@@ -6,7 +6,9 @@
 > `remote/deployments/fiducia-backend.rs` — make changes here, not in that submodule checkout.
 >
 > On disk: source clone `~/codes/fiducia.cloud/fiducia-backend.rs` · submodule checkout `~/codes/ores/k8s-cluster/remote/deployments/fiducia-backend.rs`.
-<!-- END k8s-cluster-submodule-notice --># fiducia-backend
+<!-- END k8s-cluster-submodule-notice -->
+
+# fiducia-backend
 
 Rust + [axum](https://github.com/tokio-rs/axum) backend for **fiducia.cloud** —
 "consensus & coordination as a service".
