@@ -36,6 +36,9 @@ async fn main() {
         .fallback(ServeFile::new(static_dir.join("404.html")));
 
     let app = Router::new()
+        // Liveness/readiness probe target (matches the sibling canonical.cloud
+        // deployment convention). Also available as /api/health.
+        .route("/healthz", get(health))
         .nest("/api", api)
         .fallback_service(serve_dir)
         .layer(TraceLayer::new_for_http());
