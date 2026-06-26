@@ -81,8 +81,8 @@ async fn info() -> Json<serde_json::Value> {
 }
 
 // Generated API docs (see AGENTS.md "API Docs Contract"). Artifacts are produced
-// by remote/tools/generate-api-docs.mjs from the `.route("…")` declarations above
-// and committed under generated/; do not hand-edit them.
+// by remote/tools/generate-api-docs.mjs from the route declarations above and
+// committed under generated/; do not hand-edit them.
 async fn api_docs_html() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../generated/api-docs.html"))
 }
