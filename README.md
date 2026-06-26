@@ -1,8 +1,14 @@
 # fiducia-backend
 
 Rust + [axum](https://github.com/tokio-rs/axum) backend for **fiducia.cloud** —
-"consensus & coordination as a service" (Raft-based mutual-exclusion locks, rate
-limiting, and cron).
+"consensus & coordination as a service".
+
+This is the **website tier only**: it serves the marketing site and a couple of
+health/info endpoints. It does **not** implement coordination. The actual
+Raft-replicated coordination engine and its control plane live in sibling repos:
+
+- [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane: sharded multi-Raft coordination (locks, rate limiting, cron, config KV + watches, leader election, service discovery).
+- [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) — control plane: shard placement, scaling, and node-failure handling.
 
 It serves two things:
 
