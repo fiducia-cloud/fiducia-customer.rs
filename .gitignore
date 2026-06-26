@@ -1,0 +1,7 @@
+/target
+.DS_Store
+*.log
+
+# NOTE: `static/` is intentionally COMMITTED. It holds the built Astro site
+# (from ../fiducia-ui.web `npm run sync`) so the in-cluster pod, which builds
+# only the Rust binary from source, has the frontend to serve.
