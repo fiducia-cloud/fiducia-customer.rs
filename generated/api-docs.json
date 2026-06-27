@@ -3,10 +3,10 @@
   "generatedBy": "remote/tools/generate-api-docs.mjs",
   "service": "fiducia-backend.rs",
   "language": "rust",
-  "routeCount": 7,
+  "routeCount": 21,
   "routeTypeCounts": {
     "service": 4,
-    "user-generated": 3
+    "user-generated": 17
   },
   "standardDocsRoutes": [
     "/docs/api",
@@ -14,6 +14,23 @@
     "/api/docs.json"
   ],
   "routes": [
+    {
+      "path": "/",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Host-aware root route. Serves the public static index by default and the customer portal for app.fiducia.cloud.",
+      "handlers": [
+        "root"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
     {
       "path": "/api/docs",
       "methods": [
@@ -73,9 +90,230 @@
       "routeType": "user-generated",
       "implementation": "code-first",
       "auth": "service-defined",
-      "purpose": "Custom code-first route derived from the service router.",
+      "purpose": "Service metadata including customer portal host, static prefix, regions, and realtime status.",
       "handlers": [
         "info"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal overview shell rendered by Axum and Maud.",
+      "handlers": [
+        "customer_home"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal overview shell rendered by Axum and Maud.",
+      "handlers": [
+        "customer_home"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/events",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal SSE fallback stream with rendered dashboard fragments.",
+      "handlers": [
+        "customer_events"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/fragments/kv",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "HTMX fragment for customer KV state.",
+      "handlers": [
+        "kv_fragment"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/fragments/locks",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "HTMX fragment for customer lock state.",
+      "handlers": [
+        "locks_fragment"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/fragments/requests",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "HTMX fragment for recent customer requests.",
+      "handlers": [
+        "requests_fragment"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/fragments/services",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "HTMX fragment for service discovery state.",
+      "handlers": [
+        "services_fragment"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/fragments/summary",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "HTMX fragment for customer portal summary metrics.",
+      "handlers": [
+        "summary_fragment"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/kv",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal KV view.",
+      "handlers": [
+        "customer_kv"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/locks",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal locks view.",
+      "handlers": [
+        "customer_locks"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/requests",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal request stream view.",
+      "handlers": [
+        "customer_requests"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/services",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal service discovery view.",
+      "handlers": [
+        "customer_services"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/ws",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Customer portal WebSocket stream with rendered dashboard fragments.",
+      "handlers": [
+        "customer_ws"
       ],
       "sourceFiles": [
         "remote/deployments/fiducia-backend.rs/src/main.rs"
