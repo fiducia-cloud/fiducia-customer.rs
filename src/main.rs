@@ -1,11 +1,22 @@
+use axum::http::{header, HeaderName, HeaderValue};
 use axum::{routing::get, Json, Router};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 const SERVICE: &str = "fiducia-backend";
+
+/// Bound request handling time. The site is static; nothing legitimately runs long.
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Cap request bodies — this tier only serves GETs.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 #[tokio::main]
 async fn main() {
