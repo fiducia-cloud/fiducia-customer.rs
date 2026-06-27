@@ -38,6 +38,8 @@ async fn main() {
         .route("/docs/api", get(api_docs_html))
         .route("/api/docs", get(api_docs_html))
         .route("/api/docs.json", get(api_docs_json))
+        // Mermaid architecture diagram (rendered client-side).
+        .route("/docs/diagram", get(diagram_html))
         // Everything else: the static Astro site.
         .fallback_service(serve_dir)
         .layer(TraceLayer::new_for_http());
