@@ -72,7 +72,35 @@ fn build_router(static_dir: PathBuf) -> Router {
         .route("/docs/diagram", get(diagram_html))
         // Everything else: the static Astro site.
         .fallback_service(serve_dir)
+        // Security headers for the public site. CSP is intentionally just
+        // `upgrade-insecure-requests` so the docs/diagram pages can still load
+        // their Mermaid/marked CDN + inline init; tighten once those are vendored.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("upgrade-insecure-requests"),
+        ))
+        // Hardening stack (outermost last): catch handler panics, bound request
+        // time, and cap body size.
         .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new())
 }
 
 async fn health() -> Json<serde_json::Value> {
