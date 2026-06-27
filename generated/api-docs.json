@@ -3,10 +3,10 @@
   "generatedBy": "remote/tools/generate-api-docs.mjs",
   "service": "fiducia-backend.rs",
   "language": "rust",
-  "routeCount": 6,
+  "routeCount": 7,
   "routeTypeCounts": {
     "service": 4,
-    "user-generated": 2
+    "user-generated": 3
   },
   "standardDocsRoutes": [
     "/docs/api",
@@ -93,6 +93,23 @@
       "purpose": "Human-readable generated API documentation.",
       "handlers": [
         "api_docs_html"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-backend.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/docs/diagram",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "diagram_html"
       ],
       "sourceFiles": [
         "remote/deployments/fiducia-backend.rs/src/main.rs"
