@@ -10,3 +10,4 @@
 # point STATIC_DIR at ../fiducia-ui.web/dist (or run `npm run sync` there).
 /static
 /dist
+.env

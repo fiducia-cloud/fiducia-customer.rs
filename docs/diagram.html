@@ -24,7 +24,7 @@
 <body>
   <header>
     <h1>Fiducia<b>.cloud</b> · Architecture</h1>
-    <p class="sub">Raft-replicated coordination as a service — locks, semaphores, rate limiting, config KV, leader election, service discovery.</p>
+    <p class="sub">Raft-replicated coordination as a service — locks, semaphores, rate limiting, config KV, leader election, service discovery, cron.</p>
   </header>
 
   <main>
@@ -38,7 +38,7 @@ flowchart TB
 
   subgraph REGION["Region — one per cluster (GCP · AWS · Hetzner)"]
     LB["fiducia-load-balance<br/>key &rarr; shard &rarr; leader"]
-    NODE["fiducia-node &times;N<br/>sharded multi-Raft<br/>locks · KV · elections · discovery"]
+    NODE["fiducia-node &times;N<br/>sharded multi-Raft<br/>locks · semaphores · rate-limit<br/>KV · elections · discovery · cron"]
     SIDE["fiducia-node-sidecar<br/>heartbeat · logs · metrics"]
     AUTH["fiducia-auth<br/>Supabase sessions · API keys"]
     ADMIN["fiducia-admin<br/>dashboard (HTML)"]
@@ -104,6 +104,23 @@ flowchart TB
   SHARED --> SVC
   I --> CL
     </pre></div>
+
+    <h2>4 · Zero-downtime rollout (leadership drain)</h2>
+    <p class="note">Upgrades roll <b>one node at a time</b>, and <b>one cluster at a time</b> so the cross-cluster 2/3 majority always holds. Each node is drained of leadership before it stops, so no shard takes a write outage. Full runbook: <a href="https://github.com/fiducia-cloud/fiducia-infra/blob/main/docs/ROLLOUT.md">fiducia-infra/docs/ROLLOUT.md</a>.</p>
+    <div class="diagram"><pre class="mermaid">
+flowchart LR
+  A["1 · pick a node<br/>(canary: 1 first)"] --> B["2 · brain marks it Draining<br/>(so it isn't re-replicated as Dead)"]
+  B --> C["3 · transfer its shard leaderships<br/>away (Raft leadership transfer)"]
+  C --> D["4 · LB stops routing to it<br/>(placement refresh + 421 redirects)"]
+  D --> E["5 · drain in-flight requests<br/>(preStop hook + grace period)"]
+  E --> F["6 · replace pod<br/>(new image)"]
+  F --> G["7 · rejoin + catch up<br/>commit_index == last_log_index"]
+  G --> H["8 · /readyz green &rarr; un-drain"]
+  H --> I["next node, then next cluster"]
+    </pre></div>
+
+    <h2>5 · Security posture</h2>
+    <p class="note">Edge terminates auth + rate limit; API-key secrets are CSPRNG-generated and stored only as SHA-256; the admin dev-session bypass is debug-only; every data/control-plane pod runs non-root, read-only-rootfs, dropping all Linux capabilities. Internal planes (introspect, node peer RPC) are cluster-internal and should be mTLS.</p>
   </main>
 
   <footer>
