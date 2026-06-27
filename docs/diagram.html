@@ -38,7 +38,7 @@ flowchart TB
 
   subgraph REGION["Region — one per cluster (GCP · AWS · Hetzner)"]
     LB["fiducia-load-balance<br/>key &rarr; shard &rarr; leader"]
-    NODE["fiducia-node &times;N<br/>sharded multi-Raft<br/>locks · KV · elections · discovery"]
+    NODE["fiducia-node &times;N<br/>sharded multi-Raft<br/>locks · semaphores · rate-limit<br/>KV · elections · discovery · cron"]
     SIDE["fiducia-node-sidecar<br/>heartbeat · logs · metrics"]
     AUTH["fiducia-auth<br/>Supabase sessions · API keys"]
     ADMIN["fiducia-admin<br/>dashboard (HTML)"]
