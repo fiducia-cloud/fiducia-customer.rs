@@ -13,9 +13,10 @@
 Rust + [axum](https://github.com/tokio-rs/axum) backend for **fiducia.cloud** —
 "consensus & coordination as a service".
 
-This is the **website tier only**: it serves the marketing site and a couple of
-health/info endpoints. It does **not** implement coordination. The actual
-Raft-replicated coordination engine and its control plane live in sibling repos:
+This is the **website tier only**: it serves the marketing site, the customer
+portal shell, and a couple of health/info endpoints. It does **not** implement
+coordination. The actual Raft-replicated coordination engine and its control
+plane live in sibling repos:
 
 - [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane: sharded multi-Raft coordination (locks, rate limiting, cron, config KV + watches, leader election, service discovery).
 - [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) — control plane: shard placement, scaling, and node-failure handling.
@@ -26,22 +27,37 @@ It serves two things:
 |-------------|---------------------------------------------------------------------|
 | `/healthz`, `/api/health` | health probe                                          |
 | `/api/info` | service / version JSON                                              |
+| `/app`, `/app/*` | customer portal rendered by axum + Maud and refreshed by HTMX |
+| `/_customer/*` | customer portal Vite assets (`CUSTOMER_STATIC_DIR`)             |
 | everything else | the static [Astro](https://astro.build) site (`STATIC_DIR`)     |
 
 The frontend is the sibling [`fiducia-ui.web`](https://github.com/fiducia-cloud/fiducia-ui.web)
 repo. It is **not** committed here — the deployment builds it in-pod and points
 this backend at the result via `STATIC_DIR`.
 
+The customer portal assets are the sibling
+[`fiducia-customer-ui.web`](https://github.com/fiducia-cloud/fiducia-customer-ui.web)
+repo. They are also **not** committed here; build them and point this backend at
+the result via `CUSTOMER_STATIC_DIR`. Requests with `Host: app.fiducia.cloud`
+serve the customer portal at `/`; `/app` always serves it. Set
+`FIDUCIA_SITE_MODE=customer` if a dedicated deployment should render the portal
+at `/` regardless of host.
+
 ## Run locally
 
 ```bash
-# Build the frontend somewhere and point at it:
-STATIC_DIR=../fiducia-ui.web/dist cargo run   # listens on :8080 (override PORT)
+# Build the frontends somewhere and point at them:
+STATIC_DIR=../fiducia-ui.web/dist \
+CUSTOMER_STATIC_DIR=../fiducia-customer-ui.web/dist \
+cargo run   # listens on :8080 (override PORT)
 ```
 
 `STATIC_DIR` defaults to `static`. Files are served from its root; the backend
 does not add a path prefix (the gateway strips `/fiducia/` before requests
 arrive — the Astro build carries the `/fiducia` base so asset URLs round-trip).
+`CUSTOMER_STATIC_DIR` defaults to `customer-static`. If `SUPABASE_URL` and
+`SUPABASE_ANON_KEY` are set, the rendered portal passes them to the browser for
+Supabase realtime subscriptions.
 
 ## Deployment
 
@@ -49,7 +65,8 @@ Built and run in-cluster on both the AWS and Hetzner Kubernetes clusters behind
 the shared gateway under `/fiducia/`, mirroring `canonical.cloud`:
 
 1. a **node initContainer** clones `fiducia-ui.web`, runs `astro build --base /fiducia`, and writes `dist/` to a shared volume;
-2. this **rust container** clones `fiducia-backend.rs`, `cargo run --release`, and serves that volume via `STATIC_DIR`.
+2. a **node initContainer** clones `fiducia-customer-ui.web`, runs `npm run build`, and writes `dist/` to a shared volume;
+3. this **rust container** clones `fiducia-backend.rs`, `cargo run --release`, and serves those volumes via `STATIC_DIR` and `CUSTOMER_STATIC_DIR`.
 
 Manifests live in [`ORESoftware/k8s-cluster`](https://github.com/ORESoftware/k8s-cluster)
 at `remote/argocd/dd-next-runtime/dd-fiducia-rs.*`; this repo is wired in as the

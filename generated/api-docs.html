@@ -42,16 +42,24 @@
     <h1>fiducia-backend.rs API docs</h1>
     <p>Generated from route declarations in source. Standard routes: <code>/docs/api</code>, <code>/api/docs</code>, <code>/api/docs.json</code>.</p>
     <div class="summary">
-      <span>7 routes</span>
+      <span>19 routes</span>
       <span>rust</span>
       <span>4 service</span>
-      <span>3 user-generated</span>
+      <span>15 user-generated</span>
     </div>
   </header>
   <main>
     <table>
       <thead><tr><th>Type</th><th>Methods</th><th>Path</th><th>Purpose</th><th>Handlers</th><th>Auth</th></tr></thead>
       <tbody>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/</code></td>
+  <td data-label="Purpose">Host-aware root route. Serves the public static index by default and the customer portal for app.fiducia.cloud.</td>
+  <td data-label="Handlers"><code>root</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
 <tr>
   <td data-label="Type"><span class="badge service">service</span><div class="muted">service</div></td>
   <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
@@ -80,8 +88,96 @@
   <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
   <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
   <td data-label="Path"><code>/api/info</code></td>
-  <td data-label="Purpose">Custom code-first route derived from the service router.</td>
+  <td data-label="Purpose">Service metadata including customer portal host, static prefix, regions, and realtime status.</td>
   <td data-label="Handlers"><code>info</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app</code></td>
+  <td data-label="Purpose">Customer portal overview shell rendered by Axum and Maud.</td>
+  <td data-label="Handlers"><code>customer_home</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/</code></td>
+  <td data-label="Purpose">Customer portal overview shell rendered by Axum and Maud.</td>
+  <td data-label="Handlers"><code>customer_home</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/fragments/kv</code></td>
+  <td data-label="Purpose">HTMX fragment for customer KV state.</td>
+  <td data-label="Handlers"><code>kv_fragment</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/fragments/locks</code></td>
+  <td data-label="Purpose">HTMX fragment for customer lock state.</td>
+  <td data-label="Handlers"><code>locks_fragment</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/fragments/requests</code></td>
+  <td data-label="Purpose">HTMX fragment for recent customer requests.</td>
+  <td data-label="Handlers"><code>requests_fragment</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/fragments/services</code></td>
+  <td data-label="Purpose">HTMX fragment for service discovery state.</td>
+  <td data-label="Handlers"><code>services_fragment</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/fragments/summary</code></td>
+  <td data-label="Purpose">HTMX fragment for customer portal summary metrics.</td>
+  <td data-label="Handlers"><code>summary_fragment</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/kv</code></td>
+  <td data-label="Purpose">Customer portal KV view.</td>
+  <td data-label="Handlers"><code>customer_kv</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/locks</code></td>
+  <td data-label="Purpose">Customer portal locks view.</td>
+  <td data-label="Handlers"><code>customer_locks</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/requests</code></td>
+  <td data-label="Purpose">Customer portal request stream view.</td>
+  <td data-label="Handlers"><code>customer_requests</code></td>
+  <td data-label="Auth">service-defined</td>
+</tr>
+<tr>
+  <td data-label="Type"><span class="badge user-generated">user-generated</span><div class="muted">code-first</div></td>
+  <td data-label="Methods"><div class="methods"><span class="method">GET</span></div></td>
+  <td data-label="Path"><code>/app/services</code></td>
+  <td data-label="Purpose">Customer portal service discovery view.</td>
+  <td data-label="Handlers"><code>customer_services</code></td>
   <td data-label="Auth">service-defined</td>
 </tr>
 <tr>
