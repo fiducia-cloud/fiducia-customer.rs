@@ -8,7 +8,7 @@ use tower_http::trace::TraceLayer;
 const SERVICE: &str = "fiducia-backend";
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     // Directory of the built Astro site. Defaults to the bundled `static/`
@@ -30,8 +30,9 @@ async fn main() {
         "{SERVICE} listening on http://{addr} (serving {})",
         static_dir.display()
     );
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 /// Build the application router. Separated from `main` so tests can exercise the
@@ -148,7 +149,9 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, ct, String::from_utf8_lossy(&bytes).into_owned())
     }
 
@@ -197,7 +200,10 @@ mod tests {
         assert!(v["routeCount"].as_u64().unwrap() >= 6);
         let standard = v["standardDocsRoutes"].as_array().unwrap();
         for r in ["/docs/api", "/api/docs", "/api/docs.json"] {
-            assert!(standard.iter().any(|x| x == r), "missing {r} in standardDocsRoutes");
+            assert!(
+                standard.iter().any(|x| x == r),
+                "missing {r} in standardDocsRoutes"
+            );
         }
     }
 
