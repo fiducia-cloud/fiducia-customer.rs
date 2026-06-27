@@ -34,6 +34,36 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Build the application router. Separated from `main` so tests can exercise the
+/// routes without binding a socket or initializing telemetry.
+fn build_router(static_dir: PathBuf) -> Router {
+    // Everything else is served from the static Astro build. Requests for
+    // directories resolve to index.html, and unknown paths fall back to the
+    // generated 404 page so client routing keeps working.
+    let serve_dir = ServeDir::new(&static_dir)
+        .append_index_html_on_directories(true)
+        .fallback(ServeFile::new(static_dir.join("404.html")));
+
+    // Routes are declared as flat literals (not nested) so the shared API-docs
+    // generator (remote/tools/generate-api-docs.mjs, which scans the router's
+    // route declarations) records their true paths.
+    Router::new()
+        // Liveness/readiness probe (matches the sibling canonical.cloud
+        // convention); also available as /api/health.
+        .route("/healthz", get(health))
+        .route("/api/health", get(health))
+        .route("/api/info", get(info))
+        // Generated API docs (AGENTS.md "API Docs Contract").
+        .route("/docs/api", get(api_docs_html))
+        .route("/api/docs", get(api_docs_html))
+        .route("/api/docs.json", get(api_docs_json))
+        // Mermaid architecture diagram (rendered client-side).
+        .route("/docs/diagram", get(diagram_html))
+        // Everything else: the static Astro site.
+        .fallback_service(serve_dir)
+        .layer(TraceLayer::new_for_http())
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
 }
