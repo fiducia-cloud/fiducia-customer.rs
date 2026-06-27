@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fiducia · Architecture</title>
+  <style>
+    :root { --bg:#0a1024; --panel:#121a36; --line:#243066; --ink:#e9ecf8; --dim:#9aa3c7; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.6 system-ui, sans-serif; }
+    header { padding:1.4rem 1.4rem .4rem; border-bottom:1px solid var(--line); }
+    h1 { margin:0; font-size:1.5rem; }
+    h1 b { background:linear-gradient(135deg,#c084fc,#6366f1); -webkit-background-clip:text; background-clip:text; color:transparent; }
+    .sub { color:var(--dim); margin:.3rem 0 0; }
+    main { max-width:1100px; margin:0 auto; padding:1.4rem; }
+    h2 { font-size:1.15rem; margin:2rem 0 .4rem; }
+    p.note { color:var(--dim); margin:.2rem 0 1rem; }
+    .diagram { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:1rem; overflow:auto; }
+    .mermaid { display:flex; justify-content:center; }
+    a { color:#c4b5fd; }
+    footer { color:var(--dim); padding:1.5rem 1.4rem; border-top:1px solid var(--line); margin-top:2rem; font-size:.9rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Fiducia<b>.cloud</b> · Architecture</h1>
+    <p class="sub">Raft-replicated coordination as a service — locks, semaphores, rate limiting, config KV, leader election, service discovery.</p>
+  </header>
+
+  <main>
+    <h2>1 · Request path &amp; components</h2>
+    <p class="note">Clients speak HTTP to the edge; the edge picks a healthy region; the regional load balancer routes each request by key to the shard's leader.</p>
+    <div class="diagram"><pre class="mermaid">
+flowchart TB
+  C["Client apps · 12 languages<br/>(fiducia-clients, HTTP)"]
+  EDGE["fiducia-edge<br/>Cloudflare Worker<br/>region routing · auth · rate-limit"]
+  C -->|HTTPS| EDGE
+
+  subgraph REGION["Region — one per cluster (GCP · AWS · Hetzner)"]
+    LB["fiducia-load-balance<br/>key &rarr; shard &rarr; leader"]
+    NODE["fiducia-node &times;N<br/>sharded multi-Raft<br/>locks · KV · elections · discovery"]
+    SIDE["fiducia-node-sidecar<br/>heartbeat · logs · metrics"]
+    AUTH["fiducia-auth<br/>Supabase sessions · API keys"]
+    ADMIN["fiducia-admin<br/>dashboard (HTML)"]
+    LB --> NODE
+    NODE --- SIDE
+    LB -. "introspect (cached)" .-> AUTH
+    ADMIN --> AUTH
+  end
+
+  EDGE -->|healthy region| LB
+  NODE <-->|"Raft replication (cross-cluster)"| XREG["nodes in the other 2 clusters"]
+  BRAIN["fiducia-brain<br/>placement · scaling · failure<br/>3-member Raft (1 / cluster)"]
+  SIDE -->|"heartbeat + failure-domain"| BRAIN
+  BRAIN -->|placement map| LB
+  ADMIN -->|infra ops| BRAIN
+  AUTH --> SUPA[("Supabase / Postgres<br/>orgs · users · API keys")]
+  NODE -->|"Raft log + state machine"| DISK[("per-node disk / PVC<br/>RF = 3 replicas")]
+  SIDE -. OTLP .-> OBS[("Tempo · Prometheus · Loki")]
+    </pre></div>
+
+    <h2>2 · Multi-cluster: survive losing 1 of 3</h2>
+    <p class="note">Every shard keeps RF=3 with one replica per cluster, and the brain is a 3-member Raft group (one per cluster). Lose any one cluster &rarr; every shard and the control plane keep a 2/3 majority &rarr; still serving.</p>
+    <div class="diagram"><pre class="mermaid">
+flowchart LR
+  subgraph GCP["GCP cluster"]
+    g1["node replica"]:::r
+    gb["brain member"]:::b
+  end
+  subgraph AWS["AWS cluster"]
+    a1["node replica"]:::r
+    ab["brain member"]:::b
+  end
+  subgraph HZ["Hetzner cluster"]
+    h1["node replica"]:::r
+    hb["brain member"]:::b
+  end
+  g1 <--> a1
+  a1 <--> h1
+  g1 <--> h1
+  gb <--> ab
+  ab <--> hb
+  gb <--> hb
+  classDef r fill:#3b2a63,stroke:#c084fc,color:#fff
+  classDef b fill:#1e2a55,stroke:#6366f1,color:#fff
+    </pre></div>
+
+    <h2>3 · Repositories</h2>
+    <p class="note">Shared libraries are the single sources of truth; every service depends on them.</p>
+    <div class="diagram"><pre class="mermaid">
+flowchart TB
+  subgraph SHARED["Shared libraries"]
+    R["fiducia-routing<br/>key &rarr; shard (hash)"]
+    T["fiducia-telemetry<br/>OpenTelemetry init"]
+    I["fiducia-interfaces<br/>JSON Schema + SQL &rarr; types"]
+  end
+  subgraph SVC["Services"]
+    direction LR
+    S1["node"]; S2["brain"]; S3["load-balance"]; S4["node-sidecar"]; S5["auth"]; S6["admin"]; S7["backend"]
+  end
+  subgraph OPS["Platform"]
+    E["edge (CF Worker)"]; INF["infra (k8s · kustomize)"]; CL["clients (12 langs)"]
+  end
+  SHARED --> SVC
+  I --> CL
+    </pre></div>
+  </main>
+
+  <footer>
+    Rendered client-side with <a href="https://mermaid.js.org/">Mermaid</a>. Source: <code>fiducia-backend.rs</code> at <code>/docs/diagram</code>.
+  </footer>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', securityLevel: 'loose' });
+  </script>
+</body>
+</html>

@@ -38,6 +38,8 @@ async fn main() {
         .route("/docs/api", get(api_docs_html))
         .route("/api/docs", get(api_docs_html))
         .route("/api/docs.json", get(api_docs_json))
+        // Mermaid architecture diagram (rendered client-side).
+        .route("/docs/diagram", get(diagram_html))
         // Everything else: the static Astro site.
         .fallback_service(serve_dir)
         .layer(TraceLayer::new_for_http());
@@ -87,4 +89,9 @@ async fn api_docs_json() -> impl axum::response::IntoResponse {
         [("content-type", "application/json; charset=utf-8")],
         include_str!("../generated/api-docs.json"),
     )
+}
+
+// Mermaid architecture diagram page (rendered client-side via the Mermaid CDN).
+async fn diagram_html() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../docs/diagram.html"))
 }
