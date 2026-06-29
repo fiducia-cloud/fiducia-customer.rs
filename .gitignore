@@ -11,3 +11,6 @@
 /static
 /customer-static
 /dist
+
+# Scratch / git worktrees (tmp/worktrees/*)
+tmp/
