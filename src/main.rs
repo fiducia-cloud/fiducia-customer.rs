@@ -5,6 +5,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -96,9 +97,36 @@ fn build_router(config: AppConfig) -> Router {
         .route("/healthz", get(health))
         .route("/api/health", get(health))
         .route("/api/info", get(info))
+        .route(
+            "/api/customer/api-keys",
+            get(customer_api_keys_json).post(create_customer_api_key),
+        )
+        .route(
+            "/api/customer/api-keys/rotate",
+            axum::routing::post(rotate_customer_api_key),
+        )
+        .route(
+            "/api/customer/preferences",
+            get(customer_preferences_json).put(update_customer_preferences),
+        )
+        .route(
+            "/api/customer/security/sessions",
+            get(customer_security_sessions_json),
+        )
+        .route(
+            "/api/customer/security/sessions/revoke",
+            axum::routing::post(revoke_customer_security_session),
+        )
         .route("/", get(root))
         .route("/app", get(customer_home))
         .route("/app/", get(customer_home))
+        .route("/app/dashboard", get(customer_home))
+        .route("/app/auth", get(customer_auth))
+        .route("/app/signup", get(customer_auth))
+        .route("/app/api-keys", get(customer_api_keys))
+        .route("/app/security", get(customer_security))
+        .route("/app/settings", get(customer_settings))
+        .route("/app/preferences", get(customer_settings))
         .route("/app/locks", get(customer_locks))
         .route("/app/requests", get(customer_requests))
         .route("/app/kv", get(customer_kv))
@@ -193,9 +221,221 @@ async fn info(State(config): State<AppConfig>) -> Json<serde_json::Value> {
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateCustomerApiKeyRequest {
+    name: String,
+    environment: String,
+    scope: String,
+    require_idempotency: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RotateCustomerApiKeyRequest {
+    prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeCustomerSecuritySessionRequest {
+    device: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CustomerPreferences {
+    region: String,
+    timezone: String,
+    density: String,
+    notify_lock_contention: bool,
+    notify_key_rotation: bool,
+    notify_mfa: bool,
+}
+
+async fn customer_api_keys_json() -> Json<serde_json::Value> {
+    Json(json!({
+        "api_keys": api_keys().iter().map(api_key_json).collect::<Vec<_>>(),
+        "default_require_idempotency": true,
+        "allowed_environments": ["live", "test"],
+        "allowed_scopes": allowed_api_key_scopes(),
+    }))
+}
+
+async fn create_customer_api_key(
+    Json(payload): Json<CreateCustomerApiKeyRequest>,
+) -> impl IntoResponse {
+    if let Some(error) = validate_api_key_request(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error, "ok": false })),
+        );
+    }
+
+    let issued_at_ms = unix_epoch_ms();
+    let environment_prefix = if payload.environment == "live" {
+        "fid_live"
+    } else {
+        "fid_test"
+    };
+    let suffix = format!("{:x}", issued_at_ms % 0xffff_ffff);
+    let prefix = format!("{environment_prefix}_{}", &suffix[..suffix.len().min(8)]);
+    let secret = format!("{prefix}_{}", issued_at_ms);
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "api_key": {
+                "name": payload.name.trim(),
+                "prefix": prefix,
+                "scopes": payload.scope,
+                "last_used": "never",
+                "status": "active",
+                "environment": payload.environment,
+                "require_idempotency": payload.require_idempotency.unwrap_or(true),
+            },
+            "secret": secret,
+            "secret_once": true,
+        })),
+    )
+}
+
+async fn rotate_customer_api_key(
+    Json(payload): Json<RotateCustomerApiKeyRequest>,
+) -> impl IntoResponse {
+    let prefix = payload.prefix.trim();
+    if prefix.is_empty() || !prefix.starts_with("fid_") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_key_prefix", "ok": false })),
+        );
+    }
+
+    let issued_at_ms = unix_epoch_ms();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "prefix": prefix,
+            "rotated_at_ms": issued_at_ms,
+            "replacement_secret": format!("{prefix}_rotated_{issued_at_ms}"),
+            "overlap_seconds": 900,
+        })),
+    )
+}
+
+async fn customer_preferences_json() -> Json<CustomerPreferences> {
+    Json(default_customer_preferences())
+}
+
+async fn update_customer_preferences(
+    Json(payload): Json<CustomerPreferences>,
+) -> impl IntoResponse {
+    if !CUSTOMER_REGIONS.contains(&payload.region.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_region", "ok": false })),
+        );
+    }
+    if !["comfortable", "compact"].contains(&payload.density.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_density", "ok": false })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "preferences": payload,
+            "saved_at_ms": unix_epoch_ms(),
+        })),
+    )
+}
+
+async fn customer_security_sessions_json() -> Json<serde_json::Value> {
+    Json(json!({
+        "sessions": sessions().iter().map(session_json).collect::<Vec<_>>(),
+        "revoke_supported": true,
+    }))
+}
+
+async fn revoke_customer_security_session(
+    Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
+) -> impl IntoResponse {
+    let device = payload.device.trim();
+    if device.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "device_required", "ok": false })),
+        );
+    }
+
+    let found = sessions().iter().any(|row| row.device == device);
+    if !found {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "session_not_found", "ok": false })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "device": device,
+            "status": "revoked",
+            "revoked_at_ms": unix_epoch_ms(),
+        })),
+    )
+}
+
+fn validate_api_key_request(payload: &CreateCustomerApiKeyRequest) -> Option<&'static str> {
+    if payload.name.trim().is_empty() {
+        return Some("name_required");
+    }
+    if !["live", "test"].contains(&payload.environment.as_str()) {
+        return Some("invalid_environment");
+    }
+    if !allowed_api_key_scopes().contains(&payload.scope.as_str()) {
+        return Some("invalid_scope");
+    }
+
+    None
+}
+
+fn allowed_api_key_scopes() -> &'static [&'static str] {
+    &[
+        "requests:read",
+        "requests:write",
+        "locks:read",
+        "locks:write",
+        "kv:read",
+        "kv:write",
+        "services:read",
+        "services:write",
+        "elections:read",
+        "elections:write",
+        "cron:read",
+        "cron:write",
+        "rate-limit:read",
+        "rate-limit:write",
+        "admin:read",
+    ]
+}
+
+fn default_customer_preferences() -> CustomerPreferences {
+    CustomerPreferences {
+        region: "auto".to_string(),
+        timezone: "browser".to_string(),
+        density: "comfortable".to_string(),
+        notify_lock_contention: true,
+        notify_key_rotation: true,
+        notify_mfa: true,
+    }
+}
+
 async fn root(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
     if should_serve_customer_app(&config, &headers) {
-        return customer_page(&config, CustomerTab::Overview).into_response();
+        return customer_page(&config, CustomerTab::Dashboard).into_response();
     }
 
     match tokio::fs::read_to_string(config.static_dir.join("index.html")).await {
@@ -205,7 +445,23 @@ async fn root(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
 }
 
 async fn customer_home(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Overview)
+    customer_page(&config, CustomerTab::Dashboard)
+}
+
+async fn customer_auth(State(config): State<AppConfig>) -> Markup {
+    customer_page(&config, CustomerTab::Auth)
+}
+
+async fn customer_api_keys(State(config): State<AppConfig>) -> Markup {
+    customer_page(&config, CustomerTab::ApiKeys)
+}
+
+async fn customer_security(State(config): State<AppConfig>) -> Markup {
+    customer_page(&config, CustomerTab::Security)
+}
+
+async fn customer_settings(State(config): State<AppConfig>) -> Markup {
+    customer_page(&config, CustomerTab::Settings)
 }
 
 async fn customer_locks(State(config): State<AppConfig>) -> Markup {
@@ -351,7 +607,11 @@ fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CustomerTab {
-    Overview,
+    Dashboard,
+    Auth,
+    ApiKeys,
+    Security,
+    Settings,
     Locks,
     Requests,
     Kv,
@@ -359,9 +619,13 @@ enum CustomerTab {
 }
 
 impl CustomerTab {
-    fn all() -> [CustomerTab; 5] {
+    fn all() -> [CustomerTab; 9] {
         [
-            CustomerTab::Overview,
+            CustomerTab::Dashboard,
+            CustomerTab::Auth,
+            CustomerTab::ApiKeys,
+            CustomerTab::Security,
+            CustomerTab::Settings,
             CustomerTab::Locks,
             CustomerTab::Requests,
             CustomerTab::Kv,
@@ -371,7 +635,11 @@ impl CustomerTab {
 
     fn href(self) -> &'static str {
         match self {
-            CustomerTab::Overview => "/app",
+            CustomerTab::Dashboard => "/app",
+            CustomerTab::Auth => "/app/auth",
+            CustomerTab::ApiKeys => "/app/api-keys",
+            CustomerTab::Security => "/app/security",
+            CustomerTab::Settings => "/app/settings",
             CustomerTab::Locks => "/app/locks",
             CustomerTab::Requests => "/app/requests",
             CustomerTab::Kv => "/app/kv",
@@ -381,7 +649,11 @@ impl CustomerTab {
 
     fn label(self) -> &'static str {
         match self {
-            CustomerTab::Overview => "Overview",
+            CustomerTab::Dashboard => "Dashboard",
+            CustomerTab::Auth => "Login & Signup",
+            CustomerTab::ApiKeys => "API Keys",
+            CustomerTab::Security => "Security",
+            CustomerTab::Settings => "Settings",
             CustomerTab::Locks => "Locks",
             CustomerTab::Requests => "Requests",
             CustomerTab::Kv => "Config KV",
@@ -391,11 +663,29 @@ impl CustomerTab {
 
     fn count(self) -> &'static str {
         match self {
-            CustomerTab::Overview => "12",
+            CustomerTab::Dashboard => "12",
+            CustomerTab::Auth => "2",
+            CustomerTab::ApiKeys => "3",
+            CustomerTab::Security => "2FA",
+            CustomerTab::Settings => "8",
             CustomerTab::Locks => "4",
             CustomerTab::Requests => "6",
             CustomerTab::Kv => "3",
             CustomerTab::Services => "5",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            CustomerTab::Dashboard => "Account posture, API access, realtime health, and customer operations in one workspace.",
+            CustomerTab::Auth => "Supabase Auth login, signup, magic link, and session controls for end customers.",
+            CustomerTab::ApiKeys => "Create, rotate, scope, and audit customer API keys for production integrations.",
+            CustomerTab::Security => "Two-factor authentication, trusted sessions, recovery, and account protection.",
+            CustomerTab::Settings => "Preferences, notifications, default region, and team-level customer settings.",
+            CustomerTab::Locks => "Live distributed lock state, fencing tokens, and wait queues.",
+            CustomerTab::Requests => "Recent mutating requests, routing outcomes, idempotency posture, and leader decisions.",
+            CustomerTab::Kv => "Configuration KV revisions, TTL status, and regional consistency.",
+            CustomerTab::Services => "Service discovery registrations, leader health, and instance counts.",
         }
     }
 }
@@ -436,6 +726,21 @@ struct ServiceRow {
     instances: usize,
     region: &'static str,
     leader: &'static str,
+    status: &'static str,
+}
+
+struct ApiKeyRow {
+    name: &'static str,
+    prefix: &'static str,
+    scopes: &'static str,
+    last_used: &'static str,
+    status: &'static str,
+}
+
+struct SessionRow {
+    device: &'static str,
+    location: &'static str,
+    last_seen: &'static str,
     status: &'static str,
 }
 
@@ -619,6 +924,74 @@ fn services() -> [ServiceRow; 5] {
     ]
 }
 
+fn api_keys() -> [ApiKeyRow; 3] {
+    [
+        ApiKeyRow {
+            name: "Production checkout",
+            prefix: "fid_live_7Qp2",
+            scopes: "locks:write, kv:read, requests:write",
+            last_used: "38s ago",
+            status: "active",
+        },
+        ApiKeyRow {
+            name: "Billing worker",
+            prefix: "fid_live_X4a9",
+            scopes: "locks:write, services:read",
+            last_used: "7m ago",
+            status: "rotating",
+        },
+        ApiKeyRow {
+            name: "Staging replay",
+            prefix: "fid_test_H2m8",
+            scopes: "requests:write, kv:write",
+            last_used: "2h ago",
+            status: "limited",
+        },
+    ]
+}
+
+fn api_key_json(row: &ApiKeyRow) -> serde_json::Value {
+    json!({
+        "name": row.name,
+        "prefix": row.prefix,
+        "scopes": row.scopes,
+        "last_used": row.last_used,
+        "status": row.status,
+    })
+}
+
+fn sessions() -> [SessionRow; 3] {
+    [
+        SessionRow {
+            device: "Chrome on macOS",
+            location: "Lima, PE",
+            last_seen: "current",
+            status: "verified",
+        },
+        SessionRow {
+            device: "Safari on iPhone",
+            location: "San Francisco, US",
+            last_seen: "22m ago",
+            status: "active",
+        },
+        SessionRow {
+            device: "CLI token exchange",
+            location: "iad1",
+            last_seen: "1h ago",
+            status: "limited",
+        },
+    ]
+}
+
+fn session_json(row: &SessionRow) -> serde_json::Value {
+    json!({
+        "device": row.device,
+        "location": row.location,
+        "last_seen": row.last_seen,
+        "status": row.status,
+    })
+}
+
 fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
     html! {
         (DOCTYPE)
@@ -681,39 +1054,15 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                             div class="page-heading" {
                                 div {
                                     h1 id="portal-title" { (active.label()) }
-                                    p { "Customer operations across locks, requests, KV, schedules, leadership, and live service registrations." }
+                                    p { (active.description()) }
                                 }
                                 div class="toolbar" {
                                     button type="button" hx-get="/app/fragments/summary" hx-target="#summary" hx-swap="innerHTML" { "Refresh" }
+                                    a href="/app/api-keys" { "New API key" }
                                     a href="/api/info" { "API info" }
                                 }
                             }
-                            section id="summary" hx-get="/app/fragments/summary" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                                (summary_markup())
-                            }
-                            div class="panel-grid" {
-                                section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                                    (locks_markup())
-                                }
-                                section class="panel" aria-labelledby="events-heading" {
-                                    div class="panel__header" {
-                                        h2 id="events-heading" { "Realtime Events" }
-                                        span { "Supabase" }
-                                    }
-                                    div id="realtime-events" class="event-stream" aria-live="polite" {
-                                        div class="empty-state" { "Waiting for realtime changes." }
-                                    }
-                                }
-                            }
-                            section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                                (requests_markup())
-                            }
-                            section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                                (kv_markup())
-                            }
-                            section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
-                                (services_markup())
-                            }
+                            (customer_tab_content(config, active))
                         }
                     }
                 }
@@ -739,6 +1088,546 @@ fn customer_config_script(config: &AppConfig) -> Markup {
     );
     html! {
         script { (PreEscaped(script)) }
+    }
+}
+
+fn customer_tab_content(config: &AppConfig, active: CustomerTab) -> Markup {
+    match active {
+        CustomerTab::Dashboard => dashboard_markup(config),
+        CustomerTab::Auth => auth_markup(config),
+        CustomerTab::ApiKeys => api_keys_markup(),
+        CustomerTab::Security => security_markup(),
+        CustomerTab::Settings => settings_markup(),
+        CustomerTab::Locks => html! {
+            div class="panel-grid" {
+                section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+                    (locks_markup())
+                }
+                (realtime_events_markup())
+            }
+        },
+        CustomerTab::Requests => html! {
+            section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+                (requests_markup())
+            }
+        },
+        CustomerTab::Kv => html! {
+            section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+                (kv_markup())
+            }
+        },
+        CustomerTab::Services => html! {
+            section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+                (services_markup())
+            }
+        },
+    }
+}
+
+fn dashboard_markup(config: &AppConfig) -> Markup {
+    html! {
+        section id="summary" hx-get="/app/fragments/summary" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+            (summary_markup())
+        }
+        div class="panel-grid panel-grid--dashboard" {
+            (auth_status_panel(config))
+            (api_key_summary_panel())
+            (security_summary_panel())
+            (preferences_summary_panel())
+        }
+        div class="panel-grid" {
+            section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+                (locks_markup())
+            }
+            (realtime_events_markup())
+        }
+        section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+            (requests_markup())
+        }
+        section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+            (kv_markup())
+        }
+        section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+            (services_markup())
+        }
+    }
+}
+
+fn auth_status_panel(config: &AppConfig) -> Markup {
+    let supabase_state = if config.supabase_url.is_some() && config.supabase_anon_key.is_some() {
+        "configured"
+    } else {
+        "missing env"
+    };
+    let project_url = config.supabase_url.as_deref().unwrap_or("not configured");
+
+    html! {
+        section class="panel" aria-labelledby="auth-status-heading" {
+            div class="panel__header" {
+                h2 id="auth-status-heading" { "Supabase Auth" }
+                span data-auth-status="" { "signed out" }
+            }
+            div class="panel-body stack" {
+                div class="identity-row" {
+                    div {
+                        p class="eyebrow" { "Customer session" }
+                        p class="identity-row__primary" data-auth-email="" { "No customer signed in" }
+                    }
+                    (status_tag(supabase_state))
+                }
+                p class="muted" { "Project: " span class="mono" { (project_url) } }
+                div class="action-row" {
+                    a class="button-link" href="/app/auth" { "Login" }
+                    a class="button-link" href="/app/signup" { "Sign up" }
+                }
+            }
+        }
+    }
+}
+
+fn api_key_summary_panel() -> Markup {
+    html! {
+        section class="panel" aria-labelledby="api-key-summary-heading" {
+            div class="panel__header" {
+                h2 id="api-key-summary-heading" { "API Keys" }
+                span { "3 active" }
+            }
+            div class="panel-body stack" {
+                p class="muted" { "Issue scoped keys for customer workloads and rotate live keys without downtime." }
+                dl class="detail-list" {
+                    div {
+                        dt { "Default scope" }
+                        dd { "requests:write with idempotency keys" }
+                    }
+                    div {
+                        dt { "Rotation" }
+                        dd { "dual-key overlap enabled" }
+                    }
+                }
+                a class="button-link" href="/app/api-keys" { "Manage keys" }
+            }
+        }
+    }
+}
+
+fn security_summary_panel() -> Markup {
+    html! {
+        section class="panel" aria-labelledby="security-summary-heading" {
+            div class="panel__header" {
+                h2 id="security-summary-heading" { "Security" }
+                span { "2FA ready" }
+            }
+            div class="panel-body stack" {
+                p class="muted" { "Require TOTP two-factor authentication for admins before production key issuance." }
+                dl class="detail-list" {
+                    div {
+                        dt { "MFA" }
+                        dd data-mfa-state="" { "not enrolled" }
+                    }
+                    div {
+                        dt { "Sessions" }
+                        dd { "3 trusted" }
+                    }
+                }
+                a class="button-link" href="/app/security" { "Review security" }
+            }
+        }
+    }
+}
+
+fn preferences_summary_panel() -> Markup {
+    html! {
+        section class="panel" aria-labelledby="preferences-summary-heading" {
+            div class="panel__header" {
+                h2 id="preferences-summary-heading" { "Preferences" }
+                span { "team" }
+            }
+            div class="panel-body stack" {
+                p class="muted" { "Set default region, alert cadence, timezone, and customer-visible notifications." }
+                dl class="detail-list" {
+                    div {
+                        dt { "Region" }
+                        dd { "auto" }
+                    }
+                    div {
+                        dt { "Alerts" }
+                        dd { "critical + key rotation" }
+                    }
+                }
+                a class="button-link" href="/app/settings" { "Open settings" }
+            }
+        }
+    }
+}
+
+fn auth_markup(config: &AppConfig) -> Markup {
+    let supabase_state = if config.supabase_url.is_some() && config.supabase_anon_key.is_some() {
+        "ready"
+    } else {
+        "configure SUPABASE_URL and SUPABASE_ANON_KEY"
+    };
+
+    html! {
+        div class="panel-grid panel-grid--forms" {
+            section class="panel" aria-labelledby="signin-heading" {
+                div class="panel__header" {
+                    h2 id="signin-heading" { "Login" }
+                    span { (supabase_state) }
+                }
+                form class="form-grid" data-auth-form="sign-in" {
+                    label {
+                        span { "Email" }
+                        input id="signin-email" type="email" name="email" autocomplete="email" required data-requires-supabase="";
+                    }
+                    label {
+                        span { "Password" }
+                        input id="signin-password" type="password" name="password" autocomplete="current-password" required data-requires-supabase="";
+                    }
+                    button type="submit" data-requires-supabase="" { "Login" }
+                }
+            }
+            section class="panel" aria-labelledby="signup-heading" {
+                div class="panel__header" {
+                    h2 id="signup-heading" { "Sign up" }
+                    span { "Supabase Auth" }
+                }
+                form class="form-grid" data-auth-form="sign-up" {
+                    label {
+                        span { "Work email" }
+                        input id="signup-email" type="email" name="email" autocomplete="email" required data-requires-supabase="";
+                    }
+                    label {
+                        span { "Full name" }
+                        input id="signup-name" type="text" name="full_name" autocomplete="name" required data-requires-supabase="";
+                    }
+                    label {
+                        span { "Company" }
+                        input id="signup-company" type="text" name="company_name" autocomplete="organization" data-requires-supabase="";
+                    }
+                    label {
+                        span { "Password" }
+                        input id="signup-password" type="password" name="password" autocomplete="new-password" minlength="8" required data-requires-supabase="";
+                    }
+                    button type="submit" data-requires-supabase="" { "Create account" }
+                }
+            }
+        }
+        section class="panel" aria-labelledby="magic-link-heading" {
+            div class="panel__header" {
+                h2 id="magic-link-heading" { "Magic link" }
+                span data-auth-status="" { "signed out" }
+            }
+            div class="split-panel" {
+                form class="form-grid" data-auth-form="magic-link" {
+                    label {
+                        span { "Email" }
+                        input id="magic-email" type="email" name="email" autocomplete="email" required data-requires-supabase="";
+                    }
+                    button type="submit" data-requires-supabase="" { "Send link" }
+                }
+                div class="session-box" {
+                    p class="eyebrow" { "Current session" }
+                    p class="identity-row__primary" data-auth-email="" { "No customer signed in" }
+                    div class="action-row" {
+                        button type="button" data-auth-action="sign-out" data-requires-supabase="" { "Log out" }
+                    }
+                }
+                div class="session-box" {
+                    p class="eyebrow" { "Passkeys" }
+                    p class="muted" { "Use WebAuthn passkeys as a phishing-resistant sign-in option once Supabase passkeys are enabled." }
+                    div class="action-row" {
+                        button type="button" data-passkey-action="sign-in" data-requires-supabase="" { "Sign in with passkey" }
+                    }
+                }
+            }
+            div class="inline-message" data-auth-message="" aria-live="polite" {}
+        }
+    }
+}
+
+fn api_keys_markup() -> Markup {
+    html! {
+        section class="panel" aria-labelledby="create-api-key-heading" {
+            div class="panel__header" {
+                h2 id="create-api-key-heading" { "Create API key" }
+                span { "customer scoped" }
+            }
+            form class="form-grid form-grid--inline" data-api-key-form="" {
+                label {
+                    span { "Name" }
+                    input type="text" name="name" placeholder="Production checkout" required;
+                }
+                label {
+                    span { "Environment" }
+                    select name="environment" {
+                        option value="live" { "Live" }
+                        option value="test" { "Test" }
+                    }
+                }
+                label {
+                    span { "Scopes" }
+                    select name="scope" {
+                        option value="requests:read" { "requests:read" }
+                        option value="requests:write" { "requests:write" }
+                        option value="locks:read" { "locks:read" }
+                        option value="locks:write" { "locks:write" }
+                        option value="kv:read" { "kv:read" }
+                        option value="kv:write" { "kv:write" }
+                        option value="services:read" { "services:read" }
+                        option value="services:write" { "services:write" }
+                        option value="elections:read" { "elections:read" }
+                        option value="elections:write" { "elections:write" }
+                        option value="cron:read" { "cron:read" }
+                        option value="cron:write" { "cron:write" }
+                        option value="rate-limit:read" { "rate-limit:read" }
+                        option value="rate-limit:write" { "rate-limit:write" }
+                        option value="admin:read" { "admin:read" }
+                    }
+                }
+                label class="checkbox-line" {
+                    input type="checkbox" name="require_idempotency" checked;
+                    span { "Require Idempotency-Key on mutating calls" }
+                }
+                button type="submit" { "Create key" }
+            }
+            div class="inline-message" data-api-key-message="" aria-live="polite" {}
+        }
+        section class="panel" aria-labelledby="api-keys-heading" {
+            div class="panel__header" {
+                h2 id="api-keys-heading" { "Customer API keys" }
+                span { "rotate without downtime" }
+            }
+            div class="table-wrap" {
+                table data-api-keys-table="" {
+                    thead {
+                        tr {
+                            th { "Name" }
+                            th { "Prefix" }
+                            th { "Scopes" }
+                            th { "Last used" }
+                            th { "State" }
+                            th { "Action" }
+                        }
+                    }
+                    tbody {
+                        @for row in api_keys() {
+                            tr {
+                                td { (row.name) }
+                                td class="mono" { (row.prefix) }
+                                td class="mono" { (row.scopes) }
+                                td { (row.last_used) }
+                                td {
+                                    span class=(status_class(row.status)) data-api-key-status="" { (row.status) }
+                                }
+                                td {
+                                    button class="table-action" type="button" data-api-key-action="rotate" data-key-prefix=(row.prefix) { "Rotate" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn security_markup() -> Markup {
+    html! {
+        div class="panel-grid panel-grid--forms" {
+            section class="panel" aria-labelledby="mfa-heading" {
+                div class="panel__header" {
+                    h2 id="mfa-heading" { "Two-factor authentication" }
+                    span data-mfa-state="" { "not enrolled" }
+                }
+                div class="panel-body stack" {
+                    p class="muted" { "Enroll a TOTP authenticator before issuing or rotating production API keys." }
+                    div class="action-row" {
+                        button type="button" data-mfa-action="enroll-totp" data-requires-supabase="" { "Enroll TOTP" }
+                    }
+                    img class="mfa-qr" data-mfa-qr="" alt="TOTP QR code" hidden;
+                    p class="mono secret-line" data-mfa-secret="" hidden {}
+                    label class="form-field" {
+                        span { "Authenticator code" }
+                        input type="text" inputmode="numeric" autocomplete="one-time-code" data-mfa-code="" data-requires-supabase="";
+                    }
+                    button type="button" data-mfa-action="verify-totp" data-requires-supabase="" { "Verify 2FA" }
+                    div class="inline-message" data-mfa-message="" aria-live="polite" {}
+                }
+            }
+            section class="panel" aria-labelledby="passkeys-heading" {
+                div class="panel__header" {
+                    h2 id="passkeys-heading" { "Passkeys" }
+                    span { "WebAuthn" }
+                }
+                div class="panel-body stack" {
+                    p class="muted" { "Register a passkey after sign-in so email and password accounts can step up to phishing-resistant authentication." }
+                    div class="action-row" {
+                        button type="button" data-passkey-action="register" data-requires-supabase="" { "Register passkey" }
+                        button type="button" data-passkey-action="sign-in" data-requires-supabase="" { "Test passkey sign-in" }
+                    }
+                }
+            }
+            section class="panel" aria-labelledby="recovery-heading" {
+                div class="panel__header" {
+                    h2 id="recovery-heading" { "Recovery" }
+                    span { "admin gated" }
+                }
+                div class="panel-body stack" {
+                    p class="muted" { "Recovery codes, break-glass review, and suspicious-login alerts belong to the same customer security workflow." }
+                    dl class="detail-list" {
+                        div {
+                            dt { "Recovery codes" }
+                            dd { "pending generation" }
+                        }
+                        div {
+                            dt { "Break-glass" }
+                            dd { "requires owner approval" }
+                        }
+                    }
+                }
+            }
+        }
+        section class="panel" aria-labelledby="sessions-heading" {
+            div class="panel__header" {
+                h2 id="sessions-heading" { "Trusted sessions" }
+                span { "audit trail" }
+            }
+            div class="table-wrap" {
+                table data-security-sessions-table="" {
+                    thead {
+                        tr {
+                            th { "Device" }
+                            th { "Location" }
+                            th { "Last seen" }
+                            th { "State" }
+                            th { "Action" }
+                        }
+                    }
+                    tbody {
+                        @for row in sessions() {
+                            tr {
+                                td { (row.device) }
+                                td { (row.location) }
+                                td { (row.last_seen) }
+                                td {
+                                    span class=(status_class(row.status)) data-session-status="" { (row.status) }
+                                }
+                                td {
+                                    @if row.status == "verified" {
+                                        span class="muted" { "Current" }
+                                    } @else {
+                                        button class="table-action" type="button" data-session-action="revoke" data-session-device=(row.device) { "Revoke" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn settings_markup() -> Markup {
+    html! {
+        section class="panel" aria-labelledby="preferences-heading" {
+            div class="panel__header" {
+                h2 id="preferences-heading" { "Preferences" }
+                span { "saved per browser" }
+            }
+            form class="settings-grid" data-preference-form="" {
+                label class="form-field" {
+                    span { "Default region" }
+                    select name="region" {
+                        @for region in CUSTOMER_REGIONS {
+                            option value=(*region) { (*region) }
+                        }
+                    }
+                }
+                label class="form-field" {
+                    span { "Timezone" }
+                    select name="timezone" {
+                        option value="browser" { "Browser default" }
+                        option value="utc" { "UTC" }
+                        option value="america-lima" { "America/Lima" }
+                    }
+                }
+                label class="form-field" {
+                    span { "Dashboard density" }
+                    select name="density" {
+                        option value="comfortable" { "Comfortable" }
+                        option value="compact" { "Compact" }
+                    }
+                }
+                fieldset class="toggle-group" {
+                    legend { "Notifications" }
+                    label class="checkbox-line" {
+                        input type="checkbox" name="notify_lock_contention" checked;
+                        span { "Lock contention" }
+                    }
+                    label class="checkbox-line" {
+                        input type="checkbox" name="notify_key_rotation" checked;
+                        span { "API key rotation" }
+                    }
+                    label class="checkbox-line" {
+                        input type="checkbox" name="notify_mfa" checked;
+                        span { "2FA changes" }
+                    }
+                }
+                button type="submit" { "Save preferences" }
+            }
+            div class="inline-message" data-preference-message="" aria-live="polite" {}
+        }
+        section class="panel" aria-labelledby="organization-heading" {
+            div class="panel__header" {
+                h2 id="organization-heading" { "Organization settings" }
+                span { "customer tenant" }
+            }
+            div class="panel-body detail-grid" {
+                dl class="detail-list" {
+                    div {
+                        dt { "Tenant slug" }
+                        dd class="mono" { "tenant-42" }
+                    }
+                    div {
+                        dt { "Plan" }
+                        dd { "Production" }
+                    }
+                    div {
+                        dt { "Support route" }
+                        dd { "priority" }
+                    }
+                }
+                dl class="detail-list" {
+                    div {
+                        dt { "Webhook retries" }
+                        dd { "exponential backoff" }
+                    }
+                    div {
+                        dt { "Idempotency retention" }
+                        dd { "24 hours" }
+                    }
+                    div {
+                        dt { "Default consistency" }
+                        dd { "linearizable" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn realtime_events_markup() -> Markup {
+    html! {
+        section class="panel" aria-labelledby="events-heading" {
+            div class="panel__header" {
+                h2 id="events-heading" { "Realtime Events" }
+                span { "Supabase" }
+            }
+            div id="realtime-events" class="event-stream" aria-live="polite" {
+                div class="empty-state" { "Waiting for realtime changes." }
+            }
+        }
     }
 }
 
@@ -923,9 +1812,12 @@ fn status_tag(status: &str) -> Markup {
 
 fn status_class(status: &str) -> &'static str {
     match status {
-        "held" | "current" | "healthy" | "committed" | "linearized" => "tag tag--ok",
-        "renewing" | "ttl" | "redirected" => "tag tag--warn",
-        "degraded" | "rejected" => "tag tag--error",
+        "active" | "configured" | "enabled" | "held" | "current" | "healthy" | "committed"
+        | "linearized" | "verified" => "tag tag--ok",
+        "limited" | "missing env" | "pending" | "renewing" | "rotating" | "ttl" | "redirected" => {
+            "tag tag--warn"
+        }
+        "blocked" | "degraded" | "disabled" | "expired" | "rejected" => "tag tag--error",
         _ => "tag tag--info",
     }
 }
@@ -1032,6 +1924,36 @@ mod tests {
         (status, ct, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    async fn send_json(
+        method: &str,
+        uri: &str,
+        payload: serde_json::Value,
+    ) -> (StatusCode, String, String) {
+        let app = build_router(test_config());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, ct, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     #[tokio::test]
     async fn healthz_and_api_health_report_ok() {
         for uri in ["/healthz", "/api/health"] {
@@ -1061,6 +1983,157 @@ mod tests {
         assert_eq!(v["components"]["data_plane"], "fiducia-node");
         assert_eq!(v["components"]["control_plane"], "fiducia-brain");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn customer_api_keys_can_be_listed_created_and_rotated() {
+        let (status, ct, body) = send("/api/customer/api-keys").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("application/json"), "ct={ct}");
+        let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(listed["api_keys"].as_array().unwrap().len(), 3);
+        assert_eq!(listed["default_require_idempotency"], true);
+
+        let (status, ct, body) = send_json(
+            "POST",
+            "/api/customer/api-keys",
+            json!({
+                "name": "Production webhooks",
+                "environment": "live",
+                "scope": "requests:write",
+                "require_idempotency": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(ct.contains("application/json"), "ct={ct}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["api_key"]["require_idempotency"], true);
+        assert!(created["api_key"]["prefix"]
+            .as_str()
+            .unwrap()
+            .starts_with("fid_live_"));
+        assert_eq!(created["secret_once"], true);
+
+        let (status, _ct, body) = send_json(
+            "POST",
+            "/api/customer/api-keys/rotate",
+            json!({ "prefix": created["api_key"]["prefix"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rotated: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rotated["ok"], true);
+        assert_eq!(rotated["overlap_seconds"], 900);
+    }
+
+    #[tokio::test]
+    async fn customer_api_key_creation_validates_input() {
+        let (status, _ct, body) = send_json(
+            "POST",
+            "/api/customer/api-keys",
+            json!({
+                "name": "",
+                "environment": "live",
+                "scope": "requests:write",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "name_required");
+
+        let (status, _ct, body) = send_json(
+            "POST",
+            "/api/customer/api-keys",
+            json!({
+                "name": "bad scope",
+                "environment": "live",
+                "scope": "root",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "invalid_scope");
+    }
+
+    #[tokio::test]
+    async fn customer_preferences_round_trip_json() {
+        let (status, ct, body) = send("/api/customer/preferences").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("application/json"), "ct={ct}");
+        let defaults: CustomerPreferences = serde_json::from_str(&body).unwrap();
+        assert_eq!(defaults.region, "auto");
+        assert!(defaults.notify_key_rotation);
+
+        let (status, _ct, body) = send_json(
+            "PUT",
+            "/api/customer/preferences",
+            json!({
+                "region": "iad1",
+                "timezone": "utc",
+                "density": "compact",
+                "notify_lock_contention": false,
+                "notify_key_rotation": true,
+                "notify_mfa": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(saved["ok"], true);
+        assert_eq!(saved["preferences"]["region"], "iad1");
+
+        let (status, _ct, body) = send_json(
+            "PUT",
+            "/api/customer/preferences",
+            json!({
+                "region": "moon",
+                "timezone": "utc",
+                "density": "compact",
+                "notify_lock_contention": false,
+                "notify_key_rotation": true,
+                "notify_mfa": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let rejected: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rejected["error"], "invalid_region");
+    }
+
+    #[tokio::test]
+    async fn customer_security_sessions_can_be_listed_and_revoked() {
+        let (status, ct, body) = send("/api/customer/security/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("application/json"), "ct={ct}");
+        let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), 3);
+        assert_eq!(listed["revoke_supported"], true);
+
+        let (status, _ct, body) = send_json(
+            "POST",
+            "/api/customer/security/sessions/revoke",
+            json!({ "device": "Safari on iPhone" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let revoked: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(revoked["ok"], true);
+        assert_eq!(revoked["device"], "Safari on iPhone");
+        assert_eq!(revoked["status"], "revoked");
+
+        let (status, _ct, body) = send_json(
+            "POST",
+            "/api/customer/security/sessions/revoke",
+            json!({ "device": "Unknown browser" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let rejected: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rejected["error"], "session_not_found");
     }
 
     #[tokio::test]
@@ -1120,8 +2193,34 @@ mod tests {
         let (status, ct, body) = send("/app").await;
         assert_eq!(status, StatusCode::OK);
         assert!(ct.contains("text/html"), "ct={ct}");
-        assert!(body.contains("Customer operations across locks"));
+        assert!(body.contains("Account posture, API access"));
+        assert!(body.contains("Supabase Auth"));
+        assert!(body.contains("Login"));
+        assert!(body.contains("Sign up"));
+        assert!(body.contains("API Keys"));
+        assert!(body.contains("2FA ready"));
+        assert!(body.contains("Preferences"));
         assert!(body.contains("checkout:tenant-42"));
+    }
+
+    #[tokio::test]
+    async fn customer_account_routes_render_customer_controls() {
+        let cases = [
+            ("/app/auth", "Magic link"),
+            ("/app/auth", "Sign in with passkey"),
+            ("/app/signup", "Create account"),
+            ("/app/api-keys", "Require Idempotency-Key"),
+            ("/app/security", "Register passkey"),
+            ("/app/settings", "Organization settings"),
+            ("/app/preferences", "Save preferences"),
+        ];
+
+        for (uri, needle) in cases {
+            let (status, ct, body) = send(uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(ct.contains("text/html"), "{uri} ct={ct}");
+            assert!(body.contains(needle), "{uri} missing {needle}");
+        }
     }
 
     #[tokio::test]
