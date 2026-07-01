@@ -315,7 +315,7 @@ async fn rotate_customer_api_key(
             "ok": true,
             "prefix": prefix,
             "rotated_at_ms": issued_at_ms,
-            "replacement_secret": format!("{prefix}_rotated_{issued_at_ms}"),
+            "replacement_secret": format!("{prefix}_{}", random_token_hex(24)),
             "overlap_seconds": 900,
         })),
     )
