@@ -8,6 +8,9 @@ axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# CSPRNG for demo API-key secrets — never hand out a predictable, timestamp-
+# derived credential from the customer portal.
+getrandom = "0.2"
 maud = { version = "0.26", features = ["axum"] }
 async-stream = "0.3"
 tower-http = { version = "0.5", features = ["trace", "fs", "timeout", "limit", "catch-panic", "set-header"] }
