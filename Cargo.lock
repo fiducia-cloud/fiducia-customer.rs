@@ -230,6 +230,7 @@ dependencies = [
  "axum",
  "fiducia-interfaces",
  "fiducia-telemetry",
+ "getrandom",
  "maud",
  "serde",
  "serde_json",
