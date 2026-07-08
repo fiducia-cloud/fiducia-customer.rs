@@ -813,20 +813,34 @@ async fn services_fragment() -> Markup {
     services_markup()
 }
 
-async fn customer_ws(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(customer_ws_stream)
+async fn customer_ws(State(config): State<AppConfig>, ws: WebSocketUpgrade) -> Response {
+    let rx = config.stream_tx.subscribe();
+    ws.on_upgrade(move |socket| customer_ws_stream(socket, rx))
 }
 
-async fn customer_events() -> impl IntoResponse {
+async fn customer_events(State(config): State<AppConfig>) -> impl IntoResponse {
+    let mut rx = config.stream_tx.subscribe();
     let stream = async_stream::stream! {
         yield Ok::<Event, Infallible>(stream_event("connected", 0));
 
         let mut interval = tokio::time::interval(Duration::from_secs(STREAM_HEARTBEAT_SECS));
         let mut sequence = 1_u64;
         loop {
-            interval.tick().await;
-            yield Ok::<Event, Infallible>(stream_event("refresh", sequence));
-            sequence = sequence.saturating_add(1);
+            tokio::select! {
+                _ = interval.tick() => {
+                    yield Ok::<Event, Infallible>(stream_event("refresh", sequence));
+                    sequence = sequence.saturating_add(1);
+                }
+                // Server-pushed frames (e.g. fiducia:sync on an api_keys mutation)
+                // ride the same SSE stream as a distinct `fiducia-sync` event.
+                frame = rx.recv() => {
+                    match frame {
+                        Ok(payload) => yield Ok::<Event, Infallible>(sync_stream_event(&payload)),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
         }
     };
 
@@ -837,7 +851,7 @@ async fn customer_events() -> impl IntoResponse {
     )
 }
 
-async fn customer_ws_stream(mut socket: WebSocket) {
+async fn customer_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
     let initial = stream_payload("connected", 0, "websocket").to_string();
     if socket.send(Message::Text(initial)).await.is_err() {
         return;
@@ -852,6 +866,19 @@ async fn customer_ws_stream(mut socket: WebSocket) {
                 sequence = sequence.saturating_add(1);
                 if socket.send(Message::Text(payload)).await.is_err() {
                     return;
+                }
+            }
+            // Forward broadcast frames (fiducia:sync change events) verbatim; the
+            // client disambiguates by the JSON `event` field.
+            frame = rx.recv() => {
+                match frame {
+                    Ok(payload) => {
+                        if socket.send(Message::Text(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
             msg = socket.recv() => {
