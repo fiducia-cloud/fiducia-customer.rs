@@ -909,6 +909,12 @@ fn stream_event(kind: &str, sequence: u64) -> Event {
         .data(stream_payload(kind, sequence, "sse").to_string())
 }
 
+/// Wrap a broadcast payload (a fiducia:sync frame) as an SSE event the sync SDK's
+/// EventSource listener (`fiducia-sync`) folds into the local store.
+fn sync_stream_event(payload: &str) -> Event {
+    Event::default().event("fiducia-sync").data(payload)
+}
+
 fn stream_payload(kind: &str, sequence: u64, transport: &str) -> serde_json::Value {
     json!({
         "kind": kind,
