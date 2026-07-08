@@ -232,6 +232,10 @@ struct AppConfig {
     customer_site_mode: bool,
     supabase_url: Option<String>,
     supabase_anon_key: Option<String>,
+    /// Customer Postgres pool. `None` keeps the in-memory mock api_keys path.
+    pool: Option<PgPool>,
+    /// Fans `fiducia:refresh` + `fiducia:sync` frames out to WS/SSE subscribers.
+    stream_tx: broadcast::Sender<String>,
 }
 
 async fn health() -> Json<serde_json::Value> {
