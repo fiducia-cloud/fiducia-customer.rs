@@ -283,6 +283,24 @@ struct RotateCustomerApiKeyRequest {
     prefix: String,
 }
 
+/// One queued optimistic write from the @fiducia/sync client. `table` is implied
+/// by the route (`api_keys`) but echoed by the client, so we accept it. `payload`
+/// is the row the client optimistically stored; `base_version` is the version it
+/// was edited on top of (for the ack the client reconciles against).
+#[derive(Debug, Deserialize)]
+struct SyncWriteRequest {
+    id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    table: Option<String>,
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+    #[serde(default)]
+    base_version: Option<i64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RevokeCustomerSecuritySessionRequest {
     device: String,
