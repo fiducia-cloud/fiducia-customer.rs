@@ -2249,6 +2249,8 @@ mod tests {
     }
 
     fn test_config() -> AppConfig {
+        // No pool → the mock api_keys path (mirrors the E2E harness, which boots
+        // the backend without DATABASE_URL).
         AppConfig {
             static_dir: temp_static_dir(),
             customer_static_dir: temp_customer_static_dir(),
@@ -2256,6 +2258,8 @@ mod tests {
             customer_site_mode: false,
             supabase_url: None,
             supabase_anon_key: None,
+            pool: None,
+            stream_tx: broadcast::channel(16).0,
         }
     }
 
