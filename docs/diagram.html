@@ -15,7 +15,7 @@
     main { max-width:1100px; margin:0 auto; padding:1.4rem; }
     h2 { font-size:1.15rem; margin:2rem 0 .4rem; }
     p.note { color:var(--dim); margin:.2rem 0 1rem; }
-    .diagram { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:1rem; overflow:auto; }
+    .diagram { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:1rem; overflow:auto; }
     .mermaid { display:flex; justify-content:center; }
     a { color:#c4b5fd; }
     footer { color:var(--dim); padding:1.5rem 1.4rem; border-top:1px solid var(--line); margin-top:2rem; font-size:.9rem; }
@@ -24,7 +24,7 @@
 <body>
   <header>
     <h1>Fiducia<b>.cloud</b> · Architecture</h1>
-    <p class="sub">Raft-replicated coordination as a service — locks, semaphores, rate limiting, config KV, leader election, service discovery, cron.</p>
+    <p class="sub">Raft-replicated coordination for services and AI-agent fleets — locks, semaphores, idempotency, rate limiting, config KV, leader election, service discovery, cron.</p>
   </header>
 
   <main>
@@ -32,13 +32,15 @@
     <p class="note">Clients speak HTTP to the edge; the edge picks a healthy region; the regional load balancer routes each request by key to the shard's leader.</p>
     <div class="diagram"><pre class="mermaid">
 flowchart TB
-  C["Client apps · 12 languages<br/>(fiducia-clients, HTTP)"]
+  C["Client apps · services · AI agents<br/>(fiducia-clients, HTTP)"]
+  AGENTS["Agent fleet patterns<br/>task claims · tool leases<br/>supervisor election · KV watches"]
   EDGE["fiducia-edge<br/>Cloudflare Worker<br/>region routing · auth · rate-limit"]
   C -->|HTTPS| EDGE
+  AGENTS -->|SDK / HTTP| EDGE
 
   subgraph REGION["Region — one per cluster (GCP · AWS · Hetzner)"]
     LB["fiducia-load-balance<br/>key &rarr; shard &rarr; leader"]
-    NODE["fiducia-node &times;N<br/>sharded multi-Raft<br/>locks · semaphores · rate-limit<br/>KV · elections · discovery · cron"]
+    NODE["fiducia-node &times;N<br/>sharded multi-Raft<br/>locks · semaphores · idempotency<br/>rate-limit · KV · elections · discovery · cron"]
     SIDE["fiducia-node-sidecar<br/>heartbeat · logs · metrics"]
     AUTH["fiducia-auth<br/>Supabase sessions · API keys"]
     ADMIN["fiducia-admin<br/>dashboard (HTML)"]
@@ -50,7 +52,7 @@ flowchart TB
 
   EDGE -->|healthy region| LB
   NODE <-->|"Raft replication (cross-cluster)"| XREG["nodes in the other 2 clusters"]
-  BRAIN["fiducia-brain<br/>placement · scaling · failure<br/>3-member Raft (1 / cluster)"]
+  BRAIN["fiducia-brain<br/>placement · scaling · failure<br/>durable brain-Raft: target HA step"]
   SIDE -->|"heartbeat + failure-domain"| BRAIN
   BRAIN -->|placement map| LB
   ADMIN -->|infra ops| BRAIN
@@ -59,21 +61,33 @@ flowchart TB
   SIDE -. OTLP .-> OBS[("Tempo · Prometheus · Loki")]
     </pre></div>
 
-    <h2>2 · Multi-cluster: survive losing 1 of 3</h2>
-    <p class="note">Every shard keeps RF=3 with one replica per cluster, and the brain is a 3-member Raft group (one per cluster). Lose any one cluster &rarr; every shard and the control plane keep a 2/3 majority &rarr; still serving.</p>
+    <h2>2 · AI-agent coordination patterns</h2>
+    <p class="note">Fiducia gives agent platforms the shared truth they need when many autonomous workers can see the same task, call the same paid tool, or try to publish the same result.</p>
+    <div class="diagram"><pre class="mermaid">
+flowchart LR
+  Q["Task queue / workflow engine"] --> A["Agent workers"]
+  A --> CLAIM["Idempotency + TTL locks<br/>one claim · replay-safe result"]
+  A --> TOOLS["Semaphores + rate limits<br/>GPU · browser · paid API budgets"]
+  SUP["Leader election<br/>one supervisor / reviewer"] --> A
+  KV["Config KV + watches<br/>shared run state"] --> A
+  CLAIM --> OUT["Committed output<br/>with fencing token"]
+    </pre></div>
+
+    <h2>3 · Multi-cluster data plane: survive losing 1 of 3</h2>
+    <p class="note">Every data shard keeps RF=3 with one replica per cluster. Lose any one cluster &rarr; every shard keeps a 2/3 majority &rarr; coordination writes can still commit. The brain already manages membership, placement, scaling, and failure; its own durable 3-member Raft store remains the target HA step for control-plane state.</p>
     <div class="diagram"><pre class="mermaid">
 flowchart LR
   subgraph GCP["GCP cluster"]
     g1["node replica"]:::r
-    gb["brain member"]:::b
+    gb["brain member<br/>(target HA)"]:::b
   end
   subgraph AWS["AWS cluster"]
     a1["node replica"]:::r
-    ab["brain member"]:::b
+    ab["brain member<br/>(target HA)"]:::b
   end
   subgraph HZ["Hetzner cluster"]
     h1["node replica"]:::r
-    hb["brain member"]:::b
+    hb["brain member<br/>(target HA)"]:::b
   end
   g1 <--> a1
   a1 <--> h1
@@ -85,7 +99,7 @@ flowchart LR
   classDef b fill:#1e2a55,stroke:#6366f1,color:#fff
     </pre></div>
 
-    <h2>3 · Repositories</h2>
+    <h2>4 · Repositories</h2>
     <p class="note">Shared libraries are the single sources of truth; every service depends on them.</p>
     <div class="diagram"><pre class="mermaid">
 flowchart TB
@@ -105,7 +119,7 @@ flowchart TB
   I --> CL
     </pre></div>
 
-    <h2>4 · Zero-downtime rollout (leadership drain)</h2>
+    <h2>5 · Zero-downtime rollout (leadership drain)</h2>
     <p class="note">Upgrades roll <b>one node at a time</b>, and <b>one cluster at a time</b> so the cross-cluster 2/3 majority always holds. Each node is drained of leadership before it stops, so no shard takes a write outage. Full runbook: <a href="https://github.com/fiducia-cloud/fiducia-infra/blob/main/docs/ROLLOUT.md">fiducia-infra/docs/ROLLOUT.md</a>.</p>
     <div class="diagram"><pre class="mermaid">
 flowchart LR
@@ -119,7 +133,7 @@ flowchart LR
   H --> I["next node, then next cluster"]
     </pre></div>
 
-    <h2>5 · Security posture</h2>
+    <h2>6 · Security posture</h2>
     <p class="note">Edge terminates auth + rate limit; API-key secrets are CSPRNG-generated and stored only as SHA-256; the admin dev-session bypass is debug-only; every data/control-plane pod runs non-root, read-only-rootfs, dropping all Linux capabilities. Internal planes (introspect, node peer RPC) are cluster-internal and should be mTLS.</p>
 
     <h2>6 · Use case — coordinating an AI agent fleet</h2>
