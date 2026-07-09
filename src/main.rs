@@ -4,13 +4,17 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
+use fiducia_interfaces_db::customer::ApiKeysRow;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::PgPool;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
+use uuid::Uuid;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -44,6 +48,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let customer_static_dir: PathBuf = std::env::var("CUSTOMER_STATIC_DIR")
         .unwrap_or_else(|_| "customer-static".to_string())
         .into();
+
+    // The api_keys vertical is DB-backed when DATABASE_URL points at the customer
+    // Postgres plane. If it is unset (or the DB is unreachable) we fall back to the
+    // in-memory mock path so the portal — and the E2E suite — still boot with no DB.
+    let pool = connect_customer_db().await;
+
+    // One process-wide broadcast channel fans server-pushed frames out to every
+    // connected WS/SSE client: the existing `fiducia:refresh` fragment frames AND
+    // the new `fiducia:sync` change frames emitted on api_keys mutations.
+    let (stream_tx, _) = broadcast::channel::<String>(256);
+
     let config = AppConfig {
         static_dir: static_dir.clone(),
         customer_static_dir: customer_static_dir.clone(),
@@ -56,6 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supabase_anon_key: std::env::var("SUPABASE_ANON_KEY")
             .ok()
             .filter(|v| !v.is_empty()),
+        pool,
+        stream_tx,
     };
 
     let app = build_router(config);
@@ -74,6 +91,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Open a pool to the customer Postgres plane when `DATABASE_URL` is set. Returns
+/// `None` (mock path) if the var is unset/empty, or if the connection fails — the
+/// portal must boot without a DB, so a bad/missing DB is degraded, never fatal.
+async fn connect_customer_db() -> Option<PgPool> {
+    let url = std::env::var("DATABASE_URL").ok().filter(|v| !v.is_empty())?;
+    match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+    {
+        Ok(pool) => {
+            tracing::info!("customer DB connected — api_keys served from Postgres");
+            Some(pool)
+        }
+        Err(err) => {
+            tracing::error!("customer DB connect failed ({err}); falling back to mock api_keys");
+            None
+        }
+    }
 }
 
 /// Build the application router. Separated from `main` so tests can exercise the
@@ -104,6 +142,13 @@ fn build_router(config: AppConfig) -> Router {
         .route(
             "/api/customer/api-keys/rotate",
             axum::routing::post(rotate_customer_api_key),
+        )
+        // Local-first sync write path: the @fiducia/sync client POSTs queued
+        // optimistic writes here; we persist via SQLx and return the committed row
+        // version so the client can adopt it and clear `dirty`.
+        .route(
+            "/api/customer/sync/api_keys",
+            axum::routing::post(sync_write_api_keys),
         )
         .route(
             "/api/customer/preferences",
@@ -187,6 +232,10 @@ struct AppConfig {
     customer_site_mode: bool,
     supabase_url: Option<String>,
     supabase_anon_key: Option<String>,
+    /// Customer Postgres pool. `None` keeps the in-memory mock api_keys path.
+    pool: Option<PgPool>,
+    /// Fans `fiducia:refresh` + `fiducia:sync` frames out to WS/SSE subscribers.
+    stream_tx: broadcast::Sender<String>,
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -234,6 +283,24 @@ struct RotateCustomerApiKeyRequest {
     prefix: String,
 }
 
+/// One queued optimistic write from the @fiducia/sync client. `table` is implied
+/// by the route (`api_keys`) but echoed by the client, so we accept it. `payload`
+/// is the row the client optimistically stored; `base_version` is the version it
+/// was edited on top of (for the ack the client reconciles against).
+#[derive(Debug, Deserialize)]
+struct SyncWriteRequest {
+    id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    table: Option<String>,
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+    #[serde(default)]
+    base_version: Option<i64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RevokeCustomerSecuritySessionRequest {
     device: String,
@@ -249,9 +316,27 @@ struct CustomerPreferences {
     notify_mfa: bool,
 }
 
-async fn customer_api_keys_json() -> Json<serde_json::Value> {
+async fn customer_api_keys_json(State(config): State<AppConfig>) -> Json<serde_json::Value> {
+    // DB-backed when a pool is present; otherwise the in-memory mock keys. A query
+    // failure degrades to the mock so a rendered table never disappears on a blip.
+    let keys = match &config.pool {
+        Some(pool) => match sqlx::query_as::<_, ApiKeysRow>(
+            "select * from api_keys order by created_at asc",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
+            Err(err) => {
+                tracing::error!("api_keys list query failed: {err}");
+                mock_api_keys_display()
+            }
+        },
+        None => mock_api_keys_display(),
+    };
+
     Json(json!({
-        "api_keys": api_keys().iter().map(api_key_json).collect::<Vec<_>>(),
+        "api_keys": keys,
         "default_require_idempotency": true,
         "allowed_environments": ["live", "test"],
         "allowed_scopes": allowed_api_key_scopes(),
@@ -259,6 +344,7 @@ async fn customer_api_keys_json() -> Json<serde_json::Value> {
 }
 
 async fn create_customer_api_key(
+    State(config): State<AppConfig>,
     Json(payload): Json<CreateCustomerApiKeyRequest>,
 ) -> impl IntoResponse {
     if let Some(error) = validate_api_key_request(&payload) {
@@ -278,6 +364,30 @@ async fn create_customer_api_key(
     let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
     let secret = format!("{prefix}_{}", random_token_hex(24));
 
+    // DB path: persist the key (storing only the secret hash) and broadcast the
+    // new row as a fiducia:sync change so any connected client folds it in.
+    if let Some(pool) = &config.pool {
+        match insert_api_key(pool, &payload, &prefix, &secret).await {
+            Ok(row) => {
+                broadcast_api_key_change(&config, &row);
+                let mut api_key = api_key_row_to_display(&row);
+                api_key["environment"] = json!(payload.environment);
+                api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
+                return (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "ok": true,
+                        "api_key": api_key,
+                        "secret": secret,
+                        "secret_once": true,
+                    })),
+                );
+            }
+            Err(err) => tracing::error!("api_key insert failed: {err}"),
+        }
+    }
+
+    // Mock path (no DB, or an insert that failed): unchanged legacy response.
     (
         StatusCode::CREATED,
         Json(json!({
@@ -298,6 +408,7 @@ async fn create_customer_api_key(
 }
 
 async fn rotate_customer_api_key(
+    State(config): State<AppConfig>,
     Json(payload): Json<RotateCustomerApiKeyRequest>,
 ) -> impl IntoResponse {
     let prefix = payload.prefix.trim();
@@ -309,16 +420,218 @@ async fn rotate_customer_api_key(
     }
 
     let issued_at_ms = unix_epoch_ms();
+    let replacement_secret = format!("{prefix}_{}", random_token_hex(24));
+
+    // DB path: replace the stored secret hash. The bump_row_version trigger
+    // advances `version` + `updated_at`; broadcast the bumped row.
+    if let Some(pool) = &config.pool {
+        match sqlx::query_as::<_, ApiKeysRow>(
+            "update api_keys set secret_hash = $1 where key_id = $2 returning *",
+        )
+        .bind(hash_secret(&replacement_secret))
+        .bind(prefix)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(Some(row)) => broadcast_api_key_change(&config, &row),
+            Ok(None) => {}
+            Err(err) => tracing::error!("api_key rotate failed: {err}"),
+        }
+    }
+
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "prefix": prefix,
             "rotated_at_ms": issued_at_ms,
-            "replacement_secret": format!("{prefix}_{}", random_token_hex(24)),
+            "replacement_secret": replacement_secret,
             "overlap_seconds": 900,
         })),
     )
+}
+
+/// The @fiducia/sync write path. Upserts the api_keys row and returns the committed
+/// row version so the client can adopt it (clearing its optimistic `dirty` flag),
+/// then broadcasts the change so every other client reconciles too.
+async fn sync_write_api_keys(
+    State(config): State<AppConfig>,
+    Json(req): Json<SyncWriteRequest>,
+) -> impl IntoResponse {
+    let op = req.op.as_deref().unwrap_or("upsert");
+
+    if let Some(pool) = &config.pool {
+        if let Ok(id) = Uuid::parse_str(&req.id) {
+            let committed = if op == "delete" {
+                // A delete on a revocable credential is a soft revoke, not a row
+                // drop, so audit/history stay intact. Version still bumps.
+                sqlx::query_as::<_, ApiKeysRow>(
+                    "update api_keys set revoked = true where id = $1 returning *",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+            } else {
+                let payload = req.payload.clone().unwrap_or_else(|| json!({}));
+                let name = payload.get("name").and_then(|v| v.as_str());
+                let scopes = payload_scopes(&payload);
+                let env = payload
+                    .get("environment")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| payload.get("env").and_then(|v| v.as_str()));
+                let revoked = match payload.get("status").and_then(|v| v.as_str()) {
+                    Some("revoked") => Some(true),
+                    Some(_) => Some(false),
+                    None => payload.get("revoked").and_then(|v| v.as_bool()),
+                };
+                // COALESCE keeps existing values for any field the client omitted;
+                // the trigger bumps version + updated_at on the UPDATE.
+                sqlx::query_as::<_, ApiKeysRow>(
+                    "update api_keys set \
+                        name = coalesce($2, name), \
+                        scopes = coalesce($3, scopes), \
+                        env = coalesce($4, env), \
+                        revoked = coalesce($5, revoked) \
+                     where id = $1 returning *",
+                )
+                .bind(id)
+                .bind(name)
+                .bind(scopes)
+                .bind(env)
+                .bind(revoked)
+                .fetch_optional(pool)
+                .await
+            };
+
+            match committed {
+                Ok(Some(row)) => {
+                    broadcast_api_key_change(&config, &row);
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": row.id.to_string(),
+                            "committed_version": row.version,
+                        })),
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => tracing::error!("api_keys sync write failed: {err}"),
+            }
+        }
+    }
+
+    // Fallback ack (no pool, unparseable id, or no matching row): return a
+    // monotonic version so the client's queue drains cleanly instead of retrying.
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": req.id,
+            "committed_version": req.base_version.unwrap_or(0) + 1,
+        })),
+    )
+}
+
+/// SHA-256 of an API-key secret. Only the hash is ever persisted — the plaintext
+/// secret is shown to the caller once and never stored.
+fn hash_secret(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(secret.as_bytes());
+    format!("sha256:{digest:x}")
+}
+
+/// Insert a new api_keys row (org-scoped to the first org) and return it with the
+/// server-assigned `id` + `version`.
+async fn insert_api_key(
+    pool: &PgPool,
+    payload: &CreateCustomerApiKeyRequest,
+    prefix: &str,
+    secret: &str,
+) -> Result<ApiKeysRow, sqlx::Error> {
+    let org_id: Uuid =
+        sqlx::query_scalar("select id from orgs order by created_at asc limit 1")
+            .fetch_one(pool)
+            .await?;
+
+    sqlx::query_as::<_, ApiKeysRow>(
+        "insert into api_keys (key_id, org_id, name, secret_hash, scopes, env) \
+         values ($1, $2, $3, $4, $5, $6) returning *",
+    )
+    .bind(prefix)
+    .bind(org_id)
+    .bind(payload.name.trim())
+    .bind(hash_secret(secret))
+    .bind(json!([payload.scope]))
+    .bind(&payload.environment)
+    .fetch_one(pool)
+    .await
+}
+
+/// Normalize a client `scopes` field to a jsonb array, or `None` to leave it
+/// untouched. The display row stores scopes as a comma string; the column is an
+/// array — accept either shape.
+fn payload_scopes(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    match payload.get("scopes") {
+        Some(serde_json::Value::Array(items)) => Some(serde_json::Value::Array(items.clone())),
+        Some(serde_json::Value::String(csv)) => {
+            let items: Vec<serde_json::Value> = csv
+                .split(',')
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .map(|part| json!(part))
+                .collect();
+            Some(json!(items))
+        }
+        _ => None,
+    }
+}
+
+/// Map a DB row to the display shape the frontend renders (and stores in
+/// IndexedDB). `prefix` is the public `key_id`; scopes collapse to a comma string.
+fn api_key_row_to_display(row: &ApiKeysRow) -> serde_json::Value {
+    let scopes = row
+        .scopes
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+
+    json!({
+        "id": row.id.to_string(),
+        "name": row.name,
+        "prefix": row.key_id,
+        "scopes": scopes,
+        "last_used": if row.last_used_at.is_some() { "recently" } else { "never" },
+        "status": if row.revoked { "revoked" } else { "active" },
+        "environment": row.env,
+        "version": row.version,
+    })
+}
+
+/// Broadcast a single api_keys upsert as a `fiducia:sync` frame over the shared
+/// stream. Send errors (no subscribers) are ignored.
+fn broadcast_api_key_change(config: &AppConfig, row: &ApiKeysRow) {
+    let frame = json!({
+        "event": "fiducia:sync",
+        "changes": [{
+            "table": "api_keys",
+            "op": "upsert",
+            "id": row.id.to_string(),
+            "version": row.version,
+            "row": api_key_row_to_display(row),
+            "at_ms": unix_epoch_ms(),
+        }],
+    });
+    let _ = config.stream_tx.send(frame.to_string());
+}
+
+/// The mock api_keys rendered as the same display JSON the DB path emits.
+fn mock_api_keys_display() -> Vec<serde_json::Value> {
+    api_keys().iter().map(api_key_json).collect()
 }
 
 async fn customer_preferences_json() -> Json<CustomerPreferences> {
@@ -500,20 +813,34 @@ async fn services_fragment() -> Markup {
     services_markup()
 }
 
-async fn customer_ws(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(customer_ws_stream)
+async fn customer_ws(State(config): State<AppConfig>, ws: WebSocketUpgrade) -> Response {
+    let rx = config.stream_tx.subscribe();
+    ws.on_upgrade(move |socket| customer_ws_stream(socket, rx))
 }
 
-async fn customer_events() -> impl IntoResponse {
+async fn customer_events(State(config): State<AppConfig>) -> impl IntoResponse {
+    let mut rx = config.stream_tx.subscribe();
     let stream = async_stream::stream! {
         yield Ok::<Event, Infallible>(stream_event("connected", 0));
 
         let mut interval = tokio::time::interval(Duration::from_secs(STREAM_HEARTBEAT_SECS));
         let mut sequence = 1_u64;
         loop {
-            interval.tick().await;
-            yield Ok::<Event, Infallible>(stream_event("refresh", sequence));
-            sequence = sequence.saturating_add(1);
+            tokio::select! {
+                _ = interval.tick() => {
+                    yield Ok::<Event, Infallible>(stream_event("refresh", sequence));
+                    sequence = sequence.saturating_add(1);
+                }
+                // Server-pushed frames (e.g. fiducia:sync on an api_keys mutation)
+                // ride the same SSE stream as a distinct `fiducia-sync` event.
+                frame = rx.recv() => {
+                    match frame {
+                        Ok(payload) => yield Ok::<Event, Infallible>(sync_stream_event(&payload)),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
         }
     };
 
@@ -524,7 +851,7 @@ async fn customer_events() -> impl IntoResponse {
     )
 }
 
-async fn customer_ws_stream(mut socket: WebSocket) {
+async fn customer_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
     let initial = stream_payload("connected", 0, "websocket").to_string();
     if socket.send(Message::Text(initial)).await.is_err() {
         return;
@@ -539,6 +866,19 @@ async fn customer_ws_stream(mut socket: WebSocket) {
                 sequence = sequence.saturating_add(1);
                 if socket.send(Message::Text(payload)).await.is_err() {
                     return;
+                }
+            }
+            // Forward broadcast frames (fiducia:sync change events) verbatim; the
+            // client disambiguates by the JSON `event` field.
+            frame = rx.recv() => {
+                match frame {
+                    Ok(payload) => {
+                        if socket.send(Message::Text(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
             msg = socket.recv() => {
@@ -567,6 +907,12 @@ fn stream_event(kind: &str, sequence: u64) -> Event {
         .event("fiducia-refresh")
         .id(sequence.to_string())
         .data(stream_payload(kind, sequence, "sse").to_string())
+}
+
+/// Wrap a broadcast payload (a fiducia:sync frame) as an SSE event the sync SDK's
+/// EventSource listener (`fiducia-sync`) folds into the local store.
+fn sync_stream_event(payload: &str) -> Event {
+    Event::default().event("fiducia-sync").data(payload)
 }
 
 fn stream_payload(kind: &str, sequence: u64, transport: &str) -> serde_json::Value {
@@ -1903,6 +2249,8 @@ mod tests {
     }
 
     fn test_config() -> AppConfig {
+        // No pool → the mock api_keys path (mirrors the E2E harness, which boots
+        // the backend without DATABASE_URL).
         AppConfig {
             static_dir: temp_static_dir(),
             customer_static_dir: temp_customer_static_dir(),
@@ -1910,6 +2258,8 @@ mod tests {
             customer_site_mode: false,
             supabase_url: None,
             supabase_anon_key: None,
+            pool: None,
+            stream_tx: broadcast::channel(16).0,
         }
     }
 

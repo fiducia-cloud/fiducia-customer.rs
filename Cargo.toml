@@ -24,6 +24,25 @@ fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.
 # the one source of truth for the types every fiducia service speaks.
 fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 
+# Generated sqlx::FromRow row types for the customer Postgres plane. The api_keys
+# vertical reads/writes these against the customer DB when DATABASE_URL is set.
+fiducia-interfaces-db = { path = "../fiducia-interfaces/generated/rust-db" }
+
+# SQLx for the DB-backed api_keys handlers. Runtime-checked queries (query_as, not
+# the compile-time macros) so `cargo build` needs no live DB. `json` decodes the
+# scopes jsonb column carried by ApiKeysRow.
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "uuid",
+    "chrono",
+    "json",
+    "macros",
+] }
+uuid = { version = "1", features = ["serde", "v4"] }
+# Never persist a raw API-key secret — store only a SHA-256 hash of it.
+sha2 = "0.10"
+
 [dev-dependencies]
 # `ServiceExt::oneshot` drives the router in tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }
