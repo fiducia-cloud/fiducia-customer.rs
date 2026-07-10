@@ -2668,6 +2668,63 @@ mod tests {
         assert!(ct.contains("text/event-stream"), "ct={ct}");
     }
 
+    async fn post_sync(config: AppConfig, key: Option<&str>, base: i64) -> serde_json::Value {
+        let app = build_router(config);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/customer/sync/api_keys")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(k) = key {
+            builder = builder.header("idempotency-key", k);
+        }
+        let body = json!({ "id": "k1", "op": "upsert", "base_version": base }).to_string();
+        let resp = app.oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_write_is_generic_in_table_and_acks_a_monotonic_version() {
+        // No pool in tests -> the fallback ack (base_version + 1) for ANY table, so
+        // the client's write-queue always drains.
+        let acked = post_sync(test_config(), None, 4).await;
+        assert_eq!(acked["id"], "k1");
+        assert_eq!(acked["committed_version"], 5);
+
+        // A table with no DB-wired handler still returns a valid ack (generic route).
+        let app = build_router(test_config());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/customer/sync/customer_preferences")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "id": "p1", "base_version": 0 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sync_write_idempotency_key_replays_the_same_ack() {
+        // The Arc<Mutex> idempotency cache is shared across clones of the config.
+        let config = test_config();
+        let first = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 7).await;
+        assert_eq!(first["committed_version"], 8);
+
+        // Same key, different base -> the ORIGINAL ack is replayed (not 1000), so a
+        // retried POST never re-runs the UPDATE / re-bumps version.
+        let retry = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 999).await;
+        assert_eq!(retry["committed_version"], 8);
+
+        // A different key is computed fresh.
+        let other = post_sync(config.clone(), Some("api_keys:k2:upsert:2"), 2).await;
+        assert_eq!(other["committed_version"], 3);
+    }
+
     #[tokio::test]
     async fn customer_websocket_route_requires_upgrade() {
         let app = build_router(test_config());
