@@ -2272,6 +2272,7 @@ mod tests {
             supabase_anon_key: None,
             pool: None,
             stream_tx: broadcast::channel(16).0,
+            idempotency: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
