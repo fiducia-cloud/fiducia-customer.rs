@@ -464,9 +464,10 @@ async fn rotate_customer_api_key(
     )
 }
 
-/// The @fiducia/sync write path. Upserts the api_keys row and returns the committed
-/// row version so the client can adopt it (clearing its optimistic `dirty` flag),
-/// then broadcasts the change so every other client reconciles too.
+/// The @fiducia/sync write path, generic in `{table}` (only `api_keys` is DB-wired
+/// today). Persists the queued optimistic write, returns the committed row version
+/// (a shared `WriteAck`) so the client adopts it and clears `dirty`, and broadcasts
+/// the change so every other client reconciles. Honors the client's Idempotency-Key.
 async fn sync_write(
     State(config): State<AppConfig>,
     Path(table): Path<String>,
