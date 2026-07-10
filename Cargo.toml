@@ -28,6 +28,11 @@ fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 # vertical reads/writes these against the customer DB when DATABASE_URL is set.
 fiducia-interfaces-db = { path = "../fiducia-interfaces/generated/rust-db" }
 
+# The local-first sync protocol core (native build, no wasm). The server builds
+# its `fiducia:sync` change frames and write-acks from THESE types, so the backend
+# and the @fiducia/sync browser client share exactly one protocol definition.
+fiducia-sync-core = { path = "../fiducia-sync" }
+
 # SQLx for the DB-backed api_keys handlers. Runtime-checked queries (query_as, not
 # the compile-time macros) so `cargo build` needs no live DB. `json` decodes the
 # scopes jsonb column carried by ApiKeysRow.
