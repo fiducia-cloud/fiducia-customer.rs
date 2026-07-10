@@ -661,17 +661,17 @@ fn api_key_row_to_display(row: &ApiKeysRow) -> serde_json::Value {
 /// Broadcast a single api_keys upsert as a `fiducia:sync` frame over the shared
 /// stream. Send errors (no subscribers) are ignored.
 fn broadcast_api_key_change(config: &AppConfig, row: &ApiKeysRow) {
-    let frame = json!({
-        "event": "fiducia:sync",
-        "changes": [{
-            "table": "api_keys",
-            "op": "upsert",
-            "id": row.id.to_string(),
-            "version": row.version,
-            "row": api_key_row_to_display(row),
-            "at_ms": unix_epoch_ms(),
-        }],
-    });
+    // Built from the shared fiducia-sync-core ChangeEvent so the server frame and
+    // the @fiducia/sync client decoder agree on exactly one envelope shape.
+    let change = ChangeEvent {
+        table: "api_keys".to_string(),
+        op: ChangeOp::Upsert,
+        id: row.id.to_string(),
+        version: row.version,
+        row: api_key_row_to_display(row),
+        at_ms: unix_epoch_ms() as i64,
+    };
+    let frame = json!({ "event": "fiducia:sync", "changes": [change] });
     let _ = config.stream_tx.send(frame.to_string());
 }
 
