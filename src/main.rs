@@ -251,6 +251,9 @@ struct AppConfig {
     /// original ack instead of re-running the UPDATE (which would re-bump version).
     /// In-process + bounded — retries happen within a connection's lifetime.
     idempotency: Arc<Mutex<HashMap<String, i64>>>,
+    /// Verifies the customer's Supabase session for `/api/customer/*` and scopes
+    /// writes to their org. Fail-closed (`Deny`) when no auth backend is set.
+    authenticator: Authenticator,
 }
 
 /// Cap on the in-process idempotency cache; cleared wholesale past this (retries
