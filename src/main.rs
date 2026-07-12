@@ -532,8 +532,12 @@ async fn sync_write(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     if let Some(key) = &idem_key {
-        if let Some(v) = config.idempotency.lock().unwrap().get(key).copied() {
-            return ack(&req.id, v).into_response();
+        match idempotency_begin(&config, key).await {
+            Idem::Replay(v) => return ack(&req.id, v).into_response(),
+            // A concurrent identical request holds the claim; don't re-run the
+            // mutation — return the monotonic fallback so the queue still drains.
+            Idem::InFlight => return ack(&req.id, req.base_version.unwrap_or(0) + 1).into_response(),
+            Idem::Proceed => {}
         }
     }
 
@@ -546,14 +550,95 @@ async fn sync_write(
     };
     let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
 
-    if let Some(key) = idem_key {
+    if let Some(key) = &idem_key {
+        idempotency_commit(&config, key, version).await;
+    }
+    ack(&req.id, version).into_response()
+}
+
+/// Idempotency decision for a claimed/seen key.
+enum Idem {
+    /// A previously-committed write — replay this version.
+    Replay(i64),
+    /// A concurrent claim is still in-flight — do not re-run.
+    InFlight,
+    /// We own the key (or there's no durable store) — run the mutation.
+    Proceed,
+}
+
+/// Begin idempotent handling of `key`. Durable (survives restarts) when a pool is
+/// present — claim-first so only the first request runs the mutation; otherwise an
+/// in-process cache (the mock/no-DB path used in tests).
+async fn idempotency_begin(config: &AppConfig, key: &str) -> Idem {
+    if let Some(pool) = &config.pool {
+        match store::idem_claim(pool, key).await {
+            Ok(true) => Idem::Proceed, // we own the claim
+            Ok(false) => match store::idem_committed(pool, key).await {
+                Ok(Some(Some(v))) => Idem::Replay(v),
+                Ok(Some(None)) => Idem::InFlight,
+                _ => Idem::Proceed, // vanished/error — recompute (write is data-idempotent)
+            },
+            Err(_) => Idem::Proceed, // ledger error must not block the write
+        }
+    } else if let Some(v) = config.idempotency.lock().unwrap().get(key).copied() {
+        Idem::Replay(v)
+    } else {
+        Idem::Proceed
+    }
+}
+
+/// Record the committed version for `key` (durable when pooled, else in-process).
+async fn idempotency_commit(config: &AppConfig, key: &str, version: i64) {
+    if let Some(pool) = &config.pool {
+        let _ = store::idem_record(pool, key, version).await;
+    } else {
         let mut cache = config.idempotency.lock().unwrap();
         if cache.len() >= IDEMPOTENCY_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, version);
+        cache.insert(key.to_owned(), version);
     }
-    ack(&req.id, version).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CatchupParams {
+    /// Return rows with `version` strictly greater than this cursor (default 0).
+    #[serde(default)]
+    since: i64,
+}
+
+/// Catch-up hydration: `GET /api/customer/sync/{table}?since=<version>` returns the
+/// authoritative rows newer than the client's cursor (org-scoped, ordered by
+/// version, index-backed) so anything missed while offline reconciles. Feeds the
+/// SDK's `hydrate()`.
+async fn sync_catchup(
+    State(config): State<AppConfig>,
+    Path(table): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<CatchupParams>,
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let rows: Vec<serde_json::Value> = match (table.as_str(), &config.pool) {
+        ("api_keys", Some(pool)) => {
+            let orgs = ctx.org_uuids();
+            if orgs.is_empty() {
+                vec![]
+            } else {
+                match store::catchup_api_keys(pool, &orgs, params.since, 500).await {
+                    Ok(rows) => rows.iter().map(api_key_row_to_display).collect(),
+                    Err(err) => {
+                        tracing::error!("api_keys catch-up failed: {err}");
+                        vec![]
+                    }
+                }
+            }
+        }
+        _ => vec![],
+    };
+    Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
 }
 
 /// Build the shared write-ack the @fiducia/sync client reconciles against.
