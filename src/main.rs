@@ -2389,6 +2389,13 @@ mod tests {
             pool: None,
             stream_tx: broadcast::channel(16).0,
             idempotency: Arc::new(Mutex::new(HashMap::new())),
+            // Tests exercise the handlers as an authenticated customer with a
+            // fixed org; production uses `Authenticator::from_env()` (fail-closed).
+            authenticator: Authenticator::Static(Arc::new(CustomerCtx {
+                user_id: "test-user".to_string(),
+                email: Some("test@fiducia.cloud".to_string()),
+                orgs: vec!["00000000-0000-0000-0000-000000000001".to_string()],
+            })),
         }
     }
 
