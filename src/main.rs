@@ -556,6 +556,68 @@ async fn sync_write(
     ack(&req.id, version).into_response()
 }
 
+#[derive(Deserialize)]
+struct SyncCatchupQuery {
+    #[serde(default)]
+    since: i64,
+    #[serde(default = "default_catchup_limit")]
+    limit: i64,
+}
+
+fn default_catchup_limit() -> i64 {
+    200
+}
+
+/// `GET /api/customer/sync/:table?since=&limit=` — the local-first catch-up read:
+/// hand back every row (org-scoped) whose monotonic `version` is newer than the
+/// client's high-water mark, so a reconnecting client hydrates missed changes
+/// without a full refetch. Authenticated + org-scoped like the write path.
+async fn sync_catchup(
+    State(config): State<AppConfig>,
+    Path(table): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<SyncCatchupQuery>,
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let limit = q.limit.clamp(1, 1000);
+    let changes: Vec<ChangeEvent> = match (table.as_str(), &config.pool) {
+        ("api_keys", Some(pool)) => {
+            match store::catchup_api_keys(pool, &ctx.org_uuids(), q.since, limit).await {
+                Ok(rows) => rows
+                    .iter()
+                    .map(|row| ChangeEvent {
+                        table: "api_keys".to_string(),
+                        op: ChangeOp::Upsert,
+                        id: row.id.to_string(),
+                        version: row.version,
+                        row: api_key_row_to_display(row),
+                        at_ms: unix_epoch_ms() as i64,
+                    })
+                    .collect(),
+                Err(err) => {
+                    tracing::error!("sync catchup query failed: {err}");
+                    Vec::new()
+                }
+            }
+        }
+        // No DB / no DB-wired table → an empty (but successful) catch-up page.
+        _ => Vec::new(),
+    };
+    let next_since = changes.iter().map(|c| c.version).max().unwrap_or(q.since);
+    Json(json!({
+        "ok": true,
+        "table": table,
+        "since": q.since,
+        "next_since": next_since,
+        "count": changes.len(),
+        "changes": changes,
+    }))
+    .into_response()
+}
+
 /// Idempotency decision for a claimed/seen key.
 enum Idem {
     /// A previously-committed write — replay this version.
