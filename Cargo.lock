@@ -393,6 +393,7 @@ dependencies = [
  "axum",
  "fiducia-interfaces",
  "fiducia-interfaces-db",
+ "fiducia-sync-core",
  "fiducia-telemetry",
  "getrandom 0.2.17",
  "maud",
@@ -425,6 +426,14 @@ dependencies = [
  "serde_json",
  "sqlx",
  "uuid",
+]
+
+[[package]]
+name = "fiducia-sync-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

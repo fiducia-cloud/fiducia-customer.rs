@@ -1,17 +1,20 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
 use fiducia_interfaces_db::customer::ApiKeysRow;
+use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -73,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|v| !v.is_empty()),
         pool,
         stream_tx,
+        idempotency: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = build_router(config);
@@ -144,11 +148,12 @@ fn build_router(config: AppConfig) -> Router {
             axum::routing::post(rotate_customer_api_key),
         )
         // Local-first sync write path: the @fiducia/sync client POSTs queued
-        // optimistic writes here; we persist via SQLx and return the committed row
-        // version so the client can adopt it and clear `dirty`.
+        // optimistic writes to /api/customer/sync/{table}; we persist via SQLx and
+        // return the committed row version so the client can adopt it and clear
+        // `dirty`. Generic in the table (only api_keys is DB-wired today).
         .route(
-            "/api/customer/sync/api_keys",
-            axum::routing::post(sync_write_api_keys),
+            "/api/customer/sync/:table",
+            axum::routing::post(sync_write),
         )
         .route(
             "/api/customer/preferences",
@@ -236,7 +241,15 @@ struct AppConfig {
     pool: Option<PgPool>,
     /// Fans `fiducia:refresh` + `fiducia:sync` frames out to WS/SSE subscribers.
     stream_tx: broadcast::Sender<String>,
+    /// Idempotency-Key → committed_version, so a retried sync write replays its
+    /// original ack instead of re-running the UPDATE (which would re-bump version).
+    /// In-process + bounded — retries happen within a connection's lifetime.
+    idempotency: Arc<Mutex<HashMap<String, i64>>>,
 }
+
+/// Cap on the in-process idempotency cache; cleared wholesale past this (retries
+/// are short-lived, so a coarse bound is fine and avoids unbounded growth).
+const IDEMPOTENCY_CACHE_CAP: usize = 10_000;
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
@@ -451,84 +464,118 @@ async fn rotate_customer_api_key(
     )
 }
 
-/// The @fiducia/sync write path. Upserts the api_keys row and returns the committed
-/// row version so the client can adopt it (clearing its optimistic `dirty` flag),
-/// then broadcasts the change so every other client reconciles too.
-async fn sync_write_api_keys(
+/// The @fiducia/sync write path, generic in `{table}` (only `api_keys` is DB-wired
+/// today). Persists the queued optimistic write, returns the committed row version
+/// (a shared `WriteAck`) so the client adopts it and clears `dirty`, and broadcasts
+/// the change so every other client reconciles. Honors the client's Idempotency-Key.
+async fn sync_write(
     State(config): State<AppConfig>,
+    Path(table): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<SyncWriteRequest>,
 ) -> impl IntoResponse {
-    let op = req.op.as_deref().unwrap_or("upsert");
-
-    if let Some(pool) = &config.pool {
-        if let Ok(id) = Uuid::parse_str(&req.id) {
-            let committed = if op == "delete" {
-                // A delete on a revocable credential is a soft revoke, not a row
-                // drop, so audit/history stay intact. Version still bumps.
-                sqlx::query_as::<_, ApiKeysRow>(
-                    "update api_keys set revoked = true where id = $1 returning *",
-                )
-                .bind(id)
-                .fetch_optional(pool)
-                .await
-            } else {
-                let payload = req.payload.clone().unwrap_or_else(|| json!({}));
-                let name = payload.get("name").and_then(|v| v.as_str());
-                let scopes = payload_scopes(&payload);
-                let env = payload
-                    .get("environment")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| payload.get("env").and_then(|v| v.as_str()));
-                let revoked = match payload.get("status").and_then(|v| v.as_str()) {
-                    Some("revoked") => Some(true),
-                    Some(_) => Some(false),
-                    None => payload.get("revoked").and_then(|v| v.as_bool()),
-                };
-                // COALESCE keeps existing values for any field the client omitted;
-                // the trigger bumps version + updated_at on the UPDATE.
-                sqlx::query_as::<_, ApiKeysRow>(
-                    "update api_keys set \
-                        name = coalesce($2, name), \
-                        scopes = coalesce($3, scopes), \
-                        env = coalesce($4, env), \
-                        revoked = coalesce($5, revoked) \
-                     where id = $1 returning *",
-                )
-                .bind(id)
-                .bind(name)
-                .bind(scopes)
-                .bind(env)
-                .bind(revoked)
-                .fetch_optional(pool)
-                .await
-            };
-
-            match committed {
-                Ok(Some(row)) => {
-                    broadcast_api_key_change(&config, &row);
-                    return (
-                        StatusCode::OK,
-                        Json(json!({
-                            "id": row.id.to_string(),
-                            "committed_version": row.version,
-                        })),
-                    );
-                }
-                Ok(None) => {}
-                Err(err) => tracing::error!("api_keys sync write failed: {err}"),
-            }
+    // Idempotency: replay the original ack for a retried key instead of re-running
+    // the UPDATE (whose trigger would re-bump `version`). Matches the client's
+    // stable `Idempotency-Key: table:id:op:base_version`.
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if let Some(key) = &idem_key {
+        if let Some(v) = config.idempotency.lock().unwrap().get(key).copied() {
+            return ack(&req.id, v);
         }
     }
 
-    // Fallback ack (no pool, unparseable id, or no matching row): return a
-    // monotonic version so the client's queue drains cleanly instead of retrying.
+    let committed = match table.as_str() {
+        "api_keys" => sync_write_api_keys_row(&config, &req).await,
+        // No DB-wired write handler for this table yet — fall through to the
+        // monotonic fallback ack so the client's queue still drains.
+        _ => None,
+    };
+    let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
+
+    if let Some(key) = idem_key {
+        let mut cache = config.idempotency.lock().unwrap();
+        if cache.len() >= IDEMPOTENCY_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, version);
+    }
+    ack(&req.id, version)
+}
+
+/// Build the shared write-ack the @fiducia/sync client reconciles against.
+fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
     (
         StatusCode::OK,
-        Json(json!({
-            "id": req.id,
-            "committed_version": req.base_version.unwrap_or(0) + 1,
-        })),
+        Json(WriteAck {
+            id: id.to_string(),
+            committed_version,
+        }),
     )
+}
+
+/// Persist one queued optimistic write to `api_keys`, broadcasting the committed
+/// change. Returns the committed row version, or `None` when there was no pool /
+/// no matching row / a bad id (caller falls back to a monotonic ack).
+async fn sync_write_api_keys_row(config: &AppConfig, req: &SyncWriteRequest) -> Option<i64> {
+    let pool = config.pool.as_ref()?;
+    let id = Uuid::parse_str(&req.id).ok()?;
+    let op = req.op.as_deref().unwrap_or("upsert");
+
+    let committed = if op == "delete" {
+        // A delete on a revocable credential is a soft revoke, not a row drop, so
+        // audit/history stay intact. Version still bumps.
+        sqlx::query_as::<_, ApiKeysRow>(
+            "update api_keys set revoked = true where id = $1 returning *",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    } else {
+        let payload = req.payload.clone().unwrap_or_else(|| json!({}));
+        let name = payload.get("name").and_then(|v| v.as_str());
+        let scopes = payload_scopes(&payload);
+        let env = payload
+            .get("environment")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload.get("env").and_then(|v| v.as_str()));
+        let revoked = match payload.get("status").and_then(|v| v.as_str()) {
+            Some("revoked") => Some(true),
+            Some(_) => Some(false),
+            None => payload.get("revoked").and_then(|v| v.as_bool()),
+        };
+        // COALESCE keeps existing values for any field the client omitted; the
+        // trigger bumps version + updated_at on the UPDATE.
+        sqlx::query_as::<_, ApiKeysRow>(
+            "update api_keys set \
+                name = coalesce($2, name), \
+                scopes = coalesce($3, scopes), \
+                env = coalesce($4, env), \
+                revoked = coalesce($5, revoked) \
+             where id = $1 returning *",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(scopes)
+        .bind(env)
+        .bind(revoked)
+        .fetch_optional(pool)
+        .await
+    };
+
+    match committed {
+        Ok(Some(row)) => {
+            broadcast_api_key_change(config, &row);
+            Some(row.version)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::error!("api_keys sync write failed: {err}");
+            None
+        }
+    }
 }
 
 /// SHA-256 of an API-key secret. Only the hash is ever persisted — the plaintext
@@ -615,17 +662,17 @@ fn api_key_row_to_display(row: &ApiKeysRow) -> serde_json::Value {
 /// Broadcast a single api_keys upsert as a `fiducia:sync` frame over the shared
 /// stream. Send errors (no subscribers) are ignored.
 fn broadcast_api_key_change(config: &AppConfig, row: &ApiKeysRow) {
-    let frame = json!({
-        "event": "fiducia:sync",
-        "changes": [{
-            "table": "api_keys",
-            "op": "upsert",
-            "id": row.id.to_string(),
-            "version": row.version,
-            "row": api_key_row_to_display(row),
-            "at_ms": unix_epoch_ms(),
-        }],
-    });
+    // Built from the shared fiducia-sync-core ChangeEvent so the server frame and
+    // the @fiducia/sync client decoder agree on exactly one envelope shape.
+    let change = ChangeEvent {
+        table: "api_keys".to_string(),
+        op: ChangeOp::Upsert,
+        id: row.id.to_string(),
+        version: row.version,
+        row: api_key_row_to_display(row),
+        at_ms: unix_epoch_ms() as i64,
+    };
+    let frame = json!({ "event": "fiducia:sync", "changes": [change] });
     let _ = config.stream_tx.send(frame.to_string());
 }
 
@@ -2260,6 +2307,7 @@ mod tests {
             supabase_anon_key: None,
             pool: None,
             stream_tx: broadcast::channel(16).0,
+            idempotency: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2620,6 +2668,63 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(ct.contains("text/event-stream"), "ct={ct}");
+    }
+
+    async fn post_sync(config: AppConfig, key: Option<&str>, base: i64) -> serde_json::Value {
+        let app = build_router(config);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/customer/sync/api_keys")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(k) = key {
+            builder = builder.header("idempotency-key", k);
+        }
+        let body = json!({ "id": "k1", "op": "upsert", "base_version": base }).to_string();
+        let resp = app.oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_write_is_generic_in_table_and_acks_a_monotonic_version() {
+        // No pool in tests -> the fallback ack (base_version + 1) for ANY table, so
+        // the client's write-queue always drains.
+        let acked = post_sync(test_config(), None, 4).await;
+        assert_eq!(acked["id"], "k1");
+        assert_eq!(acked["committed_version"], 5);
+
+        // A table with no DB-wired handler still returns a valid ack (generic route).
+        let app = build_router(test_config());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/customer/sync/customer_preferences")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "id": "p1", "base_version": 0 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sync_write_idempotency_key_replays_the_same_ack() {
+        // The Arc<Mutex> idempotency cache is shared across clones of the config.
+        let config = test_config();
+        let first = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 7).await;
+        assert_eq!(first["committed_version"], 8);
+
+        // Same key, different base -> the ORIGINAL ack is replayed (not 1000), so a
+        // retried POST never re-runs the UPDATE / re-bumps version.
+        let retry = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 999).await;
+        assert_eq!(retry["committed_version"], 8);
+
+        // A different key is computed fresh.
+        let other = post_sync(config.clone(), Some("api_keys:k2:upsert:2"), 2).await;
+        assert_eq!(other["committed_version"], 3);
     }
 
     #[tokio::test]
