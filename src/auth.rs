@@ -20,7 +20,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 /// A verified customer session — who is calling and which orgs they belong to.
+/// `user_id`/`email` are carried for audit/attribution; not every handler reads
+/// them yet.
 #[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct CustomerCtx {
     #[serde(default)]
     pub user_id: String,
