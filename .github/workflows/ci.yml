@@ -1,3 +1,5 @@
+# CI: fmt, clippy, unit tests (--bins), and audit. Checks out the sibling
+# fiducia-interfaces repo so the path-dependency crates resolve.
 name: ci
 
 on:
