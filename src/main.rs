@@ -1,6 +1,9 @@
 // fiducia-backend entrypoint: the axum app for fiducia.cloud's website tier.
 // Serves the static Astro marketing site, the Maud/HTMX customer portal and its
 // WS/SSE fragment streams, plus the DB-backed api_keys + @fiducia/sync endpoints.
+mod auth;
+
+use auth::{Authenticator, CustomerCtx};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
