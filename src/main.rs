@@ -521,7 +521,13 @@ async fn sync_write(
     Path(table): Path<String>,
     headers: HeaderMap,
     Json(req): Json<SyncWriteRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    // Authenticate before any state read/write: the sync path is a row-mutating
+    // surface and was previously an unauthenticated IDOR into api_keys.
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     // Idempotency: replay the original ack for a retried key instead of re-running
     // the UPDATE (whose trigger would re-bump `version`). Matches the client's
     // stable `Idempotency-Key: table:id:op:base_version`.
@@ -531,12 +537,13 @@ async fn sync_write(
         .map(str::to_owned);
     if let Some(key) = &idem_key {
         if let Some(v) = config.idempotency.lock().unwrap().get(key).copied() {
-            return ack(&req.id, v);
+            return ack(&req.id, v).into_response();
         }
     }
 
     let committed = match table.as_str() {
-        "api_keys" => sync_write_api_keys_row(&config, &req).await,
+        // Scoped to the caller's org so a client can only mutate its own rows.
+        "api_keys" => sync_write_api_keys_row(&config, &req, &ctx).await,
         // No DB-wired write handler for this table yet — fall through to the
         // monotonic fallback ack so the client's queue still drains.
         _ => None,
@@ -550,7 +557,7 @@ async fn sync_write(
         }
         cache.insert(key, version);
     }
-    ack(&req.id, version)
+    ack(&req.id, version).into_response()
 }
 
 /// Build the shared write-ack the @fiducia/sync client reconciles against.
