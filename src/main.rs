@@ -161,7 +161,7 @@ fn build_router(config: AppConfig) -> Router {
         // `dirty`. Generic in the table (only api_keys is DB-wired today).
         .route(
             "/api/customer/sync/:table",
-            axum::routing::post(sync_write),
+            axum::routing::post(sync_write).get(sync_catchup),
         )
         .route(
             "/api/customer/preferences",
