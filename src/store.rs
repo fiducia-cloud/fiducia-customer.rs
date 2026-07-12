@@ -116,6 +116,67 @@ pub async fn upsert_fields(
     .await
 }
 
+/// Catch-up hydration: keys strictly newer than `since` (org-scoped), ordered by
+/// the monotonic `version`. Backed by the `api_keys (org_id, version)` index, so
+/// this is an index range scan, not a table scan. `limit` bounds one page.
+pub async fn catchup_api_keys(
+    pool: &PgPool,
+    orgs: &[Uuid],
+    since: i64,
+    limit: i64,
+) -> Result<Vec<ApiKeysRow>, sqlx::Error> {
+    sqlx::query_as::<_, ApiKeysRow>(
+        "select * from api_keys \
+         where org_id = any($1) and version > $2 \
+         order by version asc limit $3",
+    )
+    .bind(orgs)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+// ─── Durable idempotency ledger ─────────────────────────────────────────────
+// The write path records the committed version it returned for each client
+// Idempotency-Key in `sync_idempotency_keys`, so a retried write replays the same
+// ack ACROSS RESTARTS instead of re-running the UPDATE (which would re-bump
+// version). Claim-first so only the first request runs the mutation.
+
+/// Try to claim `key`. `Ok(true)` => we own it (run the mutation); `Ok(false)` =>
+/// it already existed (replay via [`idem_committed`]).
+pub async fn idem_claim(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
+    let claimed = sqlx::query_scalar::<_, i32>(
+        "insert into sync_idempotency_keys (key) values ($1) \
+         on conflict (key) do nothing returning 1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(claimed.is_some())
+}
+
+/// The recorded outcome for `key`: `None` => no such key; `Some(None)` => claimed
+/// but still in-flight; `Some(Some(v))` => committed at version `v` (replay it).
+pub async fn idem_committed(pool: &PgPool, key: &str) -> Result<Option<Option<i64>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        "select committed_version from sync_idempotency_keys where key = $1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Record the committed version for a claimed key.
+pub async fn idem_record(pool: &PgPool, key: &str, version: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("update sync_idempotency_keys set committed_version = $2 where key = $1")
+        .bind(key)
+        .bind(version)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 // ─── DB behavior tests ──────────────────────────────────────────────────────
 //
 // These pin the org-isolation + versioning semantics of the seam against a REAL
