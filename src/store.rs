@@ -115,3 +115,166 @@ pub async fn upsert_fields(
     .fetch_optional(pool)
     .await
 }
+
+// ─── DB behavior tests ──────────────────────────────────────────────────────
+//
+// These pin the org-isolation + versioning semantics of the seam against a REAL
+// Postgres, so the storage-engine migration (raw SQL → ORM) is provably
+// behaviour-preserving: the identical suite runs before and after the swap.
+//
+// Gated on `TEST_DATABASE_URL` (a Postgres the harness may create/drop freely);
+// unset → the tests skip with a note, so `cargo test` stays green with no DB.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/customer.sql");
+
+    async fn pool_or_skip() -> Option<PgPool> {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        // Canonical customer schema; idempotent (`create ... if not exists`), and
+        // the Supabase realtime/RLS blocks are no-ops on a plain Postgres.
+        sqlx::raw_sql(SCHEMA)
+            .execute(&pool)
+            .await
+            .expect("apply customer.sql");
+        Some(pool)
+    }
+
+    fn uniq(prefix: &str) -> String {
+        format!("{prefix}-{}", Uuid::new_v4().simple())
+    }
+
+    async fn make_org(pool: &PgPool) -> Uuid {
+        let slug = uniq("org");
+        sqlx::query_scalar::<_, Uuid>("insert into orgs (slug, name) values ($1, $2) returning id")
+            .bind(&slug)
+            .bind(&slug)
+            .fetch_one(pool)
+            .await
+            .expect("insert org")
+    }
+
+    fn new_key(org: Uuid, key_id: &str) -> NewApiKey<'_> {
+        NewApiKey {
+            key_id,
+            org_id: org,
+            name: "test key",
+            secret_hash: "sha256:deadbeef".to_string(),
+            scopes: serde_json::json!(["requests:write"]),
+            env: "live",
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_list_are_org_scoped() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip insert_and_list_are_org_scoped: TEST_DATABASE_URL unset");
+            return;
+        };
+        let (org_a, org_b) = (make_org(&pool).await, make_org(&pool).await);
+        let ka = uniq("fid_live");
+        let kb = uniq("fid_live");
+        insert_api_key(&pool, new_key(org_a, &ka)).await.unwrap();
+        insert_api_key(&pool, new_key(org_b, &kb)).await.unwrap();
+
+        let only_a = list_api_keys(&pool, &[org_a]).await.unwrap();
+        assert_eq!(only_a.len(), 1, "org A sees exactly its own key");
+        assert_eq!(only_a[0].key_id, ka);
+        assert!(only_a.iter().all(|r| r.org_id == org_a));
+
+        let only_b = list_api_keys(&pool, &[org_b]).await.unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].key_id, kb);
+
+        let both = list_api_keys(&pool, &[org_a, org_b]).await.unwrap();
+        assert_eq!(both.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rotate_is_org_scoped() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip rotate_is_org_scoped: TEST_DATABASE_URL unset");
+            return;
+        };
+        let (org_a, org_b) = (make_org(&pool).await, make_org(&pool).await);
+        let prefix = uniq("fid_live");
+        let created = insert_api_key(&pool, new_key(org_a, &prefix)).await.unwrap();
+
+        // Another org cannot rotate org A's key.
+        let cross = rotate_secret(&pool, &prefix, "sha256:new".into(), &[org_b])
+            .await
+            .unwrap();
+        assert!(cross.is_none(), "cross-org rotate must not match any row");
+
+        // The owning org can, and the row version bumps.
+        let rotated = rotate_secret(&pool, &prefix, "sha256:new".into(), &[org_a])
+            .await
+            .unwrap()
+            .expect("owner rotate returns the row");
+        assert_eq!(rotated.secret_hash, "sha256:new");
+        assert_eq!(rotated.version, created.version + 1);
+    }
+
+    #[tokio::test]
+    async fn soft_delete_and_upsert_are_org_scoped() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip soft_delete_and_upsert_are_org_scoped: TEST_DATABASE_URL unset");
+            return;
+        };
+        let (org_a, org_b) = (make_org(&pool).await, make_org(&pool).await);
+        let created = insert_api_key(&pool, new_key(org_a, &uniq("fid_live")))
+            .await
+            .unwrap();
+
+        // Cross-org upsert is a no-op.
+        let cross = upsert_fields(
+            &pool,
+            created.id,
+            &[org_b],
+            ApiKeyPatch {
+                name: Some("hijacked".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(cross.is_none(), "cross-org upsert must not match");
+
+        // Owner upsert applies the patch, coalesces omitted fields, bumps version.
+        let patched = upsert_fields(
+            &pool,
+            created.id,
+            &[org_a],
+            ApiKeyPatch {
+                name: Some("renamed".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .expect("owner upsert returns the row");
+        assert_eq!(patched.name, "renamed");
+        assert_eq!(patched.env, created.env, "omitted field preserved");
+        assert_eq!(patched.version, created.version + 1);
+
+        // Cross-org soft delete is a no-op; owner soft delete revokes.
+        assert!(soft_delete(&pool, created.id, &[org_b])
+            .await
+            .unwrap()
+            .is_none());
+        let deleted = soft_delete(&pool, created.id, &[org_a])
+            .await
+            .unwrap()
+            .expect("owner soft delete returns the row");
+        assert!(deleted.revoked);
+    }
+}
