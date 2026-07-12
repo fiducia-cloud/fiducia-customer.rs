@@ -2,6 +2,7 @@
 // Serves the static Astro marketing site, the Maud/HTMX customer portal and its
 // WS/SSE fragment streams, plus the DB-backed api_keys + @fiducia/sync endpoints.
 mod auth;
+mod store;
 
 use auth::{Authenticator, CustomerCtx};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
