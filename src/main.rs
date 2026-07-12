@@ -375,13 +375,19 @@ async fn customer_api_keys_json(State(config): State<AppConfig>, headers: Header
 
 async fn create_customer_api_key(
     State(config): State<AppConfig>,
+    headers: HeaderMap,
     Json(payload): Json<CreateCustomerApiKeyRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     if let Some(error) = validate_api_key_request(&payload) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": error, "ok": false })),
-        );
+        )
+            .into_response();
     }
 
     let environment_prefix = if payload.environment == "live" {
@@ -394,10 +400,17 @@ async fn create_customer_api_key(
     let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
     let secret = format!("{prefix}_{}", random_token_hex(24));
 
-    // DB path: persist the key (storing only the secret hash) and broadcast the
-    // new row as a fiducia:sync change so any connected client folds it in.
+    // DB path: persist the key (storing only the secret hash) under the CALLER's
+    // org (never "first org"), and broadcast the new row as a fiducia:sync change.
     if let Some(pool) = &config.pool {
-        match insert_api_key(pool, &payload, &prefix, &secret).await {
+        let Some(org_id) = ctx.org_uuids().into_iter().next() else {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "no_org_membership" })),
+            )
+                .into_response();
+        };
+        match insert_api_key(pool, &payload, &prefix, &secret, org_id).await {
             Ok(row) => {
                 broadcast_api_key_change(&config, &row);
                 let mut api_key = api_key_row_to_display(&row);
@@ -411,7 +424,8 @@ async fn create_customer_api_key(
                         "secret": secret,
                         "secret_once": true,
                     })),
-                );
+                )
+                    .into_response();
             }
             Err(err) => tracing::error!("api_key insert failed: {err}"),
         }
@@ -435,6 +449,7 @@ async fn create_customer_api_key(
             "secret_once": true,
         })),
     )
+        .into_response()
 }
 
 async fn rotate_customer_api_key(
