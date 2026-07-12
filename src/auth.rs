@@ -35,11 +35,6 @@ pub struct CustomerCtx {
 }
 
 impl CustomerCtx {
-    /// The org new resources are created under (the caller's first org).
-    pub fn primary_org(&self) -> Option<&str> {
-        self.orgs.first().map(String::as_str)
-    }
-
     /// Caller's orgs parsed to UUIDs, for scoping SQL to rows they own.
     pub fn org_uuids(&self) -> Vec<uuid::Uuid> {
         self.orgs
