@@ -16,6 +16,10 @@ getrandom = "0.2"
 maud = { version = "0.26", features = ["axum"] }
 async-stream = "0.3"
 tower-http = { version = "0.5", features = ["trace", "fs", "timeout", "limit", "catch-panic", "set-header"] }
+# Verifies the customer's Supabase session by calling fiducia-auth `GET /v1/me`
+# (the single source of truth for session verification), so /api/customer/*
+# mutations are authenticated + org-scoped instead of open to the internet.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
