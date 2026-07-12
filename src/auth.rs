@@ -46,7 +46,9 @@ impl CustomerCtx {
 
 /// How a request is authenticated. Production verifies via fiducia-auth; tests
 /// inject a fixed context; an unconfigured deployment denies (fail closed).
+/// `Static` is only constructed in tests.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub enum Authenticator {
     /// Verify the Bearer session via fiducia-auth `GET {url}/v1/me`.
     AuthService(String),
