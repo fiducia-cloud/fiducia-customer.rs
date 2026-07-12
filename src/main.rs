@@ -625,12 +625,10 @@ async fn insert_api_key(
     payload: &CreateCustomerApiKeyRequest,
     prefix: &str,
     secret: &str,
+    org_id: Uuid,
 ) -> Result<ApiKeysRow, sqlx::Error> {
-    let org_id: Uuid =
-        sqlx::query_scalar("select id from orgs order by created_at asc limit 1")
-            .fetch_one(pool)
-            .await?;
-
+    // org_id is the caller's verified org (from their Supabase session), never a
+    // server-chosen "first org". The FK on api_keys.org_id rejects a forged org.
     sqlx::query_as::<_, ApiKeysRow>(
         "insert into api_keys (key_id, org_id, name, secret_hash, scopes, env) \
          values ($1, $2, $3, $4, $5, $6) returning *",
