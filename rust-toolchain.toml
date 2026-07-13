@@ -1,4 +1,4 @@
 # Pins the Rust toolchain (stable + rustfmt/clippy) so local and CI builds match.
 [toolchain]
-channel = "stable"
+channel = "1.97.0"
 components = ["rustfmt", "clippy"]

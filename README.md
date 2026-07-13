@@ -142,7 +142,7 @@ scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- car
 
 The backend consumes generated Rust and database contracts from
 `fiducia-interfaces`. CI and the Dockerfile both pin that dependency to commit
-`5f2c5279ee19941024455b2843256872485bac82`; neither follows a moving branch.
+`487e470c45ab5851e8f6f3b1dc048fe067fbf408`; neither follows a moving branch.
 The container checks the commit out detached and verifies that its full `HEAD`
 equals `INTERFACES_SHA` before compiling with the committed Cargo lockfile. CI,
 `Cargo.toml`, and the builder image use Rust 1.97; the registry-verified base and
