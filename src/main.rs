@@ -436,6 +436,25 @@ async fn request_security_gate(
     next.run(request).await
 }
 
+/// Harden a customer-sensitive response: never cache it (it carries the user's
+/// email, org ids, and CSRF token) and pin the strict portal CSP. Applied both
+/// by the path-based middleware and directly by the portal renderer, because the
+/// authenticated dashboard is reachable at `/` (app host) as well as `/app*`.
+fn apply_sensitive_response_headers(headers: &mut HeaderMap) {
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'self'",
+        ),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+}
+
 async fn security_headers(request: Request, next: Next) -> Response {
     let path = request.uri().path();
     let sensitive = path == "/login"
@@ -444,19 +463,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
         || path.starts_with("/api/customer");
     let mut response = next.run(request).await;
     if sensitive {
-        let headers = response.headers_mut();
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-        headers.insert(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(
-                "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'self'",
-            ),
-        );
-        headers.insert(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        );
+        apply_sensitive_response_headers(response.headers_mut());
     }
     response
 }
