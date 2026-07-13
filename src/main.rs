@@ -2421,8 +2421,12 @@ fn unix_epoch_ms() -> u128 {
         .as_millis()
 }
 
-fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
-    if config.customer_site_mode {
+fn host_serves_customer_app(
+    headers: &HeaderMap,
+    customer_app_host: &str,
+    customer_site_mode: bool,
+) -> bool {
+    if customer_site_mode {
         return true;
     }
 
@@ -2430,7 +2434,11 @@ fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
         return false;
     };
     let host = host.split(':').next().unwrap_or(host);
-    host.eq_ignore_ascii_case(&config.customer_app_host)
+    host.eq_ignore_ascii_case(customer_app_host)
+}
+
+fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
+    host_serves_customer_app(headers, &config.customer_app_host, config.customer_site_mode)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
