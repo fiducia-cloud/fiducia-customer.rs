@@ -9,7 +9,7 @@ mod store;
 use auth::{Authenticator, CustomerCtx};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -40,6 +41,8 @@ const STREAM_HEARTBEAT_SECS: u64 = 15;
 const CUSTOMER_WS_PATH: &str = "/app/ws";
 const CUSTOMER_EVENTS_PATH: &str = "/app/events";
 const CUSTOMER_ORG_HEADER: &str = "x-fiducia-org-id";
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const CORS_MAX_AGE_SECS: u64 = 10 * 60;
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -57,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let customer_static_dir: PathBuf = std::env::var("CUSTOMER_STATIC_DIR")
         .unwrap_or_else(|_| "customer-static".to_string())
         .into();
+    let customer_app_origin = customer_app_origin_from_env()?;
 
     // Customer state is always durable. A missing/unreachable database is a
     // deployment error, not permission to serve invented customer data.
@@ -77,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         customer_static_dir: customer_static_dir.clone(),
         customer_app_host: std::env::var("CUSTOMER_APP_HOST")
             .unwrap_or_else(|_| "app.fiducia.cloud".to_string()),
+        customer_app_origin,
         customer_site_mode: std::env::var("FIDUCIA_SITE_MODE")
             .map(|v| v.eq_ignore_ascii_case("customer"))
             .unwrap_or(false),
@@ -127,6 +132,71 @@ fn required_env(name: &str) -> Result<String, io::Error> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} must be set")))
 }
 
+fn customer_app_origin_from_env() -> Result<Option<HeaderValue>, io::Error> {
+    match std::env::var("CUSTOMER_APP_ORIGIN") {
+        Ok(value) if !value.trim().is_empty() => parse_customer_app_origin(&value).map(Some),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be valid UTF-8",
+        )),
+    }
+}
+
+fn parse_customer_app_origin(value: &str) -> Result<HeaderValue, io::Error> {
+    let value = value.trim();
+    let uri = value.parse::<Uri>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be an absolute http(s) origin",
+        )
+    })?;
+    let scheme = uri.scheme_str().filter(|scheme| matches!(*scheme, "http" | "https"));
+    let authority = uri.authority().filter(|authority| !authority.as_str().contains('@'));
+    let root_only = uri
+        .path_and_query()
+        .map(|path| path.as_str() == "/")
+        .unwrap_or(true);
+    let (Some(scheme), Some(authority)) = (scheme, authority) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must contain only an http(s) scheme and host",
+        ));
+    };
+    if !root_only {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must not contain a path, query, or fragment",
+        ));
+    }
+    let canonical = format!("{scheme}://{authority}");
+    if value != canonical && value != format!("{canonical}/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be a single exact origin",
+        ));
+    }
+    HeaderValue::from_str(&canonical).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN is not a valid HTTP header origin",
+        )
+    })
+}
+
+fn customer_cors(origin: HeaderValue) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static(CUSTOMER_ORG_HEADER),
+            HeaderName::from_static(IDEMPOTENCY_KEY_HEADER),
+        ])
+        .max_age(Duration::from_secs(CORS_MAX_AGE_SECS))
+}
+
 /// Build the application router. Separated from `main` so tests can exercise the
 /// routes without binding a socket or initializing telemetry.
 fn build_router(config: AppConfig) -> Router {
@@ -138,11 +208,12 @@ fn build_router(config: AppConfig) -> Router {
         .fallback(ServeFile::new(config.static_dir.join("404.html")));
     let customer_assets =
         ServeDir::new(&config.customer_static_dir).append_index_html_on_directories(false);
+    let customer_app_origin = config.customer_app_origin.clone();
 
     // Routes are declared as flat literals (not nested) so the shared API-docs
     // generator (remote/tools/generate-api-docs.mjs, which scans the router's
     // route declarations) records their true paths.
-    Router::new()
+    let router = Router::new()
         // Liveness/readiness probe (matches the sibling canonical.cloud
         // convention); also available as /api/health.
         .route("/healthz", get(health))
@@ -228,7 +299,12 @@ fn build_router(config: AppConfig) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new())
+        .layer(CatchPanicLayer::new());
+
+    match customer_app_origin {
+        Some(origin) => router.layer(customer_cors(origin)),
+        None => router,
+    }
 }
 
 #[derive(Clone)]
@@ -236,6 +312,9 @@ struct AppConfig {
     static_dir: PathBuf,
     customer_static_dir: PathBuf,
     customer_app_host: String,
+    /// Exact standalone customer origin allowed to call this service from a
+    /// browser. `None` keeps the service same-origin-only.
+    customer_app_origin: Option<HeaderValue>,
     customer_site_mode: bool,
     supabase_url: Option<String>,
     supabase_anon_key: Option<String>,

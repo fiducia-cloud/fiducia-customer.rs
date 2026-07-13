@@ -82,9 +82,11 @@ explicit errors instead of falling back to a second key store.
 API-key create/list/rotate requests are authenticated here and proxied to
 `fiducia-auth`; only its sanitized metadata contract is returned. Rotation
 replaces the authoritative secret immediately and reports the bounded positive
-edge/LB cache overlap to the caller. The portal can display locally observed session
-records, but provider-backed session revocation is intentionally reported as
-unsupported until Supabase session identifiers and Admin revocation are wired.
+edge/LB cache overlap to the caller. The portal displays locally observed session
+records and can mark one revoked — a user-scoped audit-state change in customer
+Postgres. Provider-backed revocation (invalidating the actual Supabase
+session/refresh token via session identifiers and the Admin API) is still not
+wired; do not treat the local revoke as having terminated the provider session.
 TOTP enrollment is available in the UI, but production-key issuance is not yet
 gated on AAL2; do not treat enrollment as an enforced issuance policy. Privileged
 admin scopes are not issued by this customer-membership-only API.
