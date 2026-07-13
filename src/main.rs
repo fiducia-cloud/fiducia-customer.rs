@@ -340,7 +340,10 @@ fn build_router(config: AppConfig) -> Router {
             request_security,
             request_security_gate,
         ))
-        .layer(middleware::from_fn(security_headers));
+        .layer(middleware::from_fn_with_state(
+            sensitive_header_context,
+            security_headers,
+        ));
 
     match customer_app_origin {
         Some(origin) => router.layer(customer_cors(origin)),
