@@ -1,7 +1,16 @@
-# fiducia-backend
+# fiducia-customer
 
 The canonical customer web application and BFF for
 [fiducia.cloud](https://fiducia.cloud). It is a Rust MASH deployment:
+
+> [!NOTE]
+> **Naming.** This repository was renamed from `fiducia-backend.rs` to
+> `fiducia-customer.rs` (2026-07) — it is the *customer* app, not a shared
+> backend. The deployed runtime identity intentionally still uses the historical
+> name: the crate/binary is `fiducia-backend`, the test image is
+> `ghcr.io/fiducia-cloud/fiducia-backend`, and the k8s Deployment/Service/HPA in
+> the `fiducia` namespace are `fiducia-backend`. Renaming those is a live-infra
+> change tracked separately; GitHub redirects the old repo URL.
 
 - **Maud** renders escaped, compile-checked customer HTML.
 - **Axum** owns routes, middleware, cookies, WebSocket/SSE refresh endpoints,
@@ -10,7 +19,7 @@ The canonical customer web application and BFF for
   Postgres.
 - **HTMX** progressively enhances same-origin forms and authenticated fragments.
 
-The sibling `fiducia-ui.web` is the static Astro marketing site only; its build
+The sibling `fiducia-marketing.web` is the static Astro marketing site only; its build
 is the fallback for the public host. The deprecated `fiducia-customer-ui.web`
 SPA is preserved for history but is not loaded or deployed by this service.
 
@@ -18,7 +27,7 @@ SPA is preserved for history but is not loaded or deployed by this service.
 
 | Boundary | Customer | Admin |
 |---|---|---|
-| Repository | `fiducia-backend.rs` | `fiducia-admin.rs` |
+| Repository | `fiducia-customer.rs` | `fiducia-admin.rs` |
 | Cookie | release `__Host-fiducia_customer_session` | release `__Host-fiducia_admin_session` |
 | Database | `fiducia-interfaces/sql/customer.sql` | `fiducia-interfaces/sql/admin.sql` |
 | Authorization | verified user plus explicit org membership | trusted operator role plus local operator registry |
@@ -75,7 +84,7 @@ the auth service.
 | `GET /healthz`, `GET /api/health` | health probes |
 | `GET /api/info` | deployment metadata |
 | `GET /docs/api`, `GET /api/docs.json` | generated human/machine-readable route inventory |
-| other paths | static `fiducia-ui.web` marketing build |
+| other paths | static `fiducia-marketing.web` marketing build |
 
 The heartbeat transports refresh signals and server-rendered summary fragments,
 not customer rows, API-key metadata, or credentials. Customer data is reloaded
@@ -98,7 +107,7 @@ without inventing database state.
 ## Run locally
 
 ```sh
-STATIC_DIR=../fiducia-ui.web/dist \
+STATIC_DIR=../fiducia-marketing.web/dist \
 DATABASE_URL=postgres://... \
 FIDUCIA_AUTH_URL=http://127.0.0.1:8097 \
 SUPABASE_URL=https://example.supabase.co \
@@ -135,7 +144,7 @@ Non-secret options can be mapped from audited flags:
 
 ```sh
 make -B -C vendor/flags-2-env all
-scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- cargo run --locked
+scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-marketing.web/dist -- cargo run --locked
 ```
 
 ### Reproducible container and CI dependency
@@ -188,6 +197,6 @@ on every dependency update.
 > **Canonical source.** This repository is the source of truth for its code. It
 > is also vendored as a secondary git submodule of
 > [ORESoftware/k8s-cluster](https://github.com/ORESoftware/k8s-cluster) at
-> `remote/deployments/fiducia-backend.rs`; make changes here, not in that
+> `remote/deployments/fiducia-customer.rs`; make changes here, not in that
 > submodule checkout.
 <!-- END k8s-cluster-submodule-notice -->

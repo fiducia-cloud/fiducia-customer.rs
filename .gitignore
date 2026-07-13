@@ -7,7 +7,7 @@
 
 # Built Astro site. NOT committed — the deployment builds it in-pod (node
 # initContainer) and hands it to this backend via STATIC_DIR. For local dev,
-# point STATIC_DIR at ../fiducia-ui.web/dist (or run `npm run sync` there).
+# point STATIC_DIR at ../fiducia-marketing.web/dist (or run `npm run sync` there).
 /static
 /dist
 

@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     // Directory of the built Astro site. Defaults to the bundled `static/`
-    // (populated from fiducia-ui.web's `dist/` at build time), but can be
+    // (populated from fiducia-marketing.web's `dist/` at build time), but can be
     // pointed straight at the frontend dist via STATIC_DIR for local dev.
     let static_dir: PathBuf = std::env::var("STATIC_DIR")
         .unwrap_or_else(|_| "static".to_string())
@@ -3981,7 +3981,7 @@ mod tests {
             let (status, ct, body) = send(uri).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
             assert!(ct.contains("text/html"), "{uri} ct={ct}");
-            assert!(body.contains("fiducia-backend.rs API docs"), "{uri}");
+            assert!(body.contains("fiducia-customer.rs API docs"), "{uri}");
         }
     }
 
@@ -3991,7 +3991,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(ct.contains("application/json"), "ct={ct}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["service"], "fiducia-backend.rs");
+        assert_eq!(v["service"], "fiducia-customer.rs");
         let routes = v["routes"].as_array().unwrap();
         assert_eq!(v["routeCount"].as_u64().unwrap() as usize, routes.len());
         assert!(

@@ -1,7 +1,7 @@
 # Non-secret command-line configuration for fiducia-backend. Database credentials
 # and authentication material remain environment-only.
 [help]
-url = "https://github.com/fiducia-cloud/fiducia-backend.rs"
+url = "https://github.com/fiducia-cloud/fiducia-customer.rs"
 columns = ["options", "env", "type", "description"]
 
 [parse]

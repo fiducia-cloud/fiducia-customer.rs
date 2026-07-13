@@ -29,7 +29,7 @@ The customer MASH server is a bin-only crate (no `lib.rs`).
 - **`entity/`** — SeaORM models for customer tables.
 
 The static-file fallback serves only the built Astro marketing site
-(`fiducia-ui.web` via `STATIC_DIR`). Customer assets are compiled into the Rust
+(`fiducia-marketing.web` via `STATIC_DIR`). Customer assets are compiled into the Rust
 binary from `assets/`; there is no runtime customer-SPA dependency.
 
 `build_router()` is intentionally split from `main()` so unit tests can exercise

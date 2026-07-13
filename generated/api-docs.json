@@ -1,7 +1,7 @@
 {
   "ok": true,
   "generatedBy": "remote/tools/generate-api-docs.mjs",
-  "service": "fiducia-backend.rs",
+  "service": "fiducia-customer.rs",
   "language": "rust",
   "routeCount": 38,
   "routeTypeCounts": {
@@ -27,7 +27,7 @@
         "root"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -46,7 +46,7 @@
         "customer_api_keys_json"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -63,7 +63,7 @@
         "revoke_customer_api_key"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -80,7 +80,7 @@
         "rotate_customer_api_key"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -97,7 +97,7 @@
         "customer_context_json"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -116,7 +116,7 @@
         "update_customer_preferences"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -133,7 +133,7 @@
         "customer_security_sessions_json"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -150,7 +150,7 @@
         "revoke_customer_security_session"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -167,7 +167,7 @@
         "sync_catchup"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -184,7 +184,7 @@
         "api_docs_html"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -201,7 +201,7 @@
         "api_docs_json"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -218,7 +218,7 @@
         "health"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -235,7 +235,7 @@
         "info"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -252,7 +252,7 @@
         "customer_home"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -269,7 +269,7 @@
         "customer_home"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -288,7 +288,7 @@
         "customer_api_keys"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -305,7 +305,7 @@
         "revoke_customer_api_key_form"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -322,7 +322,7 @@
         "rotate_customer_api_key_form"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -339,7 +339,7 @@
         "customer_auth"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -356,7 +356,7 @@
         "customer_home"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -373,7 +373,7 @@
         "customer_events"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -390,7 +390,7 @@
         "api_keys_fragment"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -407,7 +407,7 @@
         "customer_preferences_fragment"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -424,7 +424,7 @@
         "customer_sessions_fragment"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -441,7 +441,7 @@
         "summary_fragment"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -458,7 +458,7 @@
         "customer_settings"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -475,7 +475,7 @@
         "customer_security"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -492,7 +492,7 @@
         "revoke_customer_session_form"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -511,7 +511,7 @@
         "update_customer_preferences_form"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -528,7 +528,7 @@
         "customer_auth"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -545,7 +545,7 @@
         "customer_ws"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -562,7 +562,7 @@
         "customer_css"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -579,7 +579,7 @@
         "htmx_js"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -596,7 +596,7 @@
         "api_docs_html"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -613,7 +613,7 @@
         "diagram_html"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -630,7 +630,7 @@
         "health"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -649,7 +649,7 @@
         "customer_login_submit"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     },
@@ -666,7 +666,7 @@
         "customer_logout"
       ],
       "sourceFiles": [
-        "remote/deployments/fiducia-backend.rs/src/main.rs"
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],
       "notes": ""
     }

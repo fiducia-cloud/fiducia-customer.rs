@@ -9,5 +9,5 @@ entire credential lifecycle and durable key policy.
     environment-only. It runs the pinned `flags2env` parser
   (`vendor/flags-2-env`) against the `.cli-flags.toml` schema, exports the
   resulting env map, then execs the given command
-  (e.g. `scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- cargo run`).
+  (e.g. `scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-marketing.web/dist -- cargo run`).
   Build the parser first with `make -B -C vendor/flags-2-env all`.
