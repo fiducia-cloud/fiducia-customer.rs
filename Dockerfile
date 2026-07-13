@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for fiducia-backend.
-FROM rust:1.95.0-slim-bookworm AS build
+FROM rust:1.97.0-slim-bookworm AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
