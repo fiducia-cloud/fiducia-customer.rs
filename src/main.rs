@@ -279,8 +279,11 @@ fn build_router(config: AppConfig) -> Router {
             get(customer_settings).post(update_customer_preferences_form),
         )
         .route("/app/preferences", get(customer_settings))
-        .route(CUSTOMER_WS_PATH, get(customer_ws))
-        .route(CUSTOMER_EVENTS_PATH, get(customer_events))
+        // Keep these route paths literal so the shared API-doc generator can
+        // derive the complete surface; the constants remain the security and
+        // response-metadata source of truth elsewhere in this module.
+        .route("/app/ws", get(customer_ws))
+        .route("/app/events", get(customer_events))
         .route("/app/fragments/summary", get(summary_fragment))
         .route("/app/fragments/api-keys", get(api_keys_fragment))
         .route(
@@ -3690,12 +3693,14 @@ mod tests {
 
     #[tokio::test]
     async fn customer_login_is_server_mediated_and_issues_only_customer_cookie() {
+        const MOCK_SUPABASE_TOKEN_PATH: &str = "/auth/v1/token";
+        const MOCK_AUTH_ME_PATH: &str = "/v1/me";
         let supabase = Router::new().route(
-            "/auth/v1/token",
+            MOCK_SUPABASE_TOKEN_PATH,
             axum::routing::post(|| async { Json(json!({ "access_token": "customer.jwt" })) }),
         );
         let auth = Router::new().route(
-            "/v1/me",
+            MOCK_AUTH_ME_PATH,
             get(|| async {
                 Json(json!({
                     "user": {
@@ -3987,7 +3992,33 @@ mod tests {
         assert!(ct.contains("application/json"), "ct={ct}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["service"], "fiducia-backend.rs");
-        assert!(v["routeCount"].as_u64().unwrap() >= 6);
+        let routes = v["routes"].as_array().unwrap();
+        assert_eq!(v["routeCount"].as_u64().unwrap() as usize, routes.len());
+        assert!(
+            routes.len() >= 30,
+            "generated inventory is unexpectedly incomplete"
+        );
+        for path in [
+            "/api/customer/api-keys",
+            "/api/customer/api-keys/rotate",
+            "/api/customer/api-keys/revoke",
+            "/api/customer/preferences",
+            "/api/customer/security/sessions",
+            "/api/customer/sync/:table",
+            "/app/ws",
+            "/app/events",
+        ] {
+            assert!(
+                routes.iter().any(|route| route["path"] == path),
+                "generated API inventory is missing {path}"
+            );
+        }
+        for removed in ["/app/kv", "/app/locks", "/app/requests", "/app/services"] {
+            assert!(
+                routes.iter().all(|route| route["path"] != removed),
+                "generated API inventory retained removed route {removed}"
+            );
+        }
         let standard = v["standardDocsRoutes"].as_array().unwrap();
         for r in ["/docs/api", "/api/docs", "/api/docs.json"] {
             assert!(

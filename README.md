@@ -74,6 +74,7 @@ the auth service.
 | `GET /app/ws`, `GET /app/events` | authenticated non-sensitive refresh heartbeat |
 | `GET /healthz`, `GET /api/health` | health probes |
 | `GET /api/info` | deployment metadata |
+| `GET /docs/api`, `GET /api/docs.json` | generated human/machine-readable route inventory |
 | other paths | static `fiducia-ui.web` marketing build |
 
 The heartbeat transports refresh signals and server-rendered summary fragments,
@@ -143,7 +144,16 @@ The backend consumes generated Rust and database contracts from
 `fiducia-interfaces`. CI and the Dockerfile both pin that dependency to commit
 `bbd8b52ce729ec34b0a9bff4dda6d0a448181797`; neither follows a moving branch.
 The container checks the commit out detached and verifies that its full `HEAD`
-equals `INTERFACES_SHA` before compiling with the committed Cargo lockfile.
+equals `INTERFACES_SHA` before compiling with the committed Cargo lockfile. CI,
+`Cargo.toml`, and the builder image use Rust 1.97; the registry-verified base and
+distroless runtime are both pinned by digest.
+
+The test deployment workflow is intentionally fail-closed: it requires a valid
+`KUBE_CONFIG_TEST`, an existing `fiducia-backend` deployment, and a successful
+rollout. The deployment configuration must provide `CUSTOMER_APP_ORIGIN` and
+`FIDUCIA_CUSTOMER_CSRF_SECRET` from environment/secret management before the
+release binary can become ready; the repository never supplies production
+secret values.
 
 To test another reviewed contract revision, pass its full commit id and update
 the CI checkout pin in the same reviewed change:
@@ -164,6 +174,14 @@ cargo audit
 vendor/flags-2-env/build/flags2env audit .cli-flags.toml
 git diff --check
 ```
+
+`cargo audit` reads the narrow exceptions in `.cargo/audit.toml`:
+`RUSTSEC-2023-0071` is an unreachable MySQL-only lockfile edge (this service
+enables PostgreSQL only), while `RUSTSEC-2024-0370` and `RUSTSEC-2026-0173`
+describe unmaintained proc-macro crates used only while compiling Maud and
+SeaORM derives. They are not runtime accepts; retain the IDs only until upstream
+releases remove those build-time dependencies, and recheck their reverse trees
+on every dependency update.
 
 <!-- BEGIN k8s-cluster-submodule-notice -->
 > [!NOTE]

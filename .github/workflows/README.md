@@ -9,6 +9,7 @@ GitHub Actions pipelines for this service.
   Dockerfile so the path-dependency crates
   (`../fiducia-interfaces/generated/...`) resolve reproducibly.
 - **`deploy-test.yml`** — secret-gated rollout to the `fiducia-test` Kubernetes
-  namespace (sets the deployment image to the commit-SHA tag). No-op when
-  `KUBE_CONFIG_TEST` is absent; PROD deploys happen from the fiducia-monorepo,
-  not here.
+  namespace (sets the deployment image to the commit-SHA tag and waits for the
+  rollout). Missing credentials, a missing deployment, or rollout failure stops
+  the job; validation-only work belongs in `ci.yml`. PROD deploys happen from
+  the fiducia-monorepo, not here.
