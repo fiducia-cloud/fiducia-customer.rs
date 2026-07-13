@@ -2487,30 +2487,9 @@ mod tests {
     #[tokio::test]
     async fn authenticated_customer_can_create_a_key() {
         // A verified session (Static ctx) reaches the handler; no DB → mock path 201.
+        // (Org membership is required on the DB insert path — covered by the
+        // store-seam org-scoping tests.)
         let status = post_json(test_config(), "/api/customer/api-keys", CREATE_KEY_BODY).await;
-        assert_eq!(status, StatusCode::CREATED);
-    }
-
-    #[tokio::test]
-    async fn authenticated_customer_with_no_org_is_forbidden_from_creating() {
-        // A session with an empty org list cannot create (DB path would 403; here the
-        // authenticator itself is the gate — an org-less Static ctx still reaches the
-        // handler, and the mock path returns 201, so assert the auth wiring instead:
-        // a Deny is 503 and a valid ctx is 201 — covered above. This case documents
-        // that org membership is required for the DB insert path (see store tests).
-        let ctx = CustomerCtx {
-            user_id: "u".to_string(),
-            email: None,
-            orgs: vec![],
-        };
-        // With no pool the mock path is taken (201); the org requirement is enforced
-        // on the DB path and covered by the store-seam org-scoping tests.
-        let status = post_json(
-            config_with_auth(Authenticator::Static(Arc::new(ctx))),
-            "/api/customer/api-keys",
-            CREATE_KEY_BODY,
-        )
-        .await;
         assert_eq!(status, StatusCode::CREATED);
     }
 
