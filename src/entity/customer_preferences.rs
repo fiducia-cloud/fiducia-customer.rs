@@ -17,6 +17,7 @@ pub struct Model {
     pub notify_mfa: bool,
     pub updated_at: DateTimeWithTimeZone,
     pub version: i64,
+    pub sync_sequence: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -37,6 +38,7 @@ impl Model {
             notify_mfa: self.notify_mfa,
             updated_at: self.updated_at.into(),
             version: self.version,
+            sync_sequence: self.sync_sequence,
         }
     }
 }

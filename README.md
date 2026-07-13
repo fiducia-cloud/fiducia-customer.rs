@@ -55,7 +55,7 @@ at `/` regardless of host.
 STATIC_DIR=../fiducia-ui.web/dist \
 CUSTOMER_STATIC_DIR=../fiducia-customer-ui.web/dist \
 DATABASE_URL=postgres://... \
-cargo run   # listens on :8080 (override PORT)
+cargo run --locked   # listens on :8080 (override PORT)
 ```
 
 Non-secret runtime settings can also be supplied as audited flags:
@@ -66,6 +66,24 @@ scripts/with-flags2env.sh --port=8080 --site-mode=customer -- cargo run --locked
 ```
 
 Database credentials and authentication material remain environment-only.
+
+### Reproducible container and CI dependency
+
+The backend consumes generated Rust and database contracts from the sibling
+`fiducia-interfaces` repository. CI and the Dockerfile both pin that dependency
+to commit `bbd8b52ce729ec34b0a9bff4dda6d0a448181797`; neither follows a moving
+branch. The Docker build checks the commit out detached and verifies that its
+full `HEAD` equals `INTERFACES_SHA`, rejecting branch names, tags, and abbreviated
+hashes. Contract upgrades must update the Dockerfile argument and CI checkout
+`ref` together and pass against the committed Cargo lockfile.
+
+To test another reviewed interfaces commit locally, supply its full SHA:
+
+```bash
+docker build \
+  --build-arg INTERFACES_SHA=<40-character-commit-sha> \
+  -t fiducia-backend:local .
+```
 
 `STATIC_DIR` defaults to `static`. Files are served from its root; the backend
 does not add a path prefix (the gateway strips `/fiducia/` before requests
@@ -138,7 +156,7 @@ The pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
 `make -B -C vendor/flags-2-env all`, then run through `scripts/with-flags2env.sh`:
 
 ```bash
-scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- cargo run
+scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- cargo run --locked
 ```
 
 `DATABASE_URL`, `TEST_DATABASE_URL`, and the debug-only static-auth switch are
@@ -155,7 +173,7 @@ the shared gateway under `/fiducia/`, mirroring `canonical.cloud`:
 
 1. a **node initContainer** clones `fiducia-ui.web`, runs `astro build --base /fiducia`, and writes `dist/` to a shared volume;
 2. a **node initContainer** clones `fiducia-customer-ui.web`, runs `npm run build`, and writes `dist/` to a shared volume;
-3. this **rust container** clones `fiducia-backend.rs`, `cargo run --release`, and serves those volumes via `STATIC_DIR` and `CUSTOMER_STATIC_DIR`.
+3. this **rust container** clones `fiducia-backend.rs`, `cargo run --locked --release`, and serves those volumes via `STATIC_DIR` and `CUSTOMER_STATIC_DIR`.
 
 Manifests live in [`ORESoftware/k8s-cluster`](https://github.com/ORESoftware/k8s-cluster)
 at `remote/argocd/dd-next-runtime/dd-fiducia-rs.*`; this repo is wired in as the

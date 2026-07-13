@@ -15,6 +15,7 @@ pub struct Model {
     pub status: String,
     pub updated_at: DateTimeWithTimeZone,
     pub version: i64,
+    pub sync_sequence: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -34,6 +35,7 @@ impl Model {
             status: self.status,
             updated_at: self.updated_at.into(),
             version: self.version,
+            sync_sequence: self.sync_sequence,
         }
     }
 }

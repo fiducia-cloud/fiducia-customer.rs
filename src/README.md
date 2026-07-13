@@ -9,6 +9,8 @@ code lives in `main.rs`.
     (`/app`, `/app/*`), plus its `/app/ws` WebSocket and `/app/events` SSE
     streams that push non-sensitive refresh events;
   - Postgres-backed users, preferences, and user-scoped session observations;
+    the preference/session entity adapters preserve the canonical
+    `sync_sequence` cursor allocated by the database triggers;
   - the authenticated, organization-scoped customer BFF for API-key
     list/create/rotate/revoke and read-only `@fiducia/sync` hydration; key
     authority and idempotent lifecycle state remain in `fiducia-auth`;
