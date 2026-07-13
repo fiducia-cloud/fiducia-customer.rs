@@ -2283,35 +2283,29 @@ async fn customer_page_response(
     active: CustomerTab,
     explicit_org: Option<&str>,
 ) -> Response {
-    // The portal is reachable at `/` (app host) as well as `/app*`; the path-based
-    // `security_headers` middleware does not cover `/`, so harden every branch here
-    // to guarantee the authenticated dashboard is never cacheable regardless of the
-    // route it was served under.
-    let mut response = match config.authenticator.authenticate(headers).await {
+    match config.authenticator.authenticate(headers).await {
         Ok(customer) => {
             if let Err(error) = config.request_security.require_api_host(headers) {
-                request_security_error(error)
-            } else {
-                match customer_page_org(&customer, headers, explicit_org) {
-                    Ok(org_id) => customer_page(
-                        config,
-                        &customer,
-                        active,
-                        &org_id,
-                        &customer_csrf_token(config, &customer),
-                    )
-                    .into_response(),
-                    Err(response) => response,
-                }
+                return request_security_error(error);
             }
+            let org_id = match customer_page_org(&customer, headers, explicit_org) {
+                Ok(org_id) => org_id,
+                Err(response) => return response,
+            };
+            customer_page(
+                config,
+                &customer,
+                active,
+                &org_id,
+                &customer_csrf_token(config, &customer),
+            )
+            .into_response()
         }
         Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
             (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
         }
         Err(response) => response,
-    };
-    apply_sensitive_response_headers(response.headers_mut());
-    response
+    }
 }
 
 async fn summary_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
