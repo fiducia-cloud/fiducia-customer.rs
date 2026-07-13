@@ -852,7 +852,9 @@ async fn caller_user_id(config: &AppConfig, ctx: &CustomerCtx) -> Result<Uuid, R
     }
 }
 
-fn prefs_from_row(row: &crate::entity::customer_preferences::Model) -> CustomerPreferences {
+fn prefs_from_row(
+    row: &fiducia_interfaces_db::customer::CustomerPreferencesRow,
+) -> CustomerPreferences {
     CustomerPreferences {
         region: row.region.clone(),
         timezone: row.timezone.clone(),
@@ -863,7 +865,9 @@ fn prefs_from_row(row: &crate::entity::customer_preferences::Model) -> CustomerP
     }
 }
 
-fn session_model_json(row: &crate::entity::customer_sessions::Model) -> serde_json::Value {
+fn session_model_json(
+    row: &fiducia_interfaces_db::customer::CustomerSessionsRow,
+) -> serde_json::Value {
     json!({
         "device": row.device,
         "location": row.location,
