@@ -279,11 +279,12 @@ pub async fn ensure_user(
 pub async fn get_preferences(
     pool: &PgPool,
     user_id: Uuid,
-) -> Result<Option<prefs::Model>, sqlx::Error> {
-    prefs::Entity::find_by_id(user_id)
+) -> Result<Option<CustomerPreferencesRow>, sqlx::Error> {
+    Ok(prefs::Entity::find_by_id(user_id)
         .one(&orm(pool))
         .await
-        .map_err(map_err)
+        .map_err(map_err)?
+        .map(prefs::Model::into_row))
 }
 
 /// Upsert the user's preferences and return the committed row (trigger bumps
