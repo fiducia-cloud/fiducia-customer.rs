@@ -234,6 +234,136 @@ pub async fn idem_record(pool: &PgPool, key: &str, version: i64) -> Result<(), s
     Ok(())
 }
 
+// ─── users / preferences / sessions (real, DB-backed customer data) ─────────
+// These back the customer Settings + Security pages. The Supabase user id (JWT
+// subject) is mirrored into a local `users` row on first access so per-user
+// preferences and trusted sessions join against a stable id.
+
+use crate::entity::{customer_preferences as prefs, customer_sessions as sess, users};
+
+/// Ensure a local `users` row exists for the authenticated Supabase user and
+/// return its id (upsert on the unique `supabase_user_id`).
+pub async fn ensure_user(
+    pool: &PgPool,
+    supabase_user_id: Uuid,
+    email: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let conn = orm(pool);
+    if let Some(u) = users::Entity::find()
+        .filter(users::Column::SupabaseUserId.eq(supabase_user_id))
+        .one(&conn)
+        .await
+        .map_err(map_err)?
+    {
+        return Ok(u.id);
+    }
+    let am = users::ActiveModel {
+        supabase_user_id: Set(supabase_user_id),
+        email: Set(email.to_string()),
+        ..Default::default()
+    };
+    match am.insert(&conn).await {
+        Ok(u) => Ok(u.id),
+        // Lost a concurrent insert race → the unique index rejected us; re-read.
+        Err(_) => users::Entity::find()
+            .filter(users::Column::SupabaseUserId.eq(supabase_user_id))
+            .one(&conn)
+            .await
+            .map_err(map_err)?
+            .map(|u| u.id)
+            .ok_or(sqlx::Error::RowNotFound),
+    }
+}
+
+/// The user's stored preferences, or `None` if they've never saved any.
+pub async fn get_preferences(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<prefs::Model>, sqlx::Error> {
+    prefs::Entity::find_by_id(user_id)
+        .one(&orm(pool))
+        .await
+        .map_err(map_err)
+}
+
+/// Upsert the user's preferences and return the committed row (trigger bumps
+/// version/updated_at on update).
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_preferences(
+    pool: &PgPool,
+    user_id: Uuid,
+    region: String,
+    timezone: String,
+    density: String,
+    notify_key_rotation: bool,
+    notify_lock_contention: bool,
+    notify_mfa: bool,
+) -> Result<prefs::Model, sqlx::Error> {
+    let conn = orm(pool);
+    if let Some(existing) = prefs::Entity::find_by_id(user_id)
+        .one(&conn)
+        .await
+        .map_err(map_err)?
+    {
+        let mut am: prefs::ActiveModel = existing.into();
+        am.region = Set(region);
+        am.timezone = Set(timezone);
+        am.density = Set(density);
+        am.notify_key_rotation = Set(notify_key_rotation);
+        am.notify_lock_contention = Set(notify_lock_contention);
+        am.notify_mfa = Set(notify_mfa);
+        am.update(&conn).await.map_err(map_err)
+    } else {
+        prefs::ActiveModel {
+            user_id: Set(user_id),
+            region: Set(region),
+            timezone: Set(timezone),
+            density: Set(density),
+            notify_key_rotation: Set(notify_key_rotation),
+            notify_lock_contention: Set(notify_lock_contention),
+            notify_mfa: Set(notify_mfa),
+            ..Default::default()
+        }
+        .insert(&conn)
+        .await
+        .map_err(map_err)
+    }
+}
+
+/// The user's trusted sessions, most-recently-seen first.
+pub async fn list_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<sess::Model>, sqlx::Error> {
+    sess::Entity::find()
+        .filter(sess::Column::UserId.eq(user_id))
+        .order_by_desc(sess::Column::LastSeen)
+        .all(&orm(pool))
+        .await
+        .map_err(map_err)
+}
+
+/// Revoke a user's session by device label (soft: `status = 'revoked'`, scoped to
+/// the caller). Returns `false` when no matching active session exists.
+pub async fn revoke_session(
+    pool: &PgPool,
+    user_id: Uuid,
+    device: &str,
+) -> Result<bool, sqlx::Error> {
+    let conn = orm(pool);
+    let existing = sess::Entity::find()
+        .filter(sess::Column::UserId.eq(user_id))
+        .filter(sess::Column::Device.eq(device))
+        .filter(sess::Column::Status.ne("revoked"))
+        .one(&conn)
+        .await
+        .map_err(map_err)?;
+    let Some(model) = existing else {
+        return Ok(false);
+    };
+    let mut am: sess::ActiveModel = model.into();
+    am.status = Set("revoked".to_string());
+    am.update(&conn).await.map_err(map_err)?;
+    Ok(true)
+}
+
 // ─── DB behavior tests ──────────────────────────────────────────────────────
 //
 // These pin the org-isolation + versioning semantics of the seam against a REAL
@@ -495,5 +625,108 @@ mod tests {
 
         // An unknown key has no record.
         assert_eq!(idem_committed(&pool, "never-seen").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn ensure_user_upserts_and_is_idempotent() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip ensure_user_upserts_and_is_idempotent: no TEST_DATABASE_URL");
+            return;
+        };
+        let sub = Uuid::new_v4();
+        let a = ensure_user(&pool, sub, "a@example.com").await.unwrap();
+        // Same Supabase subject → same local id (no duplicate row).
+        let b = ensure_user(&pool, sub, "a@example.com").await.unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn preferences_default_then_persist_and_bump() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip preferences_default_then_persist_and_bump: no TEST_DATABASE_URL");
+            return;
+        };
+        let uid = ensure_user(&pool, Uuid::new_v4(), "p@example.com")
+            .await
+            .unwrap();
+        assert!(
+            get_preferences(&pool, uid).await.unwrap().is_none(),
+            "none until saved"
+        );
+
+        let saved = upsert_preferences(
+            &pool,
+            uid,
+            "iad".into(),
+            "UTC".into(),
+            "compact".into(),
+            false,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.region, "iad");
+        assert_eq!(saved.density, "compact");
+        assert!(!saved.notify_key_rotation);
+
+        // Second upsert updates in place and the trigger bumps version.
+        let again = upsert_preferences(
+            &pool,
+            uid,
+            "sfo".into(),
+            "UTC".into(),
+            "comfortable".into(),
+            true,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.region, "sfo");
+        assert_eq!(again.version, saved.version + 1);
+        assert_eq!(
+            get_preferences(&pool, uid).await.unwrap().unwrap().region,
+            "sfo"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_list_and_revoke_are_user_scoped() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip sessions_list_and_revoke_are_user_scoped: no TEST_DATABASE_URL");
+            return;
+        };
+        let mine = ensure_user(&pool, Uuid::new_v4(), "me@example.com")
+            .await
+            .unwrap();
+        let other = ensure_user(&pool, Uuid::new_v4(), "other@example.com")
+            .await
+            .unwrap();
+        let device = uniq("MacBook");
+        // Seed a session for each user (login flow creates these elsewhere).
+        for uid in [mine, other] {
+            sqlx::query("insert into customer_sessions (user_id, device) values ($1, $2)")
+                .bind(uid)
+                .bind(&device)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // Listing is scoped to the caller.
+        assert_eq!(list_sessions(&pool, mine).await.unwrap().len(), 1);
+
+        // Revoking my session works; a repeat is a no-op (already revoked).
+        assert!(revoke_session(&pool, mine, &device).await.unwrap());
+        assert!(!revoke_session(&pool, mine, &device).await.unwrap());
+        let after = list_sessions(&pool, mine).await.unwrap();
+        assert_eq!(after[0].status, "revoked");
+
+        // The other user's identically-named session is untouched.
+        assert_eq!(
+            list_sessions(&pool, other).await.unwrap()[0].status,
+            "active"
+        );
     }
 }

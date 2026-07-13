@@ -7,15 +7,13 @@ code lives in `main.rs`.
   - health/info probes (`/healthz`, `/api/health`, `/api/info`);
   - the customer portal, rendered server-side with Maud and refreshed with HTMX
     (`/app`, `/app/*`), plus its `/app/ws` WebSocket and `/app/events` SSE
-    streams that push rendered dashboard fragments and `fiducia:sync` change
-    frames;
-  - the DB-backed `api_keys` vertical and the `@fiducia/sync` write path
-    (`/api/customer/...`), served from the customer Postgres plane when
-    `DATABASE_URL` is set and degrading to in-memory mocks otherwise;
+    streams that push refresh events and `fiducia:sync` change frames;
+  - Postgres-backed API keys, users, preferences, sessions, and the durable
+    `@fiducia/sync` write/idempotency path (`/api/customer/...`);
+  - customer-safe coordination fragments that explicitly withhold cluster-wide
+    locks, metrics, KV, and discovery data until a tenant-scoped API exists;
   - a static-file fallback that serves the built Astro site (`STATIC_DIR`).
 
-`build_router()` is intentionally split from `main()` so the unit tests (run via
-`cargo test --bins`) can exercise routes without binding a socket. The dashboard
-data (`locks()`, `requests()`, `kv_entries()`, `services()`, …) is mock/demo data
-— this tier does not implement coordination; that lives in `fiducia-node.rs` and
-`fiducia-brain.rs`.
+`build_router()` is intentionally split from `main()` so unit tests can exercise
+routes without binding a socket. Production startup requires `DATABASE_URL`;
+tests construct missing-dependency states only to prove handlers fail closed.

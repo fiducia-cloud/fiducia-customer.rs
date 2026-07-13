@@ -28,8 +28,10 @@ It serves two things:
 | `/healthz`, `/api/health` | health probe                                          |
 | `/api/info` | service / version JSON                                              |
 | `/app`, `/app/*` | customer portal rendered by axum + Maud and refreshed by HTMX |
-| `/app/ws` | customer portal WebSocket stream for rendered dashboard fragments    |
-| `/app/events` | SSE fallback stream for rendered dashboard fragments             |
+| `/app/ws` | customer portal WebSocket stream for refresh and sync events          |
+| `/app/events` | SSE fallback stream for refresh and sync events                   |
+| `/app/fragments/*` | customer-safe HTML views; cluster-wide data stays hidden    |
+| `/api/customer/*` | authenticated, Postgres-backed customer data APIs             |
 | `/_customer/*` | customer portal Vite assets (`CUSTOMER_STATIC_DIR`)             |
 | everything else | the static [Astro](https://astro.build) site (`STATIC_DIR`)     |
 
@@ -51,6 +53,7 @@ at `/` regardless of host.
 # Build the frontends somewhere and point at them:
 STATIC_DIR=../fiducia-ui.web/dist \
 CUSTOMER_STATIC_DIR=../fiducia-customer-ui.web/dist \
+DATABASE_URL=postgres://... \
 cargo run   # listens on :8080 (override PORT)
 ```
 
@@ -61,10 +64,16 @@ arrive — the Astro build carries the `/fiducia` base so asset URLs round-trip)
 `SUPABASE_ANON_KEY` are set, the rendered portal passes them to the browser for
 Supabase realtime subscriptions.
 
+`DATABASE_URL` is required. The service refuses to start without durable
+customer Postgres. Customer preferences, sessions, API keys, and sync
+idempotency are persisted; dependency failures return explicit errors instead
+of invented successes or sample rows.
+
 The customer browser keeps one Supabase realtime WebSocket and one backend
-stream. The backend stream prefers `/app/ws` and falls back to `/app/events`;
-both send rendered HTML fragments for the dashboard panels so normal stream
-updates do not need a new HTMX HTTP request per fragment.
+stream. The backend stream prefers `/app/ws` and falls back to `/app/events`.
+The portal does not expose `fiducia-node`'s cluster-wide observability APIs as
+customer data. Those panels explicitly remain unavailable until the node has an
+authenticated tenant-scoped read contract.
 
 ## Deployment
 
