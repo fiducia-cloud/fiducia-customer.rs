@@ -239,5 +239,17 @@ mod tests {
         assert_eq!(mine_rows.len(), 1);
         assert_eq!(mine_rows[0].user_id, mine);
         assert_eq!(list_sessions(&db, other).await.unwrap()[0].user_id, other);
+
+        // Revoking my session works; a repeat is a no-op (already revoked).
+        assert!(revoke_session(&db, mine, &device).await.unwrap());
+        assert!(!revoke_session(&db, mine, &device).await.unwrap());
+        assert_eq!(list_sessions(&db, mine).await.unwrap()[0].status, "revoked");
+
+        // The other user's identically-named session is untouched: the revoke
+        // is user-scoped, not device-global.
+        assert_eq!(
+            list_sessions(&db, other).await.unwrap()[0].status,
+            "active"
+        );
     }
 }
