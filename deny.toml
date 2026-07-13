@@ -1,0 +1,13 @@
+# cargo-deny configuration (optional; documents the advisories accepted after the
+# security audit). Uncomment the ignores below to make `cargo deny check advisories`
+# pass while these remain unfixable. See the README "Security" section for rationale.
+[advisories]
+ignore = [
+    # rsa — Marvin timing side-channel. Transitive (sqlx MySQL path, unused here);
+    # no fixed upgrade is published.
+    # "RUSTSEC-2023-0071",
+    # proc-macro-error — unmaintained; build-time proc-macro dep only.
+    # "RUSTSEC-2024-0370",
+    # proc-macro-error2 — unmaintained; build-time proc-macro dep only.
+    # "RUSTSEC-2026-0173",
+]

@@ -205,12 +205,25 @@ pub async fn catchup_api_keys(
 pub async fn idem_claim(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
     let claimed = sqlx::query_scalar::<_, i32>(
         "insert into sync_idempotency_keys (key) values ($1) \
-         on conflict (key) do nothing returning 1",
+         on conflict (key) do update set created_at = excluded.created_at \
+         where sync_idempotency_keys.committed_version is null \
+           and sync_idempotency_keys.created_at < now() - interval '5 minutes' \
+         returning 1",
     )
     .bind(key)
     .fetch_optional(pool)
     .await?;
     Ok(claimed.is_some())
+}
+
+/// Release an unsuccessful in-flight claim. A committed replay record is never
+/// deleted by this path.
+pub async fn idem_release(pool: &PgPool, key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("delete from sync_idempotency_keys where key = $1 and committed_version is null")
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// The recorded outcome for `key`: `None` => no such key; `Some(None)` => claimed
@@ -313,7 +326,10 @@ pub async fn upsert_preferences(
         am.notify_key_rotation = Set(notify_key_rotation);
         am.notify_lock_contention = Set(notify_lock_contention);
         am.notify_mfa = Set(notify_mfa);
-        am.update(&conn).await.map_err(map_err).map(prefs::Model::into_row)
+        am.update(&conn)
+            .await
+            .map_err(map_err)
+            .map(prefs::Model::into_row)
     } else {
         prefs::ActiveModel {
             user_id: Set(user_id),

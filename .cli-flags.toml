@@ -1,0 +1,64 @@
+# flags-2-env flag schema for the fiducia-backend CLI: maps command-line flags to
+# the environment variables the binary reads. Consumed by
+# scripts/with-flags2env.sh and audited in CI (cli-flags.yml).
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-backend.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+type = "integer"
+help = "TCP port to listen on (default 8080)."
+
+[flags.static-dir]
+env = "STATIC_DIR"
+aliases = ["static-dir"]
+type = "string"
+help = "Directory of the built Astro marketing site (default 'static')."
+
+[flags.customer-static-dir]
+env = "CUSTOMER_STATIC_DIR"
+aliases = ["customer-static-dir"]
+type = "string"
+help = "Directory of the built customer portal assets (default 'customer-static')."
+
+[flags.customer-app-host]
+env = "CUSTOMER_APP_HOST"
+aliases = ["customer-app-host"]
+type = "string"
+help = "Host that serves the customer portal at '/' (default 'app.fiducia.cloud')."
+
+[flags.site-mode]
+env = "FIDUCIA_SITE_MODE"
+aliases = ["site-mode"]
+type = "string"
+help = "Site routing mode. Valid values: 'customer' renders the portal at '/' regardless of host. Any other/unset value uses the safe host-based routing (default), where the portal is served only at '/app' or for CUSTOMER_APP_HOST."
+
+[flags.auth-url]
+env = "FIDUCIA_AUTH_URL"
+aliases = ["auth-url"]
+type = "string"
+help = "Base URL of the fiducia-auth service used to verify customer Supabase sessions. Unset fails closed (all /api/customer/* routes deny)."
+
+[flags.supabase-url]
+env = "SUPABASE_URL"
+aliases = ["supabase-url"]
+type = "string"
+help = "Supabase project URL passed to the browser for realtime subscriptions."
+
+[flags.supabase-anon-key]
+env = "SUPABASE_ANON_KEY"
+aliases = ["supabase-anon-key"]
+type = "string"
+help = "Supabase anon (public) key passed to the browser for realtime subscriptions. Public-ish by design (not a service-role secret)."
+
+[flags.test-database-url]
+env = "TEST_DATABASE_URL"
+aliases = ["test-database-url"]
+type = "string"
+sensitive = true
+help = "SENSITIVE (contains DB credentials). Postgres the test harness may create/drop freely; gates the store integration tests."

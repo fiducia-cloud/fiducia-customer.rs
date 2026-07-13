@@ -13,7 +13,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
 use fiducia_interfaces_db::customer::ApiKeysRow;
-use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
+use fiducia_sync_core::WriteAck;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,7 +23,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -63,11 +62,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deployment error, not permission to serve invented customer data.
     let pool = connect_customer_db().await?;
 
-    // One process-wide broadcast channel fans server-pushed frames out to every
-    // connected WS/SSE client: the existing `fiducia:refresh` fragment frames AND
-    // the new `fiducia:sync` change frames emitted on api_keys mutations.
-    let (stream_tx, _) = broadcast::channel::<String>(256);
-
     let config = AppConfig {
         static_dir: static_dir.clone(),
         customer_static_dir: customer_static_dir.clone(),
@@ -81,7 +75,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .filter(|v| !v.is_empty()),
         pool: Some(pool),
-        stream_tx,
         authenticator: Authenticator::from_env(),
     };
 
@@ -245,8 +238,6 @@ struct AppConfig {
     /// Customer Postgres pool. `None` exists only in isolated route tests and
     /// always produces a service-unavailable response.
     pool: Option<PgPool>,
-    /// Fans `fiducia:refresh` + `fiducia:sync` frames out to WS/SSE subscribers.
-    stream_tx: broadcast::Sender<String>,
     /// Verifies the customer's Supabase session for `/api/customer/*` and scopes
     /// writes to their org. Fail-closed (`Deny`) when no auth backend is set.
     authenticator: Authenticator,
@@ -301,7 +292,7 @@ struct RotateCustomerApiKeyRequest {
 /// by the route (`api_keys`) but echoed by the client, so we accept it. `payload`
 /// is the row the client optimistically stored; `base_version` is the version it
 /// was edited on top of (for the ack the client reconciles against).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SyncWriteRequest {
     id: String,
     #[serde(default)]
@@ -410,8 +401,9 @@ async fn create_customer_api_key(
         Ok(pool) => pool,
         Err(response) => return response,
     };
-    // Persist the key (storing only the secret hash) under the CALLER's
-    // org (never "first org"), and broadcast the new row as a fiducia:sync change.
+    // Persist the key (storing only the secret hash) under the CALLER's org.
+    // Other sessions rehydrate through authenticated tenant-scoped APIs; customer
+    // rows are never placed on the public portal heartbeat stream.
     let Some(org_id) = ctx.org_uuids().into_iter().next() else {
         return (
             StatusCode::FORBIDDEN,
@@ -429,7 +421,6 @@ async fn create_customer_api_key(
     };
     match store::insert_api_key(pool, new_key).await {
         Ok(row) => {
-            broadcast_api_key_change(&config, &row);
             let mut api_key = api_key_row_to_display(&row);
             api_key["environment"] = json!(payload.environment);
             api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
@@ -475,7 +466,7 @@ async fn rotate_customer_api_key(
     };
     // Replace the stored secret hash, scoped to the caller's org so one
     // tenant can never rotate another tenant's key. The bump_row_version trigger
-    // advances `version` + `updated_at`; broadcast the bumped row. A prefix that
+    // advances `version` + `updated_at`. A prefix that
     // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
     match store::rotate_secret(
         pool,
@@ -485,7 +476,7 @@ async fn rotate_customer_api_key(
     )
     .await
     {
-        Ok(Some(row)) => broadcast_api_key_change(&config, &row),
+        Ok(Some(_row)) => {}
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -503,16 +494,16 @@ async fn rotate_customer_api_key(
             "prefix": prefix,
             "rotated_at_ms": issued_at_ms,
             "replacement_secret": replacement_secret,
-            "overlap_seconds": 900,
+            "overlap_seconds": 0,
         })),
     )
         .into_response()
 }
 
 /// The @fiducia/sync write path, generic in `{table}` (only `api_keys` is DB-wired
-/// today). Persists the queued optimistic write, returns the committed row version
-/// (a shared `WriteAck`) so the client adopts it and clears `dirty`, and broadcasts
-/// the change so every other client reconciles. Honors the client's Idempotency-Key.
+/// today). Persists the queued optimistic write and returns the committed row
+/// version (a shared `WriteAck`) so the client adopts it and clears `dirty`.
+/// Other clients reconcile through tenant-scoped catch-up or Supabase RLS.
 async fn sync_write(
     State(config): State<AppConfig>,
     Path(table): Path<String>,
@@ -525,13 +516,20 @@ async fn sync_write(
         Ok(c) => c,
         Err(e) => return e,
     };
+    if table != "api_keys" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "unsupported_sync_table", "table": table })),
+        )
+            .into_response();
+    }
     // Idempotency: replay the original ack for a retried key instead of re-running
     // the UPDATE (whose trigger would re-bump `version`). Matches the client's
     // stable `Idempotency-Key: table:id:op:base_version`.
     let idem_key = headers
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+        .map(|key| scoped_idempotency_key(&ctx, &table, key, &req));
     if let Some(key) = &idem_key {
         match idempotency_begin(&config, key).await {
             Ok(Idem::Replay(v)) => return ack(&req.id, v).into_response(),
@@ -547,42 +545,42 @@ async fn sync_write(
         }
     }
 
-    let version = match table.as_str() {
-        // Scoped to the caller's org so a client can only mutate its own rows.
-        "api_keys" => sync_write_api_keys_row(&config, &req, &ctx).await,
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "ok": false, "error": "unsupported_sync_table", "table": table })),
-            )
-                .into_response()
-        }
-    };
+    // Scoped to the caller's org so a client can only mutate its own rows.
+    let version = sync_write_api_keys_row(&config, &req, &ctx).await;
     let version = match version {
         Ok(version) => version,
-        Err(SyncMutationError::InvalidId) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "ok": false, "error": "invalid_row_id" })),
-            )
-                .into_response()
-        }
-        Err(SyncMutationError::NoOrg) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "ok": false, "error": "no_org_membership" })),
-            )
-                .into_response()
-        }
-        Err(SyncMutationError::NotFound) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "ok": false, "error": "row_not_found" })),
-            )
-                .into_response()
-        }
-        Err(SyncMutationError::Database(err)) => {
-            return dependency_error("postgres", "sync_write_failed", err)
+        Err(error) => {
+            if let Some(key) = &idem_key {
+                if let Err(release_error) = idempotency_release(&config, key).await {
+                    tracing::error!(error = %release_error, "failed to release unsuccessful idempotency claim");
+                }
+            }
+            match error {
+                SyncMutationError::InvalidId => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "ok": false, "error": "invalid_row_id" })),
+                    )
+                        .into_response()
+                }
+                SyncMutationError::NoOrg => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "ok": false, "error": "no_org_membership" })),
+                    )
+                        .into_response()
+                }
+                SyncMutationError::NotFound => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "ok": false, "error": "row_not_found" })),
+                    )
+                        .into_response()
+                }
+                SyncMutationError::Database(err) => {
+                    return dependency_error("postgres", "sync_write_failed", err)
+                }
+            }
         }
     };
 
@@ -592,6 +590,33 @@ async fn sync_write(
         }
     }
     ack(&req.id, version).into_response()
+}
+
+/// Namespace client-provided idempotency keys by authenticated identity, org set,
+/// endpoint, and request body. The database never stores attacker-controlled key
+/// text directly, and one tenant cannot claim another tenant's retry key.
+fn scoped_idempotency_key(
+    ctx: &CustomerCtx,
+    table: &str,
+    client_key: &str,
+    request: &SyncWriteRequest,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut orgs = ctx.orgs.clone();
+    orgs.sort();
+    orgs.dedup();
+    let request_json = serde_json::to_vec(request).unwrap_or_default();
+    let mut digest = Sha256::new();
+    digest.update(client_key.as_bytes());
+    digest.update([0]);
+    digest.update(request_json);
+    format!(
+        "v2:{}:{}:{table}:{:x}",
+        ctx.user_id,
+        orgs.join(","),
+        digest.finalize()
+    )
 }
 
 /// Idempotency decision for a claimed/seen key.
@@ -625,6 +650,13 @@ async fn idempotency_commit(
 ) -> Result<(), sqlx::Error> {
     let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
     store::idem_record(pool, key, version).await
+}
+
+/// Release a claim when the protected mutation did not commit. Stale in-flight
+/// claims are also recoverable in the store, covering process crashes.
+async fn idempotency_release(config: &AppConfig, key: &str) -> Result<(), sqlx::Error> {
+    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+    store::idem_release(pool, key).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,8 +718,8 @@ fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
     )
 }
 
-/// Persist one queued optimistic write to `api_keys`, broadcasting the committed
-/// change. Returns the committed row version or a concrete error.
+/// Persist one queued optimistic write to `api_keys`. Returns the committed row
+/// version or a concrete error.
 enum SyncMutationError {
     InvalidId,
     NoOrg,
@@ -743,10 +775,7 @@ async fn sync_write_api_keys_row(
     };
 
     match committed {
-        Ok(Some(row)) => {
-            broadcast_api_key_change(config, &row);
-            Ok(row.version)
-        }
+        Ok(Some(row)) => Ok(row.version),
         Ok(None) => Err(SyncMutationError::NotFound),
         Err(err) => Err(SyncMutationError::Database(err)),
     }
@@ -804,23 +833,6 @@ fn api_key_row_to_display(row: &ApiKeysRow) -> serde_json::Value {
         "environment": row.env,
         "version": row.version,
     })
-}
-
-/// Broadcast a single api_keys upsert as a `fiducia:sync` frame over the shared
-/// stream. Send errors (no subscribers) are ignored.
-fn broadcast_api_key_change(config: &AppConfig, row: &ApiKeysRow) {
-    // Built from the shared fiducia-sync-core ChangeEvent so the server frame and
-    // the @fiducia/sync client decoder agree on exactly one envelope shape.
-    let change = ChangeEvent {
-        table: "api_keys".to_string(),
-        op: ChangeOp::Upsert,
-        id: row.id.to_string(),
-        version: row.version,
-        row: api_key_row_to_display(row),
-        at_ms: unix_epoch_ms() as i64,
-    };
-    let frame = json!({ "event": "fiducia:sync", "changes": [change] });
-    let _ = config.stream_tx.send(frame.to_string());
 }
 
 /// Resolve the caller's local `users.id`, provisioning the row on first access.
@@ -977,7 +989,7 @@ async fn customer_security_sessions_json(
         Ok(rows) => rows.iter().map(session_model_json).collect::<Vec<_>>(),
         Err(err) => return dependency_error("postgres", "sessions_list_failed", err),
     };
-    Json(json!({ "sessions": sessions_json, "revoke_supported": true })).into_response()
+    Json(json!({ "sessions": sessions_json, "revoke_supported": false })).into_response()
 }
 
 async fn revoke_customer_security_session(
@@ -985,10 +997,9 @@ async fn revoke_customer_security_session(
     headers: HeaderMap,
     Json(payload): Json<RevokeCustomerSecuritySessionRequest>,
 ) -> Response {
-    let ctx = match config.authenticator.authenticate(&headers).await {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
+    if let Err(response) = config.authenticator.authenticate(&headers).await {
+        return response;
+    }
     let device = payload.device.trim();
     if device.is_empty() {
         return (
@@ -998,33 +1009,12 @@ async fn revoke_customer_security_session(
             .into_response();
     }
 
-    let uid = match caller_user_id(&config, &ctx).await {
-        Ok(uid) => uid,
-        Err(response) => return response,
-    };
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
-    let revoked = match store::revoke_session(pool, uid, device).await {
-        Ok(found) => found,
-        Err(err) => return dependency_error("postgres", "session_revoke_failed", err),
-    };
-    if !revoked {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "session_not_found", "ok": false })),
-        )
-            .into_response();
-    }
-
     (
-        StatusCode::OK,
+        StatusCode::NOT_IMPLEMENTED,
         Json(json!({
-            "ok": true,
+            "ok": false,
+            "error": "provider_session_revocation_not_configured",
             "device": device,
-            "status": "revoked",
-            "revoked_at_ms": unix_epoch_ms(),
         })),
     )
         .into_response()
@@ -1060,7 +1050,6 @@ fn allowed_api_key_scopes() -> &'static [&'static str] {
         "cron:write",
         "rate-limit:read",
         "rate-limit:write",
-        "admin:read",
     ]
 }
 
@@ -1142,13 +1131,11 @@ async fn services_fragment() -> Markup {
     services_markup()
 }
 
-async fn customer_ws(State(config): State<AppConfig>, ws: WebSocketUpgrade) -> Response {
-    let rx = config.stream_tx.subscribe();
-    ws.on_upgrade(move |socket| customer_ws_stream(socket, rx))
+async fn customer_ws(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(customer_ws_stream)
 }
 
-async fn customer_events(State(config): State<AppConfig>) -> impl IntoResponse {
-    let mut rx = config.stream_tx.subscribe();
+async fn customer_events() -> impl IntoResponse {
     let stream = async_stream::stream! {
         yield Ok::<Event, Infallible>(stream_event("connected", 0));
 
@@ -1159,15 +1146,6 @@ async fn customer_events(State(config): State<AppConfig>) -> impl IntoResponse {
                 _ = interval.tick() => {
                     yield Ok::<Event, Infallible>(stream_event("refresh", sequence));
                     sequence = sequence.saturating_add(1);
-                }
-                // Server-pushed frames (e.g. fiducia:sync on an api_keys mutation)
-                // ride the same SSE stream as a distinct `fiducia-sync` event.
-                frame = rx.recv() => {
-                    match frame {
-                        Ok(payload) => yield Ok::<Event, Infallible>(sync_stream_event(&payload)),
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
                 }
             }
         }
@@ -1180,7 +1158,7 @@ async fn customer_events(State(config): State<AppConfig>) -> impl IntoResponse {
     )
 }
 
-async fn customer_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
+async fn customer_ws_stream(mut socket: WebSocket) {
     let initial = stream_payload("connected", 0, "websocket").to_string();
     if socket.send(Message::Text(initial)).await.is_err() {
         return;
@@ -1195,19 +1173,6 @@ async fn customer_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<S
                 sequence = sequence.saturating_add(1);
                 if socket.send(Message::Text(payload)).await.is_err() {
                     return;
-                }
-            }
-            // Forward broadcast frames (fiducia:sync change events) verbatim; the
-            // client disambiguates by the JSON `event` field.
-            frame = rx.recv() => {
-                match frame {
-                    Ok(payload) => {
-                        if socket.send(Message::Text(payload)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
             msg = socket.recv() => {
@@ -1236,12 +1201,6 @@ fn stream_event(kind: &str, sequence: u64) -> Event {
         .event("fiducia-refresh")
         .id(sequence.to_string())
         .data(stream_payload(kind, sequence, "sse").to_string())
-}
-
-/// Wrap a broadcast payload (a fiducia:sync frame) as an SSE event the sync SDK's
-/// EventSource listener (`fiducia-sync`) folds into the local store.
-fn sync_stream_event(payload: &str) -> Event {
-    Event::default().event("fiducia-sync").data(payload)
 }
 
 fn stream_payload(kind: &str, sequence: u64, transport: &str) -> serde_json::Value {
@@ -1588,7 +1547,7 @@ fn api_key_summary_panel() -> Markup {
                     }
                     div {
                         dt { "Rotation" }
-                        dd { "dual-key overlap enabled" }
+                        dd { "rotation invalidates the previous secret immediately" }
                     }
                 }
                 a class="button-link" href="/app/api-keys" { "Manage keys" }
@@ -1602,7 +1561,7 @@ fn security_summary_panel() -> Markup {
         section class="panel" aria-labelledby="security-summary-heading" {
             div class="panel__header" {
                 h2 id="security-summary-heading" { "Security" }
-                span { "2FA ready" }
+                span { "2FA enrollment available" }
             }
             div class="panel-body stack" {
                 p class="muted" { "Require TOTP two-factor authentication for admins before production key issuance." }
@@ -1768,7 +1727,6 @@ fn api_keys_markup() -> Markup {
                         option value="cron:write" { "cron:write" }
                         option value="rate-limit:read" { "rate-limit:read" }
                         option value="rate-limit:write" { "rate-limit:write" }
-                        option value="admin:read" { "admin:read" }
                     }
                 }
                 label class="checkbox-line" {
@@ -1782,7 +1740,7 @@ fn api_keys_markup() -> Markup {
         section class="panel" aria-labelledby="api-keys-heading" {
             div class="panel__header" {
                 h2 id="api-keys-heading" { "Customer API keys" }
-                span { "rotate without downtime" }
+                span { "immediate rotation" }
             }
             div class="table-wrap" {
                 table data-api-keys-table="" {
@@ -2160,7 +2118,6 @@ mod tests {
             supabase_url: None,
             supabase_anon_key: None,
             pool: None,
-            stream_tx: broadcast::channel(16).0,
             // Tests exercise the handlers as an authenticated customer with a
             // fixed org; production uses `Authenticator::from_env()` (fail-closed).
             authenticator: Authenticator::Static(std::sync::Arc::new(CustomerCtx {
@@ -2419,7 +2376,7 @@ mod tests {
             json!({ "device": "Safari on iPhone" }),
         )
         .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
@@ -2486,7 +2443,7 @@ mod tests {
         assert!(body.contains("Login"));
         assert!(body.contains("Sign up"));
         assert!(body.contains("API Keys"));
-        assert!(body.contains("2FA ready"));
+        assert!(body.contains("2FA enrollment available"));
         assert!(body.contains("Preferences"));
         assert!(body.contains("node observability API is cluster-wide"));
         assert!(!body.contains("checkout:tenant-42"));
