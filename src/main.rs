@@ -209,6 +209,10 @@ fn build_router(config: AppConfig) -> Router {
         .fallback(ServeFile::new(config.static_dir.join("404.html")));
     let customer_app_origin = config.customer_app_origin.clone();
     let request_security = config.request_security.clone();
+    let sensitive_header_context = SensitiveHeaderContext {
+        customer_app_host: config.customer_app_host.clone(),
+        customer_site_mode: config.customer_site_mode,
+    };
     // Routes are declared as flat literals (not nested) so the shared API-docs
     // generator (remote/tools/generate-api-docs.mjs, which scans the router's
     // route declarations) records their true paths.
