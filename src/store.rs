@@ -346,7 +346,6 @@ pub async fn list_sessions(
         .into_iter()
         .map(sess::Model::into_row)
         .collect())
-        .map_err(map_err)
 }
 
 /// Revoke a user's session by device label (soft: `status = 'revoked'`, scoped to
