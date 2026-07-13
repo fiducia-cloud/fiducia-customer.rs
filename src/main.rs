@@ -548,27 +548,62 @@ async fn sync_write(
         .map(str::to_owned);
     if let Some(key) = &idem_key {
         match idempotency_begin(&config, key).await {
-            Idem::Replay(v) => return ack(&req.id, v).into_response(),
-            // A concurrent identical request holds the claim; don't re-run the
-            // mutation — return the monotonic fallback so the queue still drains.
-            Idem::InFlight => {
-                return ack(&req.id, req.base_version.unwrap_or(0) + 1).into_response()
+            Ok(Idem::Replay(v)) => return ack(&req.id, v).into_response(),
+            Ok(Idem::InFlight) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "ok": false, "error": "idempotency_in_flight" })),
+                )
+                    .into_response()
             }
-            Idem::Proceed => {}
+            Ok(Idem::Proceed) => {}
+            Err(err) => return dependency_error("postgres", "idempotency_claim_failed", err),
         }
     }
 
-    let committed = match table.as_str() {
+    let version = match table.as_str() {
         // Scoped to the caller's org so a client can only mutate its own rows.
         "api_keys" => sync_write_api_keys_row(&config, &req, &ctx).await,
-        // No DB-wired write handler for this table yet — fall through to the
-        // monotonic fallback ack so the client's queue still drains.
-        _ => None,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "ok": false, "error": "unsupported_sync_table", "table": table })),
+            )
+                .into_response()
+        }
     };
-    let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
+    let version = match version {
+        Ok(version) => version,
+        Err(SyncMutationError::InvalidId) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_row_id" })),
+            )
+                .into_response()
+        }
+        Err(SyncMutationError::NoOrg) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "no_org_membership" })),
+            )
+                .into_response()
+        }
+        Err(SyncMutationError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "ok": false, "error": "row_not_found" })),
+            )
+                .into_response()
+        }
+        Err(SyncMutationError::Database(err)) => {
+            return dependency_error("postgres", "sync_write_failed", err)
+        }
+    };
 
     if let Some(key) = &idem_key {
-        idempotency_commit(&config, key, version).await;
+        if let Err(err) = idempotency_commit(&config, key, version).await {
+            return dependency_error("postgres", "idempotency_commit_failed", err);
+        }
     }
     ack(&req.id, version).into_response()
 }
@@ -579,42 +614,31 @@ enum Idem {
     Replay(i64),
     /// A concurrent claim is still in-flight — do not re-run.
     InFlight,
-    /// We own the key (or there's no durable store) — run the mutation.
+    /// We own the durable key — run the mutation.
     Proceed,
 }
 
-/// Begin idempotent handling of `key`. Durable (survives restarts) when a pool is
-/// present — claim-first so only the first request runs the mutation; otherwise an
-/// in-process cache (the mock/no-DB path used in tests).
-async fn idempotency_begin(config: &AppConfig, key: &str) -> Idem {
-    if let Some(pool) = &config.pool {
-        match store::idem_claim(pool, key).await {
-            Ok(true) => Idem::Proceed, // we own the claim
-            Ok(false) => match store::idem_committed(pool, key).await {
-                Ok(Some(Some(v))) => Idem::Replay(v),
-                Ok(Some(None)) => Idem::InFlight,
-                _ => Idem::Proceed, // vanished/error — recompute (write is data-idempotent)
-            },
-            Err(_) => Idem::Proceed, // ledger error must not block the write
-        }
-    } else if let Some(v) = config.idempotency.lock().unwrap().get(key).copied() {
-        Idem::Replay(v)
-    } else {
-        Idem::Proceed
+/// Begin idempotent handling of `key` in the durable ledger.
+async fn idempotency_begin(config: &AppConfig, key: &str) -> Result<Idem, sqlx::Error> {
+    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+    if store::idem_claim(pool, key).await? {
+        return Ok(Idem::Proceed);
     }
+    Ok(match store::idem_committed(pool, key).await? {
+        Some(Some(version)) => Idem::Replay(version),
+        Some(None) => Idem::InFlight,
+        None => Idem::InFlight,
+    })
 }
 
-/// Record the committed version for `key` (durable when pooled, else in-process).
-async fn idempotency_commit(config: &AppConfig, key: &str, version: i64) {
-    if let Some(pool) = &config.pool {
-        let _ = store::idem_record(pool, key, version).await;
-    } else {
-        let mut cache = config.idempotency.lock().unwrap();
-        if cache.len() >= IDEMPOTENCY_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(key.to_owned(), version);
-    }
+/// Record the committed version for `key` in the durable ledger.
+async fn idempotency_commit(
+    config: &AppConfig,
+    key: &str,
+    version: i64,
+) -> Result<(), sqlx::Error> {
+    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+    store::idem_record(pool, key, version).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -638,22 +662,29 @@ async fn sync_catchup(
         Ok(c) => c,
         Err(e) => return e,
     };
-    let rows: Vec<serde_json::Value> = match (table.as_str(), &config.pool) {
-        ("api_keys", Some(pool)) => {
+    let rows: Vec<serde_json::Value> = match table.as_str() {
+        "api_keys" => {
+            let pool = match customer_pool(&config) {
+                Ok(pool) => pool,
+                Err(response) => return response,
+            };
             let orgs = ctx.org_uuids();
             if orgs.is_empty() {
                 vec![]
             } else {
                 match store::catchup_api_keys(pool, &orgs, params.since, 500).await {
                     Ok(rows) => rows.iter().map(api_key_row_to_display).collect(),
-                    Err(err) => {
-                        tracing::error!("api_keys catch-up failed: {err}");
-                        vec![]
-                    }
+                    Err(err) => return dependency_error("postgres", "sync_catchup_failed", err),
                 }
             }
         }
-        _ => vec![],
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "ok": false, "error": "unsupported_sync_table", "table": table })),
+            )
+                .into_response()
+        }
     };
     Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
 }
@@ -670,21 +701,30 @@ fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
 }
 
 /// Persist one queued optimistic write to `api_keys`, broadcasting the committed
-/// change. Returns the committed row version, or `None` when there was no pool /
-/// no matching row / a bad id (caller falls back to a monotonic ack).
+/// change. Returns the committed row version or a concrete error.
+enum SyncMutationError {
+    InvalidId,
+    NoOrg,
+    NotFound,
+    Database(sqlx::Error),
+}
+
 async fn sync_write_api_keys_row(
     config: &AppConfig,
     req: &SyncWriteRequest,
     ctx: &CustomerCtx,
-) -> Option<i64> {
-    let pool = config.pool.as_ref()?;
-    let id = Uuid::parse_str(&req.id).ok()?;
+) -> Result<i64, SyncMutationError> {
+    let pool = config
+        .pool
+        .as_ref()
+        .ok_or(SyncMutationError::Database(sqlx::Error::PoolClosed))?;
+    let id = Uuid::parse_str(&req.id).map_err(|_| SyncMutationError::InvalidId)?;
     let op = req.op.as_deref().unwrap_or("upsert");
     // Every mutation is scoped to the caller's org(s); a row in another tenant's
     // org yields no match (Option::None), so this is not a cross-tenant IDOR.
     let orgs = ctx.org_uuids();
     if orgs.is_empty() {
-        return None;
+        return Err(SyncMutationError::NoOrg);
     }
 
     let committed = if op == "delete" {
@@ -719,13 +759,10 @@ async fn sync_write_api_keys_row(
     match committed {
         Ok(Some(row)) => {
             broadcast_api_key_change(config, &row);
-            Some(row.version)
+            Ok(row.version)
         }
-        Ok(None) => None,
-        Err(err) => {
-            tracing::error!("api_keys sync write failed: {err}");
-            None
-        }
+        Ok(None) => Err(SyncMutationError::NotFound),
+        Err(err) => Err(SyncMutationError::Database(err)),
     }
 }
 
@@ -2557,10 +2594,12 @@ mod tests {
             supabase_anon_key: None,
             pool: None,
             stream_tx: broadcast::channel(16).0,
-            idempotency: Arc::new(Mutex::new(HashMap::new())),
+            node_url: "http://127.0.0.1:0".to_string(),
+            node_internal_secret: None,
+            http: reqwest::Client::new(),
             // Tests exercise the handlers as an authenticated customer with a
             // fixed org; production uses `Authenticator::from_env()` (fail-closed).
-            authenticator: Authenticator::Static(Arc::new(CustomerCtx {
+            authenticator: Authenticator::Static(std::sync::Arc::new(CustomerCtx {
                 user_id: "test-user".to_string(),
                 email: Some("test@fiducia.cloud".to_string()),
                 orgs: vec!["00000000-0000-0000-0000-000000000001".to_string()],
