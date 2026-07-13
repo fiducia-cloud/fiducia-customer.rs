@@ -25,13 +25,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use uuid::Uuid;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 const SERVICE: &str = "fiducia-backend";
 
@@ -110,7 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `None` (mock path) if the var is unset/empty, or if the connection fails — the
 /// portal must boot without a DB, so a bad/missing DB is degraded, never fatal.
 async fn connect_customer_db() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok().filter(|v| !v.is_empty())?;
+    let url = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|v| !v.is_empty())?;
     match sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .connect(&url)
@@ -482,7 +484,13 @@ async fn rotate_customer_api_key(
     // advances `version` + `updated_at`; broadcast the bumped row. A prefix that
     // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
     if let Some(pool) = &config.pool {
-        match store::rotate_secret(pool, prefix, hash_secret(&replacement_secret), &ctx.org_uuids()).await
+        match store::rotate_secret(
+            pool,
+            prefix,
+            hash_secret(&replacement_secret),
+            &ctx.org_uuids(),
+        )
+        .await
         {
             Ok(Some(row)) => broadcast_api_key_change(&config, &row),
             Ok(None) => {
@@ -537,7 +545,9 @@ async fn sync_write(
             Idem::Replay(v) => return ack(&req.id, v).into_response(),
             // A concurrent identical request holds the claim; don't re-run the
             // mutation — return the monotonic fallback so the queue still drains.
-            Idem::InFlight => return ack(&req.id, req.base_version.unwrap_or(0) + 1).into_response(),
+            Idem::InFlight => {
+                return ack(&req.id, req.base_version.unwrap_or(0) + 1).into_response()
+            }
             Idem::Proceed => {}
         }
     }
@@ -683,7 +693,10 @@ async fn sync_write_api_keys_row(
             None => payload.get("revoked").and_then(|v| v.as_bool()),
         };
         let patch = store::ApiKeyPatch {
-            name: payload.get("name").and_then(|v| v.as_str()).map(str::to_owned),
+            name: payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
             scopes: payload_scopes(&payload),
             env: payload
                 .get("environment")
@@ -2462,8 +2475,7 @@ mod tests {
             .status()
     }
 
-    const CREATE_KEY_BODY: &str =
-        r#"{"name":"k","environment":"live","scope":"requests:write"}"#;
+    const CREATE_KEY_BODY: &str = r#"{"name":"k","environment":"live","scope":"requests:write"}"#;
 
     #[tokio::test]
     async fn unauthenticated_customer_mutations_fail_closed() {
@@ -2475,11 +2487,21 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
-            post_json(deny(), "/api/customer/api-keys/rotate", r#"{"prefix":"fid_live_x"}"#).await,
+            post_json(
+                deny(),
+                "/api/customer/api-keys/rotate",
+                r#"{"prefix":"fid_live_x"}"#
+            )
+            .await,
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
-            post_json(deny(), "/api/customer/sync/api_keys", r#"{"id":"x","op":"upsert"}"#).await,
+            post_json(
+                deny(),
+                "/api/customer/sync/api_keys",
+                r#"{"id":"x","op":"upsert"}"#
+            )
+            .await,
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
@@ -2862,9 +2884,14 @@ mod tests {
             builder = builder.header("idempotency-key", k);
         }
         let body = json!({ "id": "k1", "op": "upsert", "base_version": base }).to_string();
-        let resp = app.oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -2884,7 +2911,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/customer/sync/customer_preferences")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!({ "id": "p1", "base_version": 0 }).to_string()))
+                    .body(Body::from(
+                        json!({ "id": "p1", "base_version": 0 }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await

@@ -46,7 +46,7 @@ impl CustomerCtx {
 
 /// How a request is authenticated. Production verifies via fiducia-auth; tests
 /// inject a fixed context; an unconfigured deployment denies (fail closed).
-/// `Static` is only constructed in tests.
+/// `Static` is available only to tests and explicitly opted-in debug E2E runs.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub enum Authenticator {
@@ -70,6 +70,18 @@ fn deny(status: StatusCode, code: &str) -> Response {
 impl Authenticator {
     /// `FIDUCIA_AUTH_URL` selects the auth service; unset → fail closed (`Deny`).
     pub fn from_env() -> Self {
+        // Browser E2E boots the real debug backend without a Supabase stack. Keep
+        // that path explicit and impossible in release binaries so production
+        // remains fail-closed even if this variable is accidentally present.
+        if cfg!(debug_assertions)
+            && std::env::var("FIDUCIA_E2E_STATIC_CUSTOMER_AUTH").as_deref() == Ok("1")
+        {
+            return Authenticator::Static(Arc::new(CustomerCtx {
+                user_id: "fiducia-e2e-customer".to_string(),
+                email: Some("customer-e2e@fiducia.invalid".to_string()),
+                orgs: vec!["00000000-0000-4000-8000-000000000001".to_string()],
+            }));
+        }
         match std::env::var("FIDUCIA_AUTH_URL")
             .ok()
             .filter(|v| !v.trim().is_empty())
