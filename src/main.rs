@@ -18,11 +18,10 @@ use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
-use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -60,10 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "customer-static".to_string())
         .into();
 
-    // The api_keys vertical is DB-backed when DATABASE_URL points at the customer
-    // Postgres plane. If it is unset (or the DB is unreachable) we fall back to the
-    // in-memory mock path so the portal — and the E2E suite — still boot with no DB.
-    let pool = connect_customer_db().await;
+    // Customer state is always durable. A missing/unreachable database is a
+    // deployment error, not permission to serve invented customer data.
+    let pool = connect_customer_db().await?;
+    let node_url = required_env("FIDUCIA_NODE_URL")?;
 
     // One process-wide broadcast channel fans server-pushed frames out to every
     // connected WS/SSE client: the existing `fiducia:refresh` fragment frames AND
@@ -82,9 +81,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supabase_anon_key: std::env::var("SUPABASE_ANON_KEY")
             .ok()
             .filter(|v| !v.is_empty()),
-        pool,
+        pool: Some(pool),
         stream_tx,
-        idempotency: Arc::new(Mutex::new(HashMap::new())),
+        node_url: node_url.trim_end_matches('/').to_string(),
+        node_internal_secret: std::env::var("FIDUCIA_INTERNAL_SECRET")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
         authenticator: Authenticator::from_env(),
     };
 
@@ -106,27 +111,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Open a pool to the customer Postgres plane when `DATABASE_URL` is set. Returns
-/// `None` (mock path) if the var is unset/empty, or if the connection fails — the
-/// portal must boot without a DB, so a bad/missing DB is degraded, never fatal.
-async fn connect_customer_db() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL")
-        .ok()
-        .filter(|v| !v.is_empty())?;
-    match sqlx::postgres::PgPoolOptions::new()
+/// Connect to the customer Postgres plane. Production startup fails closed when
+/// `DATABASE_URL` is absent or unreachable.
+async fn connect_customer_db() -> Result<PgPool, Box<dyn std::error::Error>> {
+    let url = required_env("DATABASE_URL")?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .connect(&url)
-        .await
-    {
-        Ok(pool) => {
-            tracing::info!("customer DB connected — api_keys served from Postgres");
-            Some(pool)
-        }
-        Err(err) => {
-            tracing::error!("customer DB connect failed ({err}); falling back to mock api_keys");
-            None
-        }
-    }
+        .await?;
+    pool.acquire().await?;
+    tracing::info!("customer DB connected — customer state is durable");
+    Ok(pool)
+}
+
+fn required_env(name: &str) -> Result<String, io::Error> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} must be set")))
 }
 
 /// Build the application router. Separated from `main` so tests can exercise the
@@ -248,22 +250,19 @@ struct AppConfig {
     customer_site_mode: bool,
     supabase_url: Option<String>,
     supabase_anon_key: Option<String>,
-    /// Customer Postgres pool. `None` keeps the in-memory mock api_keys path.
+    /// Customer Postgres pool. `None` exists only in isolated route tests and
+    /// always produces a service-unavailable response.
     pool: Option<PgPool>,
     /// Fans `fiducia:refresh` + `fiducia:sync` frames out to WS/SSE subscribers.
     stream_tx: broadcast::Sender<String>,
-    /// Idempotency-Key → committed_version, so a retried sync write replays its
-    /// original ack instead of re-running the UPDATE (which would re-bump version).
-    /// In-process + bounded — retries happen within a connection's lifetime.
-    idempotency: Arc<Mutex<HashMap<String, i64>>>,
+    /// Live coordination data comes from fiducia-node, never static samples.
+    node_url: String,
+    node_internal_secret: Option<String>,
+    http: reqwest::Client,
     /// Verifies the customer's Supabase session for `/api/customer/*` and scopes
     /// writes to their org. Fail-closed (`Deny`) when no auth backend is set.
     authenticator: Authenticator,
 }
-
-/// Cap on the in-process idempotency cache; cleared wholesale past this (retries
-/// are short-lived, so a coarse bound is fine and avoids unbounded growth).
-const IDEMPOTENCY_CACHE_CAP: usize = 10_000;
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
@@ -343,23 +342,46 @@ struct CustomerPreferences {
     notify_mfa: bool,
 }
 
+fn customer_pool(config: &AppConfig) -> Result<&PgPool, Response> {
+    config.pool.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "database_unavailable",
+                "dependency": "postgres"
+            })),
+        )
+            .into_response()
+    })
+}
+
+fn dependency_error(
+    dependency: &str,
+    code: &str,
+    error: impl std::fmt::Display,
+) -> Response {
+    tracing::error!(dependency, code, error = %error, "required dependency operation failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "ok": false, "error": code, "dependency": dependency })),
+    )
+        .into_response()
+}
+
 async fn customer_api_keys_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
     let ctx = match config.authenticator.authenticate(&headers).await {
         Ok(c) => c,
         Err(e) => return e,
     };
-    // DB-backed when a pool is present; otherwise the in-memory mock keys. A query
-    // failure degrades to the mock so a rendered table never disappears on a blip.
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
     // Scoped to the caller's org(s) — a key list must never disclose other tenants.
-    let keys = match &config.pool {
-        Some(pool) => match store::list_api_keys(pool, &ctx.org_uuids()).await {
-            Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
-            Err(err) => {
-                tracing::error!("api_keys list query failed: {err}");
-                mock_api_keys_display()
-            }
-        },
-        None => mock_api_keys_display(),
+    let keys = match store::list_api_keys(pool, &ctx.org_uuids()).await {
+        Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
+        Err(err) => return dependency_error("postgres", "api_keys_list_failed", err),
     };
 
     Json(json!({
@@ -398,64 +420,46 @@ async fn create_customer_api_key(
     let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
     let secret = format!("{prefix}_{}", random_token_hex(24));
 
-    // DB path: persist the key (storing only the secret hash) under the CALLER's
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    // Persist the key (storing only the secret hash) under the CALLER's
     // org (never "first org"), and broadcast the new row as a fiducia:sync change.
-    if let Some(pool) = &config.pool {
-        let Some(org_id) = ctx.org_uuids().into_iter().next() else {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "ok": false, "error": "no_org_membership" })),
+    let Some(org_id) = ctx.org_uuids().into_iter().next() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "no_org_membership" })),
+        )
+            .into_response();
+    };
+    let new_key = store::NewApiKey {
+        key_id: &prefix,
+        org_id,
+        name: payload.name.trim(),
+        secret_hash: hash_secret(&secret),
+        scopes: json!([payload.scope]),
+        env: &payload.environment,
+    };
+    match store::insert_api_key(pool, new_key).await {
+        Ok(row) => {
+            broadcast_api_key_change(&config, &row);
+            let mut api_key = api_key_row_to_display(&row);
+            api_key["environment"] = json!(payload.environment);
+            api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "api_key": api_key,
+                    "secret": secret,
+                    "secret_once": true,
+                })),
             )
-                .into_response();
-        };
-        let new_key = store::NewApiKey {
-            key_id: &prefix,
-            org_id,
-            name: payload.name.trim(),
-            secret_hash: hash_secret(&secret),
-            scopes: json!([payload.scope]),
-            env: &payload.environment,
-        };
-        match store::insert_api_key(pool, new_key).await {
-            Ok(row) => {
-                broadcast_api_key_change(&config, &row);
-                let mut api_key = api_key_row_to_display(&row);
-                api_key["environment"] = json!(payload.environment);
-                api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
-                return (
-                    StatusCode::CREATED,
-                    Json(json!({
-                        "ok": true,
-                        "api_key": api_key,
-                        "secret": secret,
-                        "secret_once": true,
-                    })),
-                )
-                    .into_response();
-            }
-            Err(err) => tracing::error!("api_key insert failed: {err}"),
+                .into_response()
         }
+        Err(err) => dependency_error("postgres", "api_key_insert_failed", err),
     }
-
-    // Mock path (no DB, or an insert that failed): unchanged legacy response.
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "ok": true,
-            "api_key": {
-                "name": payload.name.trim(),
-                "prefix": prefix,
-                "scopes": payload.scope,
-                "last_used": "never",
-                "status": "active",
-                "environment": payload.environment,
-                "require_idempotency": payload.require_idempotency.unwrap_or(true),
-            },
-            "secret": secret,
-            "secret_once": true,
-        })),
-    )
-        .into_response()
 }
 
 async fn rotate_customer_api_key(
@@ -479,29 +483,31 @@ async fn rotate_customer_api_key(
     let issued_at_ms = unix_epoch_ms();
     let replacement_secret = format!("{prefix}_{}", random_token_hex(24));
 
-    // DB path: replace the stored secret hash, scoped to the caller's org so one
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    // Replace the stored secret hash, scoped to the caller's org so one
     // tenant can never rotate another tenant's key. The bump_row_version trigger
     // advances `version` + `updated_at`; broadcast the bumped row. A prefix that
     // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
-    if let Some(pool) = &config.pool {
-        match store::rotate_secret(
-            pool,
-            prefix,
-            hash_secret(&replacement_secret),
-            &ctx.org_uuids(),
-        )
-        .await
-        {
-            Ok(Some(row)) => broadcast_api_key_change(&config, &row),
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "ok": false, "error": "key_not_found" })),
-                )
-                    .into_response();
-            }
-            Err(err) => tracing::error!("api_key rotate failed: {err}"),
+    match store::rotate_secret(
+        pool,
+        prefix,
+        hash_secret(&replacement_secret),
+        &ctx.org_uuids(),
+    )
+    .await
+    {
+        Ok(Some(row)) => broadcast_api_key_change(&config, &row),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "ok": false, "error": "key_not_found" })),
+            )
+                .into_response();
         }
+        Err(err) => return dependency_error("postgres", "api_key_rotate_failed", err),
     }
 
     (

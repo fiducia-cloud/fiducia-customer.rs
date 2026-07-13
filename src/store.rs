@@ -629,4 +629,78 @@ mod tests {
         // An unknown key has no record.
         assert_eq!(idem_committed(&pool, "never-seen").await.unwrap(), None);
     }
+
+    #[tokio::test]
+    async fn ensure_user_upserts_and_is_idempotent() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip ensure_user_upserts_and_is_idempotent: no TEST_DATABASE_URL");
+            return;
+        };
+        let sub = Uuid::new_v4();
+        let a = ensure_user(&pool, sub, "a@example.com").await.unwrap();
+        // Same Supabase subject → same local id (no duplicate row).
+        let b = ensure_user(&pool, sub, "a@example.com").await.unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn preferences_default_then_persist_and_bump() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip preferences_default_then_persist_and_bump: no TEST_DATABASE_URL");
+            return;
+        };
+        let uid = ensure_user(&pool, Uuid::new_v4(), "p@example.com").await.unwrap();
+        assert!(get_preferences(&pool, uid).await.unwrap().is_none(), "none until saved");
+
+        let saved = upsert_preferences(
+            &pool, uid, "iad".into(), "UTC".into(), "compact".into(), false, true, true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.region, "iad");
+        assert_eq!(saved.density, "compact");
+        assert!(!saved.notify_key_rotation);
+
+        // Second upsert updates in place and the trigger bumps version.
+        let again = upsert_preferences(
+            &pool, uid, "sfo".into(), "UTC".into(), "comfortable".into(), true, true, true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.region, "sfo");
+        assert_eq!(again.version, saved.version + 1);
+        assert_eq!(get_preferences(&pool, uid).await.unwrap().unwrap().region, "sfo");
+    }
+
+    #[tokio::test]
+    async fn sessions_list_and_revoke_are_user_scoped() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip sessions_list_and_revoke_are_user_scoped: no TEST_DATABASE_URL");
+            return;
+        };
+        let mine = ensure_user(&pool, Uuid::new_v4(), "me@example.com").await.unwrap();
+        let other = ensure_user(&pool, Uuid::new_v4(), "other@example.com").await.unwrap();
+        let device = uniq("MacBook");
+        // Seed a session for each user (login flow creates these elsewhere).
+        for uid in [mine, other] {
+            sqlx::query("insert into customer_sessions (user_id, device) values ($1, $2)")
+                .bind(uid)
+                .bind(&device)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // Listing is scoped to the caller.
+        assert_eq!(list_sessions(&pool, mine).await.unwrap().len(), 1);
+
+        // Revoking my session works; a repeat is a no-op (already revoked).
+        assert!(revoke_session(&pool, mine, &device).await.unwrap());
+        assert!(!revoke_session(&pool, mine, &device).await.unwrap());
+        let after = list_sessions(&pool, mine).await.unwrap();
+        assert_eq!(after[0].status, "revoked");
+
+        // The other user's identically-named session is untouched.
+        assert_eq!(list_sessions(&pool, other).await.unwrap()[0].status, "active");
+    }
 }
