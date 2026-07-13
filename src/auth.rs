@@ -24,12 +24,9 @@ use serde_json::json;
 #[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct CustomerCtx {
-    #[serde(default)]
     pub user_id: String,
-    #[serde(default)]
     pub email: Option<String>,
     /// Orgs the user belongs to (admin-controlled claims; see fiducia-auth).
-    #[serde(default)]
     pub orgs: Vec<String>,
 }
 
@@ -112,12 +109,23 @@ impl Authenticator {
                             body.get("user").cloned().unwrap_or(serde_json::Value::Null),
                         )
                         .map_err(|_| deny(StatusCode::BAD_GATEWAY, "auth_bad_response"))?;
+                        if ctx.user_id.trim().is_empty() {
+                            return Err(deny(StatusCode::BAD_GATEWAY, "auth_bad_response"));
+                        }
                         if ctx.orgs.is_empty() {
                             return Err(deny(StatusCode::FORBIDDEN, "no_org_membership"));
                         }
                         Ok(ctx)
                     }
-                    Ok(_) => Err(deny(StatusCode::UNAUTHORIZED, "invalid_or_expired_session")),
+                    Ok(r)
+                        if matches!(
+                            r.status(),
+                            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                        ) =>
+                    {
+                        Err(deny(StatusCode::UNAUTHORIZED, "invalid_or_expired_session"))
+                    }
+                    Ok(_) => Err(deny(StatusCode::SERVICE_UNAVAILABLE, "auth_unavailable")),
                     Err(_) => Err(deny(StatusCode::SERVICE_UNAVAILABLE, "auth_unreachable")),
                 }
             }

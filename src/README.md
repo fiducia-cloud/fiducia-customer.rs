@@ -7,9 +7,11 @@ code lives in `main.rs`.
   - health/info probes (`/healthz`, `/api/health`, `/api/info`);
   - the customer portal, rendered server-side with Maud and refreshed with HTMX
     (`/app`, `/app/*`), plus its `/app/ws` WebSocket and `/app/events` SSE
-    streams that push refresh events and `fiducia:sync` change frames;
-  - Postgres-backed API keys, users, preferences, sessions, and the durable
-    `@fiducia/sync` write/idempotency path (`/api/customer/...`);
+    streams that push non-sensitive refresh events;
+  - Postgres-backed users, preferences, and user-scoped session observations;
+  - the authenticated, organization-scoped customer BFF for API-key
+    list/create/rotate/revoke and read-only `@fiducia/sync` hydration; key
+    authority and idempotent lifecycle state remain in `fiducia-auth`;
   - customer-safe coordination fragments that explicitly withhold cluster-wide
     locks, metrics, KV, and discovery data until a tenant-scoped API exists;
   - a static-file fallback that serves the built Astro site (`STATIC_DIR`).

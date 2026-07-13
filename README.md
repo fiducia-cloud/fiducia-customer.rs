@@ -27,6 +27,7 @@ It serves two things:
 |-------------|---------------------------------------------------------------------|
 | `/healthz`, `/api/health` | health probe                                          |
 | `/api/info` | service / version JSON                                              |
+| `/api/customer/context` | verified customer identity and organization choices       |
 | `/app`, `/app/*` | customer portal rendered by axum + Maud and refreshed by HTMX |
 | `/app/ws` | customer portal WebSocket heartbeat for non-sensitive refresh events |
 | `/app/events` | SSE fallback heartbeat for non-sensitive refresh events           |
@@ -79,10 +80,14 @@ persisted there. API-key lifecycle is delegated to `fiducia-auth`, the sole
 credential authority and introspection source; dependency failures return
 explicit errors instead of falling back to a second key store.
 
-API-key create/list/rotate requests are authenticated here and proxied to
-`fiducia-auth`; only its sanitized metadata contract is returned. Rotation
-replaces the authoritative secret immediately and reports the bounded positive
-edge/LB cache overlap to the caller. The portal displays locally observed session
+API-key create/list/rotate/revoke requests are authenticated here and proxied to
+`fiducia-auth`; only its sanitized metadata contract is returned. Multi-org
+customers must select a verified membership with `x-fiducia-org-id`. Mutations
+require `Idempotency-Key`, which is forwarded unchanged to the credential
+authority. Secret-bearing and credential-metadata responses use
+`Cache-Control: no-store`. Rotation replaces the authoritative secret
+immediately and reports the bounded positive edge/LB cache overlap to the
+caller. The portal displays locally observed session
 records and can mark one revoked — a user-scoped audit-state change in customer
 Postgres. Provider-backed revocation (invalidating the actual Supabase
 session/refresh token via session identifiers and the Admin API) is still not
@@ -113,6 +118,7 @@ closed (`Deny`).
 | `STATIC_DIR` | string (dir) | no | Directory of the built Astro marketing site. | `static` |
 | `CUSTOMER_STATIC_DIR` | string (dir) | no | Directory of the built customer portal assets. | `customer-static` |
 | `CUSTOMER_APP_HOST` | string (host) | no | Host that serves the customer portal at `/`. | `app.fiducia.cloud` |
+| `CUSTOMER_APP_ORIGIN` | HTTP(S) origin | no | Exact independently hosted customer origin allowed to call browser-facing APIs. Paths, wildcards, userinfo, and origin lists are rejected. Unset keeps the service same-origin-only. | unset |
 | `FIDUCIA_SITE_MODE` | string (mode) | no | `customer` renders the portal at `/` regardless of host. Any other/unset value uses the **safe** host-based routing (portal only at `/app` or for `CUSTOMER_APP_HOST`). | unset → host-based (safe) |
 | `FIDUCIA_AUTH_URL` | string (URL) | no | Base URL of `fiducia-auth`; verifies customer Supabase sessions. **Unset → fail closed**: every `/api/customer/*` route denies. | unset → `Deny` |
 | `SUPABASE_URL` | string (URL) | no | Supabase project URL handed to the browser for login/session management. | unset |
@@ -173,7 +179,9 @@ does not construct SQL from request input. The middleware stack sets
 bounds request time (`TimeoutLayer`, 30s), caps bodies (`RequestBodyLimitLayer`,
 64 KiB), and catches handler panics (`CatchPanicLayer`). API-key generation,
 hash persistence, rotation, and introspection are owned by `fiducia-auth`; this
-service never mints a parallel credential. There is no permissive CORS layer.
+service never mints a parallel credential. Cross-origin browser access is off by
+default; when `CUSTOMER_APP_ORIGIN` is set, only that exact origin, the required
+methods, and the bearer/org/idempotency headers are authorized.
 
 **Heartbeat no longer fans out customer rows.** A process-wide broadcast channel
 that placed `api_keys` change frames onto the public `/app/ws` + `/app/events`

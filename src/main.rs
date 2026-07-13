@@ -9,7 +9,7 @@ mod store;
 use auth::{Authenticator, CustomerCtx};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -40,6 +41,8 @@ const STREAM_HEARTBEAT_SECS: u64 = 15;
 const CUSTOMER_WS_PATH: &str = "/app/ws";
 const CUSTOMER_EVENTS_PATH: &str = "/app/events";
 const CUSTOMER_ORG_HEADER: &str = "x-fiducia-org-id";
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const CORS_MAX_AGE_SECS: u64 = 10 * 60;
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -57,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let customer_static_dir: PathBuf = std::env::var("CUSTOMER_STATIC_DIR")
         .unwrap_or_else(|_| "customer-static".to_string())
         .into();
+    let customer_app_origin = customer_app_origin_from_env()?;
 
     // Customer state is always durable. A missing/unreachable database is a
     // deployment error, not permission to serve invented customer data.
@@ -77,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         customer_static_dir: customer_static_dir.clone(),
         customer_app_host: std::env::var("CUSTOMER_APP_HOST")
             .unwrap_or_else(|_| "app.fiducia.cloud".to_string()),
+        customer_app_origin,
         customer_site_mode: std::env::var("FIDUCIA_SITE_MODE")
             .map(|v| v.eq_ignore_ascii_case("customer"))
             .unwrap_or(false),
@@ -127,6 +132,75 @@ fn required_env(name: &str) -> Result<String, io::Error> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} must be set")))
 }
 
+fn customer_app_origin_from_env() -> Result<Option<HeaderValue>, io::Error> {
+    match std::env::var("CUSTOMER_APP_ORIGIN") {
+        Ok(value) if !value.trim().is_empty() => parse_customer_app_origin(&value).map(Some),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be valid UTF-8",
+        )),
+    }
+}
+
+fn parse_customer_app_origin(value: &str) -> Result<HeaderValue, io::Error> {
+    let value = value.trim();
+    let uri = value.parse::<Uri>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be an absolute http(s) origin",
+        )
+    })?;
+    let scheme = uri
+        .scheme_str()
+        .filter(|scheme| matches!(*scheme, "http" | "https"));
+    let authority = uri
+        .authority()
+        .filter(|authority| !authority.as_str().contains('@'));
+    let root_only = uri
+        .path_and_query()
+        .map(|path| path.as_str() == "/")
+        .unwrap_or(true);
+    let (Some(scheme), Some(authority)) = (scheme, authority) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must contain only an http(s) scheme and host",
+        ));
+    };
+    if !root_only {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must not contain a path, query, or fragment",
+        ));
+    }
+    let canonical = format!("{scheme}://{authority}");
+    if value != canonical && value != format!("{canonical}/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be a single exact origin",
+        ));
+    }
+    HeaderValue::from_str(&canonical).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN is not a valid HTTP header origin",
+        )
+    })
+}
+
+fn customer_cors(origin: HeaderValue) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static(CUSTOMER_ORG_HEADER),
+            HeaderName::from_static(IDEMPOTENCY_KEY_HEADER),
+        ])
+        .max_age(Duration::from_secs(CORS_MAX_AGE_SECS))
+}
+
 /// Build the application router. Separated from `main` so tests can exercise the
 /// routes without binding a socket or initializing telemetry.
 fn build_router(config: AppConfig) -> Router {
@@ -138,11 +212,12 @@ fn build_router(config: AppConfig) -> Router {
         .fallback(ServeFile::new(config.static_dir.join("404.html")));
     let customer_assets =
         ServeDir::new(&config.customer_static_dir).append_index_html_on_directories(false);
+    let customer_app_origin = config.customer_app_origin.clone();
 
     // Routes are declared as flat literals (not nested) so the shared API-docs
     // generator (remote/tools/generate-api-docs.mjs, which scans the router's
     // route declarations) records their true paths.
-    Router::new()
+    let router = Router::new()
         // Liveness/readiness probe (matches the sibling canonical.cloud
         // convention); also available as /api/health.
         .route("/healthz", get(health))
@@ -228,7 +303,12 @@ fn build_router(config: AppConfig) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new())
+        .layer(CatchPanicLayer::new());
+
+    match customer_app_origin {
+        Some(origin) => router.layer(customer_cors(origin)),
+        None => router,
+    }
 }
 
 #[derive(Clone)]
@@ -236,6 +316,9 @@ struct AppConfig {
     static_dir: PathBuf,
     customer_static_dir: PathBuf,
     customer_app_host: String,
+    /// Exact standalone customer origin allowed to call this service from a
+    /// browser. `None` keeps the service same-origin-only.
+    customer_app_origin: Option<HeaderValue>,
     customer_site_mode: bool,
     supabase_url: Option<String>,
     supabase_anon_key: Option<String>,
@@ -302,6 +385,7 @@ struct RevokeCustomerApiKeyRequest {
 #[derive(Debug, Deserialize)]
 struct AuthKeyMeta {
     key_id: String,
+    org_id: String,
     name: String,
     scopes: Vec<String>,
     env: String,
@@ -373,6 +457,26 @@ fn dependency_error(dependency: &str, code: &str, error: impl std::fmt::Display)
         .into_response()
 }
 
+fn no_store_json(status: StatusCode, body: serde_json::Value) -> Response {
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
+fn valid_org_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+}
+
 #[allow(clippy::result_large_err)]
 fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<String, Response> {
     if let Some(requested) = headers.get(CUSTOMER_ORG_HEADER) {
@@ -383,8 +487,7 @@ fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<Strin
             )
                 .into_response()
         })?;
-        let requested = requested.trim();
-        if requested.is_empty() || requested.len() > 128 {
+        if !valid_org_id(requested) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "ok": false, "error": "invalid_org_selection" })),
@@ -416,6 +519,30 @@ fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<Strin
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn require_idempotency_key(headers: &HeaderMap) -> Result<&HeaderValue, Response> {
+    let value = headers.get(IDEMPOTENCY_KEY_HEADER).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "idempotency_key_required" })),
+        )
+            .into_response()
+    })?;
+    let valid = value.to_str().is_ok_and(|value| {
+        !value.is_empty()
+            && value.len() <= 200
+            && value.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+    });
+    if !valid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid_idempotency_key" })),
+        )
+            .into_response());
+    }
+    Ok(value)
+}
+
 async fn auth_json(
     config: &AppConfig,
     headers: &HeaderMap,
@@ -443,8 +570,8 @@ async fn auth_json(
     let mut request = reqwest::Client::new()
         .request(method, format!("{base}{path}"))
         .header(reqwest::header::AUTHORIZATION, bearer);
-    if let Some(idempotency_key) = headers.get("idempotency-key") {
-        request = request.header("idempotency-key", idempotency_key);
+    if let Some(idempotency_key) = headers.get(IDEMPOTENCY_KEY_HEADER) {
+        request = request.header(IDEMPOTENCY_KEY_HEADER, idempotency_key);
     }
     if let Some(body) = body {
         request = request.json(&body);
@@ -471,8 +598,19 @@ fn proxied_auth_error(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(json!({ "ok": false, "error": error }))).into_response()
 }
 
-fn auth_key_to_display(key: &AuthKeyMeta) -> Result<serde_json::Value, &'static str> {
-    if key.key_id.is_empty() || !matches!(key.env.as_str(), "live" | "test") || key.version == 0 {
+fn auth_key_to_display(
+    key: &AuthKeyMeta,
+    expected_org_id: &str,
+) -> Result<serde_json::Value, &'static str> {
+    if key.org_id != expected_org_id
+        || !valid_key_id(&key.key_id)
+        || !matches!(key.env.as_str(), "live" | "test")
+        || key.version == 0
+        || key
+            .scopes
+            .iter()
+            .any(|scope| !allowed_api_key_scopes().contains(&scope.as_str()))
+    {
         return Err("invalid key metadata");
     }
     Ok(json!({
@@ -491,11 +629,28 @@ fn auth_key_to_display(key: &AuthKeyMeta) -> Result<serde_json::Value, &'static 
 fn auth_key_id_from_prefix(prefix: &str) -> Option<&str> {
     let rest = prefix.strip_prefix("fdc_")?;
     let (environment, key_id) = rest.split_once('_')?;
-    if matches!(environment, "live" | "test") && !key_id.is_empty() {
+    if matches!(environment, "live" | "test") && valid_key_id(key_id) {
         Some(key_id)
     } else {
         None
     }
+}
+
+fn valid_key_id(key_id: &str) -> bool {
+    key_id.len() == 16
+        && key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn raw_api_key_matches(raw: &str, key: &AuthKeyMeta) -> bool {
+    let expected_prefix = format!("fdc_{}_{}.", key.env, key.key_id);
+    raw.strip_prefix(&expected_prefix).is_some_and(|secret| {
+        secret.len() == 64
+            && secret
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
 
 fn encode_query_value(value: &str) -> String {
@@ -536,20 +691,22 @@ async fn customer_api_keys_json(State(config): State<AppConfig>, headers: Header
     let keys = match response
         .keys
         .iter()
-        .map(auth_key_to_display)
+        .map(|key| auth_key_to_display(key, &org_id))
         .collect::<Result<Vec<_>, _>>()
     {
         Ok(keys) => keys,
         Err(error) => return dependency_error("fiducia-auth", "auth_key_list_bad_response", error),
     };
 
-    Json(json!({
-        "api_keys": keys,
-        "default_require_idempotency": true,
-        "allowed_environments": ["live", "test"],
-        "allowed_scopes": allowed_api_key_scopes(),
-    }))
-    .into_response()
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "api_keys": keys,
+            "default_require_idempotency": true,
+            "allowed_environments": ["live", "test"],
+            "allowed_scopes": allowed_api_key_scopes(),
+        }),
+    )
 }
 
 async fn customer_context_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
@@ -557,14 +714,16 @@ async fn customer_context_json(State(config): State<AppConfig>, headers: HeaderM
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    Json(json!({
-        "user": {
-            "user_id": ctx.user_id,
-            "email": ctx.email,
-            "orgs": ctx.orgs,
-        }
-    }))
-    .into_response()
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "user": {
+                "user_id": ctx.user_id,
+                "email": ctx.email,
+                "orgs": ctx.orgs,
+            }
+        }),
+    )
 }
 
 async fn create_customer_api_key(
@@ -576,6 +735,9 @@ async fn create_customer_api_key(
         Ok(c) => c,
         Err(e) => return e,
     };
+    if let Err(response) = require_idempotency_key(&headers) {
+        return response;
+    }
     if let Some(error) = validate_api_key_request(&payload) {
         return (
             StatusCode::BAD_REQUEST,
@@ -590,9 +752,9 @@ async fn create_customer_api_key(
     };
     let request = json!({
         "name": payload.name.trim(),
-        "org_id": org_id,
-        "scopes": [payload.scope],
-        "env": payload.environment,
+        "org_id": &org_id,
+        "scopes": [&payload.scope],
+        "env": &payload.environment,
         "require_idempotency": payload.require_idempotency.unwrap_or(true),
     });
     let (status, body) = match auth_json(
@@ -616,23 +778,28 @@ async fn create_customer_api_key(
             return dependency_error("fiducia-auth", "auth_key_create_bad_response", error)
         }
     };
-    let display = match auth_key_to_display(&response.key) {
+    if !raw_api_key_matches(&response.api_key, &response.key) {
+        return dependency_error(
+            "fiducia-auth",
+            "auth_key_create_bad_response",
+            "raw key does not match metadata",
+        );
+    }
+    let display = match auth_key_to_display(&response.key, &org_id) {
         Ok(display) => display,
         Err(error) => {
             return dependency_error("fiducia-auth", "auth_key_create_bad_response", error)
         }
     };
-    (
+    no_store_json(
         StatusCode::CREATED,
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({
+        json!({
             "ok": true,
             "api_key": display,
             "secret": response.api_key,
             "secret_once": true,
-        })),
+        }),
     )
-        .into_response()
 }
 
 async fn rotate_customer_api_key(
@@ -644,6 +811,9 @@ async fn rotate_customer_api_key(
         Ok(c) => c,
         Err(e) => return e,
     };
+    if let Err(response) = require_idempotency_key(&headers) {
+        return response;
+    }
     let prefix = payload.prefix.trim();
     let Some(key_id) = auth_key_id_from_prefix(prefix) else {
         return (
@@ -683,26 +853,31 @@ async fn rotate_customer_api_key(
             return dependency_error("fiducia-auth", "auth_key_rotate_bad_response", error)
         }
     };
-    let display = match auth_key_to_display(&response.key) {
+    if !raw_api_key_matches(&response.api_key, &response.key) {
+        return dependency_error(
+            "fiducia-auth",
+            "auth_key_rotate_bad_response",
+            "raw key does not match metadata",
+        );
+    }
+    let display = match auth_key_to_display(&response.key, &org_id) {
         Ok(display) => display,
         Err(error) => {
             return dependency_error("fiducia-auth", "auth_key_rotate_bad_response", error)
         }
     };
 
-    (
+    no_store_json(
         StatusCode::OK,
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({
+        json!({
             "ok": true,
             "prefix": prefix,
             "rotated_at_ms": unix_epoch_ms(),
             "replacement_secret": response.api_key,
             "api_key": display,
             "overlap_seconds": response.overlap_seconds,
-        })),
+        }),
     )
-        .into_response()
 }
 
 async fn revoke_customer_api_key(
@@ -714,6 +889,9 @@ async fn revoke_customer_api_key(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    if let Err(response) = require_idempotency_key(&headers) {
+        return response;
+    }
     let prefix = payload.prefix.trim();
     let Some(key_id) = auth_key_id_from_prefix(prefix) else {
         return (
@@ -752,7 +930,10 @@ async fn revoke_customer_api_key(
         )
             .into_response();
     }
-    Json(json!({ "ok": true, "prefix": prefix, "status": "revoked" })).into_response()
+    no_store_json(
+        StatusCode::OK,
+        json!({ "ok": true, "prefix": prefix, "status": "revoked" }),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -800,7 +981,7 @@ async fn sync_catchup(
             match response
                 .keys
                 .iter()
-                .map(auth_key_to_display)
+                .map(|key| auth_key_to_display(key, &org_id))
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(keys) => keys,
@@ -817,13 +998,15 @@ async fn sync_catchup(
                 .into_response()
         }
     };
-    Json(json!({
-        "table": table,
-        "snapshot": true,
-        "requested_since": params.since,
-        "rows": rows,
-    }))
-    .into_response()
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "table": table,
+            "snapshot": true,
+            "requested_since": params.since,
+            "rows": rows,
+        }),
+    )
 }
 
 /// Resolve the caller's local `users.id`, provisioning the row on first access.
@@ -1899,7 +2082,126 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt; // for `oneshot`
+
+    const ORG_A: &str = "00000000-0000-4000-8000-000000000001";
+    const ORG_B: &str = "00000000-0000-4000-8000-000000000002";
+    const KEY_ID: &str = "0123456789abcdef";
+
+    #[derive(Clone, Debug)]
+    struct CapturedAuthRequest {
+        method: Method,
+        path_and_query: String,
+        authorization: Option<String>,
+        idempotency_key: Option<String>,
+        body: serde_json::Value,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockAuthState {
+        requests: Arc<Mutex<Vec<CapturedAuthRequest>>>,
+    }
+
+    fn mock_key_meta() -> serde_json::Value {
+        json!({
+            "key_id": KEY_ID,
+            "org_id": ORG_B,
+            "name": "Production webhooks",
+            "scopes": ["requests:write"],
+            "env": "live",
+            "last_used_ms": null,
+            "revoked": false,
+            "version": 1,
+            "require_idempotency": true,
+            // The upstream contract must never include this, but even a drifted
+            // response cannot pass it through the BFF's typed sanitizer.
+            "secret_hash": "sha256:must-not-leak"
+        })
+    }
+
+    async fn mock_auth_request(
+        State(state): State<MockAuthState>,
+        request: axum::extract::Request,
+    ) -> Response {
+        let method = request.method().clone();
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
+            .to_string();
+        let authorization = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let idempotency_key = request
+            .headers()
+            .get(IDEMPOTENCY_KEY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let (parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
+            .await
+            .expect("read mock auth request body");
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("mock auth request JSON")
+        };
+        state.requests.lock().unwrap().push(CapturedAuthRequest {
+            method: method.clone(),
+            path_and_query: path_and_query.clone(),
+            authorization,
+            idempotency_key,
+            body,
+        });
+
+        let path = parts.uri.path();
+        let mut rotated_meta = mock_key_meta();
+        rotated_meta["version"] = json!(2);
+        let response = match (method, path) {
+            (Method::GET, "/v1/keys") => json!({ "keys": [mock_key_meta()] }),
+            (Method::POST, "/v1/keys") => json!({
+                "api_key": format!("fdc_live_{KEY_ID}.{}", "a".repeat(64)),
+                "key": mock_key_meta()
+            }),
+            (Method::POST, "/v1/keys/0123456789abcdef/rotate") => json!({
+                "ok": true,
+                "api_key": format!("fdc_live_{KEY_ID}.{}", "b".repeat(64)),
+                "key": rotated_meta,
+                "secret_once": true,
+                "overlap_seconds": 60
+            }),
+            (Method::DELETE, "/v1/keys/0123456789abcdef") => {
+                json!({ "revoked": true })
+            }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "unexpected_mock_auth_route" })),
+                )
+                    .into_response()
+            }
+        };
+        Json(response).into_response()
+    }
+
+    async fn spawn_mock_auth() -> (String, MockAuthState, tokio::task::JoinHandle<()>) {
+        let state = MockAuthState::default();
+        let app = Router::new()
+            .fallback(mock_auth_request)
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), state, server)
+    }
 
     /// Create a throwaway `static/` dir with the minimum files the static
     /// handler serves (home page, 404 fallback, a hashed asset).
@@ -1945,6 +2247,7 @@ mod tests {
             static_dir: temp_static_dir(),
             customer_static_dir: temp_customer_static_dir(),
             customer_app_host: "app.fiducia.cloud".to_string(),
+            customer_app_origin: None,
             customer_site_mode: false,
             supabase_url: None,
             supabase_anon_key: None,
@@ -1968,6 +2271,60 @@ mod tests {
         }
     }
 
+    fn multi_org_config() -> AppConfig {
+        config_with_auth(Authenticator::Static(Arc::new(CustomerCtx {
+            user_id: "00000000-0000-4000-8000-000000000099".to_string(),
+            email: Some("multi-org@fiducia.cloud".to_string()),
+            orgs: vec![ORG_A.to_string(), ORG_B.to_string()],
+        })))
+    }
+
+    async fn bff_request(
+        config: AppConfig,
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        org_id: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Response {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, "Bearer verified-supabase-session");
+        if let Some(org_id) = org_id {
+            builder = builder.header(CUSTOMER_ORG_HEADER, org_id);
+        }
+        if let Some(idempotency_key) = idempotency_key {
+            builder = builder.header(IDEMPOTENCY_KEY_HEADER, idempotency_key);
+        }
+        let body = match body {
+            Some(body) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        build_router(config)
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "response was not JSON ({error}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, headers, body)
+    }
+
     async fn post_json(config: AppConfig, uri: &str, body: &str) -> StatusCode {
         build_router(config)
             .oneshot(
@@ -1975,6 +2332,7 @@ mod tests {
                     .method("POST")
                     .uri(uri)
                     .header("content-type", "application/json")
+                    .header(IDEMPOTENCY_KEY_HEADER, "test-request-1")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -1984,6 +2342,317 @@ mod tests {
     }
 
     const CREATE_KEY_BODY: &str = r#"{"name":"k","environment":"live","scope":"requests:write"}"#;
+
+    #[test]
+    fn customer_origin_validation_accepts_one_exact_http_origin() {
+        assert_eq!(
+            parse_customer_app_origin("https://app.fiducia.cloud")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "https://app.fiducia.cloud"
+        );
+        assert_eq!(
+            parse_customer_app_origin("http://127.0.0.1:4173/")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "http://127.0.0.1:4173"
+        );
+        for invalid in [
+            "*",
+            "app.fiducia.cloud",
+            "https://app.fiducia.cloud/path",
+            "https://app.fiducia.cloud?query=1",
+            "https://user@app.fiducia.cloud",
+            "https://app.fiducia.cloud,https://evil.example",
+        ] {
+            assert!(
+                parse_customer_app_origin(invalid).is_err(),
+                "accepted invalid origin {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn org_selection_is_explicit_and_membership_checked() {
+        let config = multi_org_config();
+        let Authenticator::Static(ctx) = &config.authenticator else {
+            panic!("multi-org test config must use static auth");
+        };
+
+        assert_eq!(
+            selected_customer_org(ctx, &HeaderMap::new())
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut selected = HeaderMap::new();
+        selected.insert(CUSTOMER_ORG_HEADER, HeaderValue::from_static(ORG_B));
+        assert_eq!(selected_customer_org(ctx, &selected).unwrap(), ORG_B);
+
+        selected.insert(
+            CUSTOMER_ORG_HEADER,
+            HeaderValue::from_static("00000000-0000-4000-8000-000000000003"),
+        );
+        assert_eq!(
+            selected_customer_org(ctx, &selected).unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        selected.insert(
+            CUSTOMER_ORG_HEADER,
+            HeaderValue::from_static("org with whitespace"),
+        );
+        assert_eq!(
+            selected_customer_org(ctx, &selected).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn auth_key_sanitizer_checks_org_wire_shape_and_scopes() {
+        let key: AuthKeyMeta = serde_json::from_value(mock_key_meta()).unwrap();
+        let display = auth_key_to_display(&key, ORG_B).unwrap();
+        assert_eq!(display["prefix"], format!("fdc_live_{KEY_ID}"));
+        assert!(display.get("secret_hash").is_none());
+        assert!(auth_key_to_display(&key, ORG_A).is_err());
+        assert!(raw_api_key_matches(
+            &format!("fdc_live_{KEY_ID}.{}", "a".repeat(64)),
+            &key
+        ));
+        assert!(!raw_api_key_matches(
+            &format!("fdc_live_{KEY_ID}.short"),
+            &key
+        ));
+    }
+
+    #[tokio::test]
+    async fn cors_allows_only_the_configured_customer_origin_and_headers() {
+        let mut config = test_config();
+        config.customer_app_origin =
+            Some(parse_customer_app_origin("https://app.fiducia.cloud").unwrap());
+        let preflight = |origin: &'static str| {
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/customer/api-keys")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,content-type,idempotency-key,x-fiducia-org-id",
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let allowed = build_router(config.clone())
+            .oneshot(preflight("https://app.fiducia.cloud"))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            allowed
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://app.fiducia.cloud"
+        );
+        let allowed_headers = allowed
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        for required in [
+            "authorization",
+            "content-type",
+            IDEMPOTENCY_KEY_HEADER,
+            CUSTOMER_ORG_HEADER,
+        ] {
+            assert!(allowed_headers.contains(required), "missing {required}");
+        }
+
+        let denied = build_router(config)
+            .oneshot(preflight("https://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(
+            denied
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://app.fiducia.cloud",
+            "the fixed allow-origin must never reflect a foreign Origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn customer_key_bff_is_org_scoped_sanitized_and_forwards_idempotency() {
+        let (auth_url, state, server) = spawn_mock_auth().await;
+        let mut config = multi_org_config();
+        config.auth_url = Some(auth_url);
+
+        let context = bff_request(
+            config.clone(),
+            Method::GET,
+            "/api/customer/context",
+            None,
+            None,
+            None,
+        )
+        .await;
+        let (status, headers, body) = response_json(context).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["user"]["orgs"].as_array().unwrap().len(), 2);
+
+        let missing_org = bff_request(
+            config.clone(),
+            Method::GET,
+            "/api/customer/api-keys",
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(missing_org.status(), StatusCode::BAD_REQUEST);
+
+        let listed = bff_request(
+            config.clone(),
+            Method::GET,
+            "/api/customer/api-keys",
+            None,
+            Some(ORG_B),
+            None,
+        )
+        .await;
+        let (status, headers, body) = response_json(listed).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["api_keys"][0]["prefix"], format!("fdc_live_{KEY_ID}"));
+        assert!(body.to_string().find("secret_hash").is_none());
+
+        let create_body = json!({
+            "name": "Production webhooks",
+            "environment": "live",
+            "scope": "requests:write",
+            "require_idempotency": true
+        });
+        let missing_idempotency = bff_request(
+            config.clone(),
+            Method::POST,
+            "/api/customer/api-keys",
+            Some(create_body.clone()),
+            Some(ORG_B),
+            None,
+        )
+        .await;
+        let (status, _, body) = response_json(missing_idempotency).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "idempotency_key_required");
+
+        let created = bff_request(
+            config.clone(),
+            Method::POST,
+            "/api/customer/api-keys",
+            Some(create_body),
+            Some(ORG_B),
+            Some("customer-create-key-1"),
+        )
+        .await;
+        let (status, headers, body) = response_json(created).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(headers.get(header::PRAGMA).unwrap(), "no-cache");
+        assert!(body["secret"].as_str().unwrap().starts_with("fdc_live_"));
+        assert!(body.to_string().find("secret_hash").is_none());
+
+        let rotated = bff_request(
+            config.clone(),
+            Method::POST,
+            "/api/customer/api-keys/rotate",
+            Some(json!({ "prefix": format!("fdc_live_{KEY_ID}") })),
+            Some(ORG_B),
+            Some("customer-rotate-key-1"),
+        )
+        .await;
+        let (status, headers, body) = response_json(rotated).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["api_key"]["version"], 2);
+        assert_eq!(body["overlap_seconds"], 60);
+
+        let revoked = bff_request(
+            config.clone(),
+            Method::POST,
+            "/api/customer/api-keys/revoke",
+            Some(json!({ "prefix": format!("fdc_live_{KEY_ID}") })),
+            Some(ORG_B),
+            Some("customer-revoke-key-1"),
+        )
+        .await;
+        let (status, headers, body) = response_json(revoked).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["status"], "revoked");
+
+        let catchup = bff_request(
+            config,
+            Method::GET,
+            "/api/customer/sync/api_keys?since=99",
+            None,
+            Some(ORG_B),
+            None,
+        )
+        .await;
+        let (status, headers, body) = response_json(catchup).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["snapshot"], true);
+        assert_eq!(body["requested_since"], 99);
+        assert!(body.to_string().find("secret_hash").is_none());
+
+        let requests = state.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 5);
+        assert!(requests
+            .iter()
+            .all(|request| request.authorization.as_deref()
+                == Some("Bearer verified-supabase-session")));
+        let create = requests
+            .iter()
+            .find(|request| request.method == Method::POST && request.path_and_query == "/v1/keys")
+            .unwrap();
+        assert_eq!(
+            create.idempotency_key.as_deref(),
+            Some("customer-create-key-1")
+        );
+        assert_eq!(create.body["org_id"], ORG_B);
+        let rotate = requests
+            .iter()
+            .find(|request| request.path_and_query.contains("/rotate"))
+            .unwrap();
+        assert_eq!(
+            rotate.idempotency_key.as_deref(),
+            Some("customer-rotate-key-1")
+        );
+        assert!(rotate.path_and_query.ends_with(&format!("org_id={ORG_B}")));
+        let revoke = requests
+            .iter()
+            .find(|request| request.method == Method::DELETE)
+            .unwrap();
+        assert_eq!(
+            revoke.idempotency_key.as_deref(),
+            Some("customer-revoke-key-1")
+        );
+        assert!(revoke.path_and_query.ends_with(&format!("org_id={ORG_B}")));
+        assert!(requests
+            .iter()
+            .filter(|request| request.method == Method::GET)
+            .all(|request| request.path_and_query.ends_with(&format!("org_id={ORG_B}"))));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn unauthenticated_customer_mutations_fail_closed() {
@@ -2056,6 +2725,7 @@ mod tests {
                     .method(method)
                     .uri(uri)
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(IDEMPOTENCY_KEY_HEADER, "test-request-1")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
             )

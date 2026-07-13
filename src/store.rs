@@ -247,9 +247,6 @@ mod tests {
 
         // The other user's identically-named session is untouched: the revoke
         // is user-scoped, not device-global.
-        assert_eq!(
-            list_sessions(&db, other).await.unwrap()[0].status,
-            "active"
-        );
+        assert_eq!(list_sessions(&db, other).await.unwrap()[0].status, "active");
     }
 }
