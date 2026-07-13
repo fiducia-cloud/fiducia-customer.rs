@@ -455,9 +455,31 @@ fn apply_sensitive_response_headers(headers: &mut HeaderMap) {
     );
 }
 
-async fn security_headers(request: Request, next: Next) -> Response {
+/// Host/mode inputs the outermost header middleware needs to recognize when `/`
+/// is serving the authenticated portal (rather than the public marketing index).
+#[derive(Clone)]
+struct SensitiveHeaderContext {
+    customer_app_host: String,
+    customer_site_mode: bool,
+}
+
+async fn security_headers(
+    State(ctx): State<SensitiveHeaderContext>,
+    request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path();
-    let sensitive = path == "/login"
+    // `/` serves the customer dashboard on the app host (or in customer-site mode),
+    // carrying the same email/org/CSRF material as `/app`, but the path prefixes
+    // below don't catch it — classify it as sensitive so it is never cacheable.
+    let root_is_portal = path == "/"
+        && host_serves_customer_app(
+            request.headers(),
+            &ctx.customer_app_host,
+            ctx.customer_site_mode,
+        );
+    let sensitive = root_is_portal
+        || path == "/login"
         || path == "/logout"
         || path.starts_with("/app")
         || path.starts_with("/api/customer");
