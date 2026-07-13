@@ -209,6 +209,10 @@ fn build_router(config: AppConfig) -> Router {
         .fallback(ServeFile::new(config.static_dir.join("404.html")));
     let customer_app_origin = config.customer_app_origin.clone();
     let request_security = config.request_security.clone();
+    let sensitive_header_context = SensitiveHeaderContext {
+        customer_app_host: config.customer_app_host.clone(),
+        customer_site_mode: config.customer_site_mode,
+    };
     // Routes are declared as flat literals (not nested) so the shared API-docs
     // generator (remote/tools/generate-api-docs.mjs, which scans the router's
     // route declarations) records their true paths.
@@ -336,7 +340,10 @@ fn build_router(config: AppConfig) -> Router {
             request_security,
             request_security_gate,
         ))
-        .layer(middleware::from_fn(security_headers));
+        .layer(middleware::from_fn_with_state(
+            sensitive_header_context,
+            security_headers,
+        ));
 
     match customer_app_origin {
         Some(origin) => router.layer(customer_cors(origin)),
@@ -436,27 +443,56 @@ async fn request_security_gate(
     next.run(request).await
 }
 
-async fn security_headers(request: Request, next: Next) -> Response {
+/// Harden a customer-sensitive response: never cache it (it carries the user's
+/// email, org ids, and CSRF token) and pin the strict portal CSP. Applied both
+/// by the path-based middleware and directly by the portal renderer, because the
+/// authenticated dashboard is reachable at `/` (app host) as well as `/app*`.
+fn apply_sensitive_response_headers(headers: &mut HeaderMap) {
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'self'",
+        ),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+}
+
+/// Host/mode inputs the outermost header middleware needs to recognize when `/`
+/// is serving the authenticated portal (rather than the public marketing index).
+#[derive(Clone)]
+struct SensitiveHeaderContext {
+    customer_app_host: String,
+    customer_site_mode: bool,
+}
+
+async fn security_headers(
+    State(ctx): State<SensitiveHeaderContext>,
+    request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path();
-    let sensitive = path == "/login"
+    // `/` serves the customer dashboard on the app host (or in customer-site mode),
+    // carrying the same email/org/CSRF material as `/app`, but the path prefixes
+    // below don't catch it — classify it as sensitive so it is never cacheable.
+    let root_is_portal = path == "/"
+        && host_serves_customer_app(
+            request.headers(),
+            &ctx.customer_app_host,
+            ctx.customer_site_mode,
+        );
+    let sensitive = root_is_portal
+        || path == "/login"
         || path == "/logout"
         || path.starts_with("/app")
         || path.starts_with("/api/customer");
     let mut response = next.run(request).await;
     if sensitive {
-        let headers = response.headers_mut();
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-        headers.insert(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(
-                "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'self'",
-            ),
-        );
-        headers.insert(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        );
+        apply_sensitive_response_headers(response.headers_mut());
     }
     response
 }
@@ -2414,8 +2450,12 @@ fn unix_epoch_ms() -> u128 {
         .as_millis()
 }
 
-fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
-    if config.customer_site_mode {
+fn host_serves_customer_app(
+    headers: &HeaderMap,
+    customer_app_host: &str,
+    customer_site_mode: bool,
+) -> bool {
+    if customer_site_mode {
         return true;
     }
 
@@ -2423,7 +2463,11 @@ fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
         return false;
     };
     let host = host.split(':').next().unwrap_or(host);
-    host.eq_ignore_ascii_case(&config.customer_app_host)
+    host.eq_ignore_ascii_case(customer_app_host)
+}
+
+fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
+    host_serves_customer_app(headers, &config.customer_app_host, config.customer_site_mode)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4255,6 +4299,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn portal_served_at_root_on_app_host_is_hardened_like_app() {
+        // The authenticated dashboard is reachable at both `/app` and `/` (on the
+        // customer app host). It carries the user's email, org ids, and CSRF token,
+        // so the root path must be just as no-store / strict-CSP as `/app`.
+        let response = build_router(test_config())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_marker = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "root-served portal must not be cacheable"
+        );
+        assert_eq!(response.headers().get(header::PRAGMA).unwrap(), "no-cache");
+        assert!(
+            body_marker.contains("form-action 'self'"),
+            "root-served portal must carry the strict portal CSP, got: {body_marker}"
+        );
+        assert_eq!(
+            response.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
     }
 
     #[tokio::test]
