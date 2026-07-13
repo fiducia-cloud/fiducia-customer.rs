@@ -8,7 +8,7 @@ columns = ["options", "env", "type", "description"]
 allow_unknown = false
 
 [env]
-ignore = ["DATABASE_URL", "TEST_DATABASE_URL", "FIDUCIA_E2E_STATIC_CUSTOMER_AUTH"]
+ignore = ["DATABASE_URL", "TEST_DATABASE_URL", "FIDUCIA_E2E_STATIC_CUSTOMER_AUTH", "FIDUCIA_INSECURE_COOKIES"]
 
 [flags.port]
 env = "PORT"
@@ -21,13 +21,7 @@ help = "HTTP listen port."
 env = "STATIC_DIR"
 aliases = ["static-dir"]
 type = "string"
-help = "Admin UI static asset directory."
-
-[flags.customer-static-dir]
-env = "CUSTOMER_STATIC_DIR"
-aliases = ["customer-static-dir"]
-type = "string"
-help = "Customer UI static asset directory."
+help = "Static Astro marketing-site directory."
 
 [flags.customer-app-host]
 env = "CUSTOMER_APP_HOST"
@@ -51,13 +45,13 @@ help = "Authentication service base URL."
 env = "SUPABASE_URL"
 aliases = ["supabase-url"]
 type = "string"
-help = "Public Supabase project URL exposed to the customer UI."
+help = "Supabase project URL used for server-mediated customer login."
 
-[flags.supabase-anon-key]
-env = "SUPABASE_ANON_KEY"
-aliases = ["supabase-anon-key"]
+[flags.supabase-publishable-key]
+env = "SUPABASE_PUBLISHABLE_KEY"
+aliases = ["supabase-publishable-key"]
 type = "string"
-help = "Public Supabase anonymous key exposed to the customer UI."
+help = "Public Supabase key used by the Rust server for password exchange."
 
 [flags.log]
 env = "RUST_LOG"

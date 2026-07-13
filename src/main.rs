@@ -5,19 +5,19 @@ mod auth;
 mod entity;
 mod store;
 
-use auth::{Authenticator, CustomerCtx};
+use auth::{bearer_token, Authenticator, CustomerCtx, CUSTOMER_SESSION_COOKIE};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
 use fiducia_interfaces_db::customer::ApiKeysRow;
 use fiducia_sync_core::WriteAck;
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup, DOCTYPE};
+use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::PgPool;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
@@ -40,6 +40,8 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const STREAM_HEARTBEAT_SECS: u64 = 15;
 const CUSTOMER_WS_PATH: &str = "/app/ws";
 const CUSTOMER_EVENTS_PATH: &str = "/app/events";
+const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
+const CUSTOMER_CSS: &str = include_str!("../assets/customer.css");
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -54,26 +56,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "static".to_string())
         .into();
 
-    let customer_static_dir: PathBuf = std::env::var("CUSTOMER_STATIC_DIR")
-        .unwrap_or_else(|_| "customer-static".to_string())
-        .into();
-
     // Customer state is always durable. A missing/unreachable database is a
     // deployment error, not permission to serve invented customer data.
     let pool = connect_customer_db().await?;
 
     let config = AppConfig {
         static_dir: static_dir.clone(),
-        customer_static_dir: customer_static_dir.clone(),
         customer_app_host: std::env::var("CUSTOMER_APP_HOST")
             .unwrap_or_else(|_| "app.fiducia.cloud".to_string()),
         customer_site_mode: std::env::var("FIDUCIA_SITE_MODE")
             .map(|v| v.eq_ignore_ascii_case("customer"))
             .unwrap_or(false),
-        supabase_url: std::env::var("SUPABASE_URL").ok().filter(|v| !v.is_empty()),
-        supabase_anon_key: std::env::var("SUPABASE_ANON_KEY")
-            .ok()
-            .filter(|v| !v.is_empty()),
+        supabase_url: Some(required_env("SUPABASE_URL")?),
+        supabase_publishable_key: Some(required_env("SUPABASE_PUBLISHABLE_KEY")?),
+        auth_url: Some(required_env("FIDUCIA_AUTH_URL")?),
         pool: Some(pool),
         authenticator: Authenticator::from_env(),
     };
@@ -87,9 +83,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!(
-        "{SERVICE} listening on http://{addr} (site={}, customer={})",
-        static_dir.display(),
-        customer_static_dir.display()
+        "{SERVICE} listening on http://{addr} (marketing={})",
+        static_dir.display()
     );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -98,13 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Connect to the customer Postgres plane. Production startup fails closed when
 /// `DATABASE_URL` is absent or unreachable.
-async fn connect_customer_db() -> Result<PgPool, Box<dyn std::error::Error>> {
+async fn connect_customer_db() -> Result<DatabaseConnection, Box<dyn std::error::Error>> {
     let url = required_env("DATABASE_URL")?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await?;
-    pool.acquire().await?;
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(5).sqlx_logging(false);
+    let pool = Database::connect(options).await?;
+    pool.ping().await?;
     tracing::info!("customer DB connected — customer state is durable");
     Ok(pool)
 }
@@ -125,9 +119,6 @@ fn build_router(config: AppConfig) -> Router {
     let serve_dir = ServeDir::new(&config.static_dir)
         .append_index_html_on_directories(true)
         .fallback(ServeFile::new(config.static_dir.join("404.html")));
-    let customer_assets =
-        ServeDir::new(&config.customer_static_dir).append_index_html_on_directories(false);
-
     // Routes are declared as flat literals (not nested) so the shared API-docs
     // generator (remote/tools/generate-api-docs.mjs, which scans the router's
     // route declarations) records their true paths.
@@ -137,6 +128,10 @@ fn build_router(config: AppConfig) -> Router {
         .route("/healthz", get(health))
         .route("/api/health", get(health))
         .route("/api/info", get(info))
+        .route("/assets/htmx.min.js", get(htmx_js))
+        .route("/assets/customer.css", get(customer_css))
+        .route("/login", get(customer_login).post(customer_login_submit))
+        .route("/logout", axum::routing::post(customer_logout))
         .route(
             "/api/customer/api-keys",
             get(customer_api_keys_json).post(create_customer_api_key),
@@ -171,9 +166,19 @@ fn build_router(config: AppConfig) -> Router {
         .route("/app/dashboard", get(customer_home))
         .route("/app/auth", get(customer_auth))
         .route("/app/signup", get(customer_auth))
-        .route("/app/api-keys", get(customer_api_keys))
+        .route(
+            "/app/api-keys",
+            get(customer_api_keys).post(create_customer_api_key_form),
+        )
         .route("/app/security", get(customer_security))
-        .route("/app/settings", get(customer_settings))
+        .route(
+            "/app/security/sessions/revoke",
+            axum::routing::post(revoke_customer_session_form),
+        )
+        .route(
+            "/app/settings",
+            get(customer_settings).post(update_customer_preferences_form),
+        )
         .route("/app/preferences", get(customer_settings))
         .route("/app/locks", get(customer_locks))
         .route("/app/requests", get(customer_requests))
@@ -182,6 +187,15 @@ fn build_router(config: AppConfig) -> Router {
         .route(CUSTOMER_WS_PATH, get(customer_ws))
         .route(CUSTOMER_EVENTS_PATH, get(customer_events))
         .route("/app/fragments/summary", get(summary_fragment))
+        .route("/app/fragments/api-keys", get(api_keys_fragment))
+        .route(
+            "/app/fragments/preferences",
+            get(customer_preferences_fragment),
+        )
+        .route(
+            "/app/fragments/security-sessions",
+            get(customer_sessions_fragment),
+        )
         .route("/app/fragments/locks", get(locks_fragment))
         .route("/app/fragments/requests", get(requests_fragment))
         .route("/app/fragments/kv", get(kv_fragment))
@@ -192,7 +206,6 @@ fn build_router(config: AppConfig) -> Router {
         .route("/api/docs.json", get(api_docs_json))
         // Mermaid architecture diagram (rendered client-side).
         .route("/docs/diagram", get(diagram_html))
-        .nest_service("/_customer", customer_assets)
         // Everything else: the static Astro site.
         .fallback_service(serve_dir)
         .with_state(config)
@@ -230,17 +243,209 @@ fn build_router(config: AppConfig) -> Router {
 #[derive(Clone)]
 struct AppConfig {
     static_dir: PathBuf,
-    customer_static_dir: PathBuf,
     customer_app_host: String,
     customer_site_mode: bool,
     supabase_url: Option<String>,
-    supabase_anon_key: Option<String>,
+    supabase_publishable_key: Option<String>,
+    auth_url: Option<String>,
     /// Customer Postgres pool. `None` exists only in isolated route tests and
     /// always produces a service-unavailable response.
-    pool: Option<PgPool>,
+    pool: Option<DatabaseConnection>,
     /// Verifies the customer's Supabase session for `/api/customer/*` and scopes
     /// writes to their org. Fail-closed (`Deny`) when no auth backend is set.
     authenticator: Authenticator,
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomerLoginForm {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SupabasePasswordSession {
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthCreatedKeyResponse {
+    api_key: String,
+    key: AuthCreatedKeyMeta,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthCreatedKeyMeta {
+    key_id: String,
+    org_id: String,
+    env: String,
+    require_idempotency: bool,
+}
+
+async fn htmx_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        HTMX_JS,
+    )
+}
+
+async fn customer_css() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        CUSTOMER_CSS,
+    )
+}
+
+async fn customer_login() -> Markup {
+    customer_login_markup(None)
+}
+
+async fn customer_login_submit(
+    State(config): State<AppConfig>,
+    Form(form): Form<CustomerLoginForm>,
+) -> Response {
+    let email = form.email.trim();
+    if email.is_empty() || form.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            customer_login_markup(Some("Email and password are required.")),
+        )
+            .into_response();
+    }
+    let (Some(supabase_url), Some(publishable_key)) = (
+        config.supabase_url.as_deref(),
+        config.supabase_publishable_key.as_deref(),
+    ) else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
+    };
+
+    let response = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => {
+            client
+                .post(format!(
+                    "{}/auth/v1/token?grant_type=password",
+                    supabase_url.trim_end_matches('/')
+                ))
+                .header("apikey", publishable_key)
+                .json(&json!({ "email": email, "password": form.password }))
+                .send()
+                .await
+        }
+        Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
+    };
+    let response = match response {
+        Ok(response) if response.status().is_success() => response,
+        Ok(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                customer_login_markup(Some("Supabase rejected those credentials.")),
+            )
+                .into_response()
+        }
+        Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
+    };
+    let session = match response.json::<SupabasePasswordSession>().await {
+        Ok(session) => session,
+        Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
+    };
+
+    let mut headers = HeaderMap::new();
+    let bearer = match HeaderValue::from_str(&format!("Bearer {}", session.access_token)) {
+        Ok(value) => value,
+        Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
+    };
+    headers.insert(header::AUTHORIZATION, bearer);
+    if let Err(response) = config.authenticator.authenticate(&headers).await {
+        return response;
+    }
+
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/app".to_string()),
+            (
+                header::SET_COOKIE,
+                make_customer_session_cookie(&session.access_token),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+fn make_customer_session_cookie(token: &str) -> String {
+    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
+        ""
+    } else {
+        "; Secure"
+    };
+    format!(
+        "{CUSTOMER_SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600{secure}"
+    )
+}
+
+async fn customer_logout() -> Response {
+    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
+        ""
+    } else {
+        "; Secure"
+    };
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/login".to_string()),
+            (
+                header::SET_COOKIE,
+                format!(
+                    "{CUSTOMER_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"
+                ),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+fn customer_login_markup(message: Option<&str>) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Sign in · Fiducia Customer" }
+                link rel="stylesheet" href="/assets/customer.css";
+                script src="/assets/htmx.min.js" defer {}
+            }
+            body {
+                main class="auth-shell" {
+                    section class="auth-card" {
+                        p class="eyebrow" { "Customer application" }
+                        h1 { "Sign in to Fiducia" }
+                        p class="muted" { "Supabase authenticates your credentials; fiducia-auth verifies the resulting identity and organization membership." }
+                        @if let Some(message) = message {
+                            p class="auth-message" role="alert" { (message) }
+                        }
+                        form method="post" action="/login" hx-post="/login" hx-target="body" hx-swap="outerHTML" {
+                            label for="email" { "Email" }
+                            input id="email" name="email" type="email" autocomplete="email" required;
+                            label for="password" { "Password" }
+                            input id="password" name="password" type="password" autocomplete="current-password" required;
+                            button type="submit" { "Sign in" }
+                        }
+                        p class="muted" { "Operator accounts use the separate admin application and cookie boundary." }
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -256,15 +461,15 @@ async fn info(State(config): State<AppConfig>) -> Json<serde_json::Value> {
         "customer_portal": {
             "host": config.customer_app_host,
             "path": "/app",
-            "static_prefix": "/_customer",
+            "rendering": "maud+htmx",
             "streams": {
                 "websocket": CUSTOMER_WS_PATH,
                 "sse": CUSTOMER_EVENTS_PATH,
                 "heartbeat_secs": STREAM_HEARTBEAT_SECS,
             },
             "regions": CUSTOMER_REGIONS,
-            "supabase_realtime": config.supabase_url.is_some()
-                && config.supabase_anon_key.is_some(),
+            "supabase_login": config.supabase_url.is_some()
+                && config.supabase_publishable_key.is_some(),
         },
         // The coordination API is not served here — it lives in the data-plane
         // and control-plane services.
@@ -281,6 +486,13 @@ struct CreateCustomerApiKeyRequest {
     environment: String,
     scope: String,
     require_idempotency: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateCustomerApiKeyForm {
+    name: String,
+    environment: String,
+    scope: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +524,21 @@ struct RevokeCustomerSecuritySessionRequest {
     device: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RevokeCustomerSessionForm {
+    device: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomerPreferencesForm {
+    region: String,
+    timezone: String,
+    density: String,
+    notify_lock_contention: Option<String>,
+    notify_key_rotation: Option<String>,
+    notify_mfa: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CustomerPreferences {
     region: String,
@@ -323,7 +550,7 @@ struct CustomerPreferences {
 }
 
 #[allow(clippy::result_large_err)] // Axum handlers return the framework Response directly.
-fn customer_pool(config: &AppConfig) -> Result<&PgPool, Response> {
+fn customer_pool(config: &AppConfig) -> Result<&DatabaseConnection, Response> {
     config.pool.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -386,56 +613,131 @@ async fn create_customer_api_key(
         )
             .into_response();
     }
+    let token = bearer_token(&headers);
+    let (row, secret) =
+        match issue_customer_api_key(&config, &ctx, token.as_deref(), &payload).await {
+            Ok(issued) => issued,
+            Err(response) => return response,
+        };
+    let mut api_key = api_key_row_to_display(&row);
+    api_key["environment"] = json!(payload.environment);
+    api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "api_key": api_key,
+            "secret": secret,
+            "secret_once": true,
+        })),
+    )
+        .into_response()
+}
 
-    let environment_prefix = if payload.environment == "live" {
-        "fid_live"
-    } else {
-        "fid_test"
-    };
-    // The prefix is a public identifier (safe to derive); the secret must not
-    // be — it is CSPRNG bytes, unguessable from the creation time.
-    let prefix = format!("{environment_prefix}_{}", &random_token_hex(4)[..8]);
-    let secret = format!("{prefix}_{}", random_token_hex(24));
-
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
-    // Persist the key (storing only the secret hash) under the CALLER's org.
-    // Other sessions rehydrate through authenticated tenant-scoped APIs; customer
-    // rows are never placed on the public portal heartbeat stream.
+async fn issue_customer_api_key(
+    config: &AppConfig,
+    ctx: &CustomerCtx,
+    token: Option<&str>,
+    payload: &CreateCustomerApiKeyRequest,
+) -> Result<(ApiKeysRow, String), Response> {
+    if let Some(error) = validate_api_key_request(payload) {
+        return Err((StatusCode::BAD_REQUEST, error).into_response());
+    }
+    let pool = customer_pool(config)?;
     let Some(org_id) = ctx.org_uuids().into_iter().next() else {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "ok": false, "error": "no_org_membership" })),
-        )
-            .into_response();
+        return Err((StatusCode::FORBIDDEN, "no_org_membership").into_response());
     };
+    let Some(token) = token else {
+        return Err((StatusCode::UNAUTHORIZED, "missing_customer_session").into_response());
+    };
+    let Some(auth_url) = config.auth_url.as_deref() else {
+        return Err(dependency_error(
+            "fiducia-auth",
+            "key_authority_not_configured",
+            "FIDUCIA_AUTH_URL is required",
+        ));
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| dependency_error("fiducia-auth", "key_create_failed", error))?;
+    let response = client
+        .post(format!("{}/v1/keys", auth_url.trim_end_matches('/')))
+        .bearer_auth(token)
+        .json(&json!({
+            "name": payload.name.trim(),
+            "org_id": org_id,
+            "scopes": [payload.scope.as_str()],
+            "env": payload.environment,
+            "require_idempotency": payload.require_idempotency.unwrap_or(true),
+        }))
+        .send()
+        .await
+        .map_err(|error| dependency_error("fiducia-auth", "key_create_failed", error))?;
+    if !response.status().is_success() {
+        return Err(dependency_error(
+            "fiducia-auth",
+            "key_create_rejected",
+            response.status(),
+        ));
+    }
+    let issued = response
+        .json::<AuthCreatedKeyResponse>()
+        .await
+        .map_err(|error| dependency_error("fiducia-auth", "key_create_bad_response", error))?;
+    if issued.key.org_id != org_id.to_string()
+        || issued.key.require_idempotency != payload.require_idempotency.unwrap_or(true)
+    {
+        return Err(dependency_error(
+            "fiducia-auth",
+            "key_create_contract_mismatch",
+            "auth response did not match the requested organization or policy",
+        ));
+    }
+    let verifier_secret = issued
+        .api_key
+        .split_once('.')
+        .map(|(_, secret)| secret)
+        .ok_or_else(|| {
+            dependency_error(
+                "fiducia-auth",
+                "key_create_bad_response",
+                "raw key did not contain a verifier secret",
+            )
+        })?;
     let new_key = store::NewApiKey {
-        key_id: &prefix,
+        key_id: &issued.key.key_id,
         org_id,
         name: payload.name.trim(),
-        secret_hash: hash_secret(&secret),
+        secret_hash: hash_secret(verifier_secret),
         scopes: json!([payload.scope]),
         env: &payload.environment,
+        require_idempotency: payload.require_idempotency.unwrap_or(true),
     };
     match store::insert_api_key(pool, new_key).await {
-        Ok(row) => {
-            let mut api_key = api_key_row_to_display(&row);
-            api_key["environment"] = json!(payload.environment);
-            api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "ok": true,
-                    "api_key": api_key,
-                    "secret": secret,
-                    "secret_once": true,
-                })),
-            )
-                .into_response()
+        Ok(row) => Ok((row, issued.api_key)),
+        Err(error) => {
+            let compensation = client
+                .delete(format!(
+                    "{}/v1/keys/{}",
+                    auth_url.trim_end_matches('/'),
+                    issued.key.key_id
+                ))
+                .bearer_auth(token)
+                .send()
+                .await;
+            if compensation
+                .as_ref()
+                .map(|response| !response.status().is_success())
+                .unwrap_or(true)
+            {
+                tracing::error!(
+                    key_id = %issued.key.key_id,
+                    "failed to compensate auth key after customer Postgres insert failure"
+                );
+            }
+            Err(dependency_error("postgres", "api_key_insert_failed", error))
         }
-        Err(err) => dependency_error("postgres", "api_key_insert_failed", err),
     }
 }
 
@@ -444,56 +746,135 @@ async fn rotate_customer_api_key(
     headers: HeaderMap,
     Json(payload): Json<RotateCustomerApiKeyRequest>,
 ) -> Response {
-    let ctx = match config.authenticator.authenticate(&headers).await {
-        Ok(c) => c,
-        Err(e) => return e,
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
     };
-    let prefix = payload.prefix.trim();
-    if prefix.is_empty() || !prefix.starts_with("fid_") {
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let presented = payload.prefix.trim();
+    let left = presented
+        .split_once('.')
+        .map(|(left, _)| left)
+        .unwrap_or(presented);
+    let key_id = left.rsplit('_').next().unwrap_or_default();
+    if key_id.is_empty()
+        || !key_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_key_prefix", "ok": false })),
         )
             .into_response();
     }
-
-    let issued_at_ms = unix_epoch_ms();
-    let replacement_secret = format!("{prefix}_{}", random_token_hex(24));
-
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
-        Err(response) => return response,
+    let Some(token) = bearer_token(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing_customer_session").into_response();
     };
-    // Replace the stored secret hash, scoped to the caller's org so one
-    // tenant can never rotate another tenant's key. The bump_row_version trigger
-    // advances `version` + `updated_at`. A prefix that
-    // is not the caller's org yields `Ok(None)` (no-op), reported as not-found.
-    match store::rotate_secret(
-        pool,
-        prefix,
-        hash_secret(&replacement_secret),
-        &ctx.org_uuids(),
-    )
-    .await
+    let Some(auth_url) = config.auth_url.as_deref() else {
+        return dependency_error(
+            "fiducia-auth",
+            "key_authority_not_configured",
+            "FIDUCIA_AUTH_URL is required",
+        );
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
     {
-        Ok(Some(_row)) => {}
-        Ok(None) => {
+        Ok(client) => client,
+        Err(error) => return dependency_error("fiducia-auth", "key_rotate_failed", error),
+    };
+    let response = match client
+        .post(format!(
+            "{}/v1/keys/{key_id}/rotate",
+            auth_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "ok": false, "error": "key_not_found" })),
             )
-                .into_response();
+                .into_response()
         }
-        Err(err) => return dependency_error("postgres", "api_key_rotate_failed", err),
+        Ok(response) => {
+            return dependency_error("fiducia-auth", "key_rotate_rejected", response.status())
+        }
+        Err(error) => return dependency_error("fiducia-auth", "key_rotate_failed", error),
+    };
+    let issued = match response.json::<AuthCreatedKeyResponse>().await {
+        Ok(issued) => issued,
+        Err(error) => return dependency_error("fiducia-auth", "key_rotate_bad_response", error),
+    };
+    if issued.key.key_id != key_id || !customer.orgs.iter().any(|org| org == &issued.key.org_id) {
+        return dependency_error(
+            "fiducia-auth",
+            "key_rotate_contract_mismatch",
+            "auth response did not match the requested key or customer organization",
+        );
+    }
+    let verifier_secret = match issued.api_key.split_once('.') {
+        Some((_, secret)) => secret,
+        None => {
+            return dependency_error(
+                "fiducia-auth",
+                "key_rotate_bad_response",
+                "raw key did not contain a verifier secret",
+            )
+        }
+    };
+    let updated = store::rotate_secret(
+        pool,
+        key_id,
+        hash_secret(verifier_secret),
+        &customer.org_uuids(),
+    )
+    .await;
+    if !matches!(updated, Ok(Some(_))) {
+        let compensation = client
+            .delete(format!(
+                "{}/v1/keys/{key_id}",
+                auth_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await;
+        if compensation
+            .as_ref()
+            .map(|response| !response.status().is_success())
+            .unwrap_or(true)
+        {
+            tracing::error!(
+                key_id,
+                "failed to revoke authoritative key after relational rotation failure"
+            );
+        }
+        return match updated {
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "ok": false, "error": "key_not_found" })),
+            )
+                .into_response(),
+            Err(error) => dependency_error("postgres", "api_key_rotate_failed", error),
+            Ok(Some(_)) => unreachable!(),
+        };
     }
 
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
-            "prefix": prefix,
-            "rotated_at_ms": issued_at_ms,
-            "replacement_secret": replacement_secret,
+            "prefix": format!("fdc_{}_{}", issued.key.env, key_id),
+            "rotated_at_ms": unix_epoch_ms(),
+            "replacement_secret": issued.api_key,
             "overlap_seconds": 0,
         })),
     )
@@ -630,8 +1011,11 @@ enum Idem {
 }
 
 /// Begin idempotent handling of `key` in the durable ledger.
-async fn idempotency_begin(config: &AppConfig, key: &str) -> Result<Idem, sqlx::Error> {
-    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+async fn idempotency_begin(config: &AppConfig, key: &str) -> Result<Idem, DbErr> {
+    let pool = config
+        .pool
+        .as_ref()
+        .ok_or_else(|| DbErr::Custom("customer database unavailable".to_string()))?;
     if store::idem_claim(pool, key).await? {
         return Ok(Idem::Proceed);
     }
@@ -643,19 +1027,21 @@ async fn idempotency_begin(config: &AppConfig, key: &str) -> Result<Idem, sqlx::
 }
 
 /// Record the committed version for `key` in the durable ledger.
-async fn idempotency_commit(
-    config: &AppConfig,
-    key: &str,
-    version: i64,
-) -> Result<(), sqlx::Error> {
-    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+async fn idempotency_commit(config: &AppConfig, key: &str, version: i64) -> Result<(), DbErr> {
+    let pool = config
+        .pool
+        .as_ref()
+        .ok_or_else(|| DbErr::Custom("customer database unavailable".to_string()))?;
     store::idem_record(pool, key, version).await
 }
 
 /// Release a claim when the protected mutation did not commit. Stale in-flight
 /// claims are also recoverable in the store, covering process crashes.
-async fn idempotency_release(config: &AppConfig, key: &str) -> Result<(), sqlx::Error> {
-    let pool = config.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+async fn idempotency_release(config: &AppConfig, key: &str) -> Result<(), DbErr> {
+    let pool = config
+        .pool
+        .as_ref()
+        .ok_or_else(|| DbErr::Custom("customer database unavailable".to_string()))?;
     store::idem_release(pool, key).await
 }
 
@@ -724,7 +1110,7 @@ enum SyncMutationError {
     InvalidId,
     NoOrg,
     NotFound,
-    Database(sqlx::Error),
+    Database(DbErr),
 }
 
 async fn sync_write_api_keys_row(
@@ -732,10 +1118,9 @@ async fn sync_write_api_keys_row(
     req: &SyncWriteRequest,
     ctx: &CustomerCtx,
 ) -> Result<i64, SyncMutationError> {
-    let pool = config
-        .pool
-        .as_ref()
-        .ok_or(SyncMutationError::Database(sqlx::Error::PoolClosed))?;
+    let pool = config.pool.as_ref().ok_or_else(|| {
+        SyncMutationError::Database(DbErr::Custom("customer database unavailable".to_string()))
+    })?;
     let id = Uuid::parse_str(&req.id).map_err(|_| SyncMutationError::InvalidId)?;
     let op = req.op.as_deref().unwrap_or("upsert");
     // Every mutation is scoped to the caller's org(s); a row in another tenant's
@@ -826,11 +1211,12 @@ fn api_key_row_to_display(row: &ApiKeysRow) -> serde_json::Value {
     json!({
         "id": row.id.to_string(),
         "name": row.name,
-        "prefix": row.key_id,
+        "prefix": format!("fdc_{}_{}", row.env, row.key_id),
         "scopes": scopes,
         "last_used": if row.last_used_at.is_some() { "recently" } else { "never" },
         "status": if row.revoked { "revoked" } else { "active" },
         "environment": row.env,
+        "require_idempotency": row.require_idempotency,
         "version": row.version,
     })
 }
@@ -1026,6 +1412,139 @@ async fn revoke_customer_security_session(
     }
 }
 
+async fn customer_preferences_fragment(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    preferences_fragment_markup(&config, &customer, false).await
+}
+
+async fn update_customer_preferences_form(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<CustomerPreferencesForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    if !CUSTOMER_REGIONS.contains(&form.region.as_str()) {
+        return (StatusCode::BAD_REQUEST, "invalid_region").into_response();
+    }
+    if !["comfortable", "compact"].contains(&form.density.as_str()) {
+        return (StatusCode::BAD_REQUEST, "invalid_density").into_response();
+    }
+    let user_id = match caller_user_id(&config, &customer).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let row = match store::upsert_preferences(
+        pool,
+        user_id,
+        form.region,
+        form.timezone,
+        form.density,
+        form.notify_key_rotation.is_some(),
+        form.notify_lock_contention.is_some(),
+        form.notify_mfa.is_some(),
+    )
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => return dependency_error("postgres", "preferences_write_failed", error),
+    };
+    preferences_form_markup(&prefs_from_row(&row), true).into_response()
+}
+
+async fn preferences_fragment_markup(
+    config: &AppConfig,
+    customer: &CustomerCtx,
+    saved: bool,
+) -> Response {
+    let user_id = match caller_user_id(config, customer).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let preferences = match store::get_preferences(pool, user_id).await {
+        Ok(Some(row)) => prefs_from_row(&row),
+        Ok(None) => default_customer_preferences(),
+        Err(error) => return dependency_error("postgres", "preferences_read_failed", error),
+    };
+    preferences_form_markup(&preferences, saved).into_response()
+}
+
+async fn customer_sessions_fragment(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    sessions_fragment_markup(&config, &customer, None).await
+}
+
+async fn revoke_customer_session_form(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<RevokeCustomerSessionForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    let device = form.device.trim();
+    if device.is_empty() {
+        return (StatusCode::BAD_REQUEST, "device_required").into_response();
+    }
+    let user_id = match caller_user_id(&config, &customer).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let message = match store::revoke_session(pool, user_id, device).await {
+        Ok(true) => Some("Session revoked."),
+        Ok(false) => Some("Session was already revoked or no longer exists."),
+        Err(error) => return dependency_error("postgres", "session_revoke_failed", error),
+    };
+    sessions_fragment_markup(&config, &customer, message).await
+}
+
+async fn sessions_fragment_markup(
+    config: &AppConfig,
+    customer: &CustomerCtx,
+    message: Option<&str>,
+) -> Response {
+    let user_id = match caller_user_id(config, customer).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let sessions = match store::list_sessions(pool, user_id).await {
+        Ok(sessions) => sessions,
+        Err(error) => return dependency_error("postgres", "sessions_list_failed", error),
+    };
+    sessions_table_markup(&sessions, message).into_response()
+}
+
 fn validate_api_key_request(payload: &CreateCustomerApiKeyRequest) -> Option<&'static str> {
     if payload.name.trim().is_empty() {
         return Some("name_required");
@@ -1072,7 +1591,7 @@ fn default_customer_preferences() -> CustomerPreferences {
 
 async fn root(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
     if should_serve_customer_app(&config, &headers) {
-        return customer_page(&config, CustomerTab::Dashboard).into_response();
+        return customer_page_response(&config, &headers, CustomerTab::Dashboard).await;
     }
 
     match tokio::fs::read_to_string(config.static_dir.join("index.html")).await {
@@ -1081,67 +1600,192 @@ async fn root(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
     }
 }
 
-async fn customer_home(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Dashboard)
+async fn customer_home(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::Dashboard).await
 }
 
-async fn customer_auth(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Auth)
+async fn customer_auth(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::Auth).await
 }
 
-async fn customer_api_keys(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::ApiKeys)
+async fn customer_api_keys(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::ApiKeys).await
 }
 
-async fn customer_security(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Security)
+async fn customer_security(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::Security).await
 }
 
-async fn customer_settings(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Settings)
+async fn customer_settings(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::Settings).await
 }
 
-async fn customer_locks(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Locks)
+async fn customer_locks(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::Locks).await
 }
 
-async fn customer_requests(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Requests)
+async fn customer_requests(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::Requests).await
 }
 
-async fn customer_kv(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Kv)
+async fn customer_kv(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::Kv).await
 }
 
-async fn customer_services(State(config): State<AppConfig>) -> Markup {
-    customer_page(&config, CustomerTab::Services)
+async fn customer_services(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    customer_page_response(&config, &headers, CustomerTab::Services).await
 }
 
-async fn summary_fragment() -> Markup {
-    summary_markup()
+async fn create_customer_api_key_form(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<CreateCustomerApiKeyForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    let payload = CreateCustomerApiKeyRequest {
+        name: form.name,
+        environment: form.environment,
+        scope: form.scope,
+        require_idempotency: Some(true),
+    };
+    let token = bearer_token(&headers);
+    let (_row, secret) =
+        match issue_customer_api_key(&config, &customer, token.as_deref(), &payload).await {
+            Ok(issued) => issued,
+            Err(response) => return response,
+        };
+    api_keys_fragment_markup(&config, &customer, Some(&secret)).await
 }
 
-async fn locks_fragment() -> Markup {
-    locks_markup()
+async fn api_keys_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    api_keys_fragment_markup(&config, &customer, None).await
 }
 
-async fn requests_fragment() -> Markup {
-    requests_markup()
+async fn api_keys_fragment_markup(
+    config: &AppConfig,
+    customer: &CustomerCtx,
+    secret: Option<&str>,
+) -> Response {
+    let pool = match customer_pool(config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let keys = match store::list_api_keys(pool, &customer.org_uuids()).await {
+        Ok(keys) => keys,
+        Err(error) => return dependency_error("postgres", "api_keys_list_failed", error),
+    };
+    api_keys_table_markup(&keys, secret).into_response()
 }
 
-async fn kv_fragment() -> Markup {
-    kv_markup()
+fn api_keys_table_markup(keys: &[ApiKeysRow], secret: Option<&str>) -> Markup {
+    html! {
+        @if let Some(secret) = secret {
+            section class="panel secret-once" role="status" {
+                h2 { "Copy this secret now" }
+                code { (secret) }
+                p class="muted" { "The plaintext is shown once. Only its SHA-256 verifier is stored." }
+            }
+        }
+        section class="panel" aria-labelledby="api-keys-heading" {
+            div class="panel__header" {
+                h2 id="api-keys-heading" { "Customer API keys" }
+                span { (keys.len()) " total" }
+            }
+            div class="table-wrap" {
+                table {
+                    thead {
+                        tr {
+                            th { "Name" }
+                            th { "Prefix" }
+                            th { "Environment" }
+                            th { "Scopes" }
+                            th { "State" }
+                        }
+                    }
+                    tbody {
+                        @if keys.is_empty() {
+                            tr { td colspan="5" class="muted" { "No API keys yet." } }
+                        } @else {
+                            @for key in keys {
+                                tr {
+                                    td { (&key.name) }
+                                    td { code { (format!("fdc_{}_{}", key.env, key.key_id)) } }
+                                    td { (&key.env) }
+                                    td { code { (key.scopes.to_string()) } }
+                                    td { @if key.revoked { "revoked" } @else { "active" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
-async fn services_fragment() -> Markup {
-    services_markup()
+async fn customer_page_response(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    active: CustomerTab,
+) -> Response {
+    match config.authenticator.authenticate(headers).await {
+        Ok(customer) => customer_page(config, &customer, active).into_response(),
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
+        }
+        Err(response) => response,
+    }
 }
 
-async fn customer_ws(ws: WebSocketUpgrade) -> Response {
+async fn summary_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    protected_fragment(&config, &headers, summary_markup()).await
+}
+
+async fn locks_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    protected_fragment(&config, &headers, locks_markup()).await
+}
+
+async fn requests_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    protected_fragment(&config, &headers, requests_markup()).await
+}
+
+async fn kv_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    protected_fragment(&config, &headers, kv_markup()).await
+}
+
+async fn services_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    protected_fragment(&config, &headers, services_markup()).await
+}
+
+async fn protected_fragment(config: &AppConfig, headers: &HeaderMap, fragment: Markup) -> Response {
+    match config.authenticator.authenticate(headers).await {
+        Ok(_) => fragment.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn customer_ws(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = config.authenticator.authenticate(&headers).await {
+        return response;
+    }
     ws.on_upgrade(customer_ws_stream)
 }
 
-async fn customer_events() -> impl IntoResponse {
+async fn customer_events(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    if let Err(response) = config.authenticator.authenticate(&headers).await {
+        return response;
+    }
     let stream = async_stream::stream! {
         yield Ok::<Event, Infallible>(stream_event("connected", 0));
 
@@ -1157,11 +1801,13 @@ async fn customer_events() -> impl IntoResponse {
         }
     };
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(STREAM_HEARTBEAT_SECS))
-            .text("keepalive"),
-    )
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(STREAM_HEARTBEAT_SECS))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 async fn customer_ws_stream(mut socket: WebSocket) {
@@ -1233,20 +1879,6 @@ fn unix_epoch_ms() -> u128 {
         .as_millis()
 }
 
-/// Hex-encoded CSPRNG token for API-key secrets. The plaintext is returned once;
-/// only its hash is persisted in customer Postgres.
-fn random_token_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    // getrandom only fails if the OS entropy source is unavailable; treat that
-    // as fatal for a secret rather than falling back to a weak value.
-    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
-    let mut out = String::with_capacity(bytes * 2);
-    for b in buf {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
 fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
     if config.customer_site_mode {
         return true;
@@ -1304,7 +1936,7 @@ impl CustomerTab {
     fn label(self) -> &'static str {
         match self {
             CustomerTab::Dashboard => "Dashboard",
-            CustomerTab::Auth => "Login & Signup",
+            CustomerTab::Auth => "Account",
             CustomerTab::ApiKeys => "API Keys",
             CustomerTab::Security => "Security",
             CustomerTab::Settings => "Settings",
@@ -1315,24 +1947,10 @@ impl CustomerTab {
         }
     }
 
-    fn count(self) -> &'static str {
-        match self {
-            CustomerTab::Dashboard => "12",
-            CustomerTab::Auth => "2",
-            CustomerTab::ApiKeys => "3",
-            CustomerTab::Security => "2FA",
-            CustomerTab::Settings => "8",
-            CustomerTab::Locks => "4",
-            CustomerTab::Requests => "6",
-            CustomerTab::Kv => "3",
-            CustomerTab::Services => "5",
-        }
-    }
-
     fn description(self) -> &'static str {
         match self {
             CustomerTab::Dashboard => "Account posture, API access, realtime health, and customer operations in one workspace.",
-            CustomerTab::Auth => "Supabase Auth login, signup, magic link, and session controls for end customers.",
+            CustomerTab::Auth => "Your Supabase identity, verified organization membership, and isolated customer session.",
             CustomerTab::ApiKeys => "Create, rotate, scope, and audit customer API keys for production integrations.",
             CustomerTab::Security => "Two-factor authentication, trusted sessions, recovery, and account protection.",
             CustomerTab::Settings => "Preferences, notifications, default region, and team-level customer settings.",
@@ -1344,7 +1962,7 @@ impl CustomerTab {
     }
 }
 
-fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
+fn customer_page(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -1352,8 +1970,8 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Fiducia Customer Portal" }
-                link rel="stylesheet" href="/_customer/assets/customer.css";
-                (customer_config_script(config))
+                link rel="stylesheet" href="/assets/customer.css";
+                script src="/assets/htmx.min.js" defer {}
             }
             body {
                 div class="app-shell" {
@@ -1366,9 +1984,11 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                             }
                         }
                         div class="topbar__status" {
-                            span class="status-pill" data-backend-stream-status="" data-status="connecting" { "connecting" }
-                            span class="status-pill" data-supabase-status="" data-status="offline" { "offline" }
-                            span class="status-pill" { "linearizable reads" }
+                            span class="status-pill" data-status="online" { "verified" }
+                            span class="status-pill" { (customer.email.as_deref().unwrap_or(&customer.user_id)) }
+                            form method="post" action="/logout" {
+                                button type="submit" { "Sign out" }
+                            }
                         }
                     }
                     main class="workspace" {
@@ -1380,12 +2000,10 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                                         @if tab == active {
                                             a href=(tab.href()) aria-current="page" {
                                                 span { (tab.label()) }
-                                                span class="nav__count" { (tab.count()) }
                                             }
                                         } @else {
                                             a href=(tab.href()) {
                                                 span { (tab.label()) }
-                                                span class="nav__count" { (tab.count()) }
                                             }
                                         }
                                     }
@@ -1414,123 +2032,103 @@ fn customer_page(config: &AppConfig, active: CustomerTab) -> Markup {
                                     a href="/api/info" { "API info" }
                                 }
                             }
-                            (customer_tab_content(config, active))
+                            (customer_tab_content(config, customer, active))
                         }
                     }
                 }
-                script type="module" src="/_customer/assets/customer.js" {}
             }
         }
     }
 }
 
-fn customer_config_script(config: &AppConfig) -> Markup {
-    let payload = json!({
-        "apiBase": "",
-        "customerHost": config.customer_app_host,
-        "backendWsPath": CUSTOMER_WS_PATH,
-        "backendEventsPath": CUSTOMER_EVENTS_PATH,
-        "regions": CUSTOMER_REGIONS,
-        "supabaseUrl": config.supabase_url,
-        "supabaseAnonKey": config.supabase_anon_key,
-    });
-    let script = format!(
-        "window.FIDUCIA_CUSTOMER_CONFIG = {};",
-        serde_json::to_string(&payload).unwrap()
-    );
-    html! {
-        script { (PreEscaped(script)) }
-    }
-}
-
-fn customer_tab_content(config: &AppConfig, active: CustomerTab) -> Markup {
+fn customer_tab_content(config: &AppConfig, customer: &CustomerCtx, active: CustomerTab) -> Markup {
     match active {
-        CustomerTab::Dashboard => dashboard_markup(config),
-        CustomerTab::Auth => auth_markup(config),
+        CustomerTab::Dashboard => dashboard_markup(config, customer),
+        CustomerTab::Auth => auth_markup(customer),
         CustomerTab::ApiKeys => api_keys_markup(),
         CustomerTab::Security => security_markup(),
         CustomerTab::Settings => settings_markup(),
         CustomerTab::Locks => html! {
             div class="panel-grid" {
-                section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+                section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="load, every 15s" hx-swap="innerHTML" {
                     (locks_markup())
                 }
                 (realtime_events_markup())
             }
         },
         CustomerTab::Requests => html! {
-            section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+            section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="load, every 15s" hx-swap="innerHTML" {
                 (requests_markup())
             }
         },
         CustomerTab::Kv => html! {
-            section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+            section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="load, every 15s" hx-swap="innerHTML" {
                 (kv_markup())
             }
         },
         CustomerTab::Services => html! {
-            section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+            section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="load, every 15s" hx-swap="innerHTML" {
                 (services_markup())
             }
         },
     }
 }
 
-fn dashboard_markup(config: &AppConfig) -> Markup {
+fn dashboard_markup(config: &AppConfig, customer: &CustomerCtx) -> Markup {
     html! {
-        section id="summary" hx-get="/app/fragments/summary" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+        section id="summary" hx-get="/app/fragments/summary" hx-trigger="load, every 15s" hx-swap="innerHTML" {
             (summary_markup())
         }
         div class="panel-grid panel-grid--dashboard" {
-            (auth_status_panel(config))
+            (auth_status_panel(config, customer))
             (api_key_summary_panel())
             (security_summary_panel())
             (preferences_summary_panel())
         }
         div class="panel-grid" {
-            section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+            section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="load, every 15s" hx-swap="innerHTML" {
                 (locks_markup())
             }
             (realtime_events_markup())
         }
-        section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+        section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="load, every 15s" hx-swap="innerHTML" {
             (requests_markup())
         }
-        section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+        section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="load, every 15s" hx-swap="innerHTML" {
             (kv_markup())
         }
-        section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="fiducia:refresh from:body" hx-swap="innerHTML" {
+        section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="load, every 15s" hx-swap="innerHTML" {
             (services_markup())
         }
     }
 }
 
-fn auth_status_panel(config: &AppConfig) -> Markup {
-    let supabase_state = if config.supabase_url.is_some() && config.supabase_anon_key.is_some() {
-        "configured"
-    } else {
-        "missing env"
-    };
+fn auth_status_panel(config: &AppConfig, customer: &CustomerCtx) -> Markup {
+    let supabase_state =
+        if config.supabase_url.is_some() && config.supabase_publishable_key.is_some() {
+            "configured"
+        } else {
+            "missing env"
+        };
     let project_url = config.supabase_url.as_deref().unwrap_or("not configured");
 
     html! {
         section class="panel" aria-labelledby="auth-status-heading" {
             div class="panel__header" {
                 h2 id="auth-status-heading" { "Supabase Auth" }
-                span data-auth-status="" { "signed out" }
+                span data-auth-status="" { "verified" }
             }
             div class="panel-body stack" {
                 div class="identity-row" {
                     div {
                         p class="eyebrow" { "Customer session" }
-                        p class="identity-row__primary" data-auth-email="" { "No customer signed in" }
+                        p class="identity-row__primary" data-auth-email="" { (customer.email.as_deref().unwrap_or(&customer.user_id)) }
                     }
                     (status_tag(supabase_state))
                 }
                 p class="muted" { "Project: " span class="mono" { (project_url) } }
                 div class="action-row" {
-                    a class="button-link" href="/app/auth" { "Login" }
-                    a class="button-link" href="/app/signup" { "Sign up" }
+                    a class="button-link" href="/app/auth" { "Account" }
                 }
             }
         }
@@ -1542,7 +2140,7 @@ fn api_key_summary_panel() -> Markup {
         section class="panel" aria-labelledby="api-key-summary-heading" {
             div class="panel__header" {
                 h2 id="api-key-summary-heading" { "API Keys" }
-                span { "3 active" }
+                span { "Postgres-backed" }
             }
             div class="panel-body stack" {
                 p class="muted" { "Issue scoped keys for customer workloads and rotate live keys without downtime." }
@@ -1567,18 +2165,18 @@ fn security_summary_panel() -> Markup {
         section class="panel" aria-labelledby="security-summary-heading" {
             div class="panel__header" {
                 h2 id="security-summary-heading" { "Security" }
-                span { "2FA enrollment available" }
+                span { "Supabase-managed" }
             }
             div class="panel-body stack" {
-                p class="muted" { "Require TOTP two-factor authentication for admins before production key issuance." }
+                p class="muted" { "Supabase owns MFA and passkey enrollment; trusted session records are loaded from the customer database." }
                 dl class="detail-list" {
                     div {
-                        dt { "MFA" }
-                        dd data-mfa-state="" { "not enrolled" }
+                        dt { "Identity" }
+                        dd { "verified by fiducia-auth" }
                     }
                     div {
-                        dt { "Sessions" }
-                        dd { "3 trusted" }
+                        dt { "Enrollment state" }
+                        dd { "not guessed by this service" }
                     }
                 }
                 a class="button-link" href="/app/security" { "Review security" }
@@ -1592,107 +2190,40 @@ fn preferences_summary_panel() -> Markup {
         section class="panel" aria-labelledby="preferences-summary-heading" {
             div class="panel__header" {
                 h2 id="preferences-summary-heading" { "Preferences" }
-                span { "team" }
+                span { "Postgres-backed" }
             }
             div class="panel-body stack" {
                 p class="muted" { "Set default region, alert cadence, timezone, and customer-visible notifications." }
-                dl class="detail-list" {
-                    div {
-                        dt { "Region" }
-                        dd { "auto" }
-                    }
-                    div {
-                        dt { "Alerts" }
-                        dd { "critical + key rotation" }
-                    }
-                }
+                p { "Values are rendered from the authenticated user's persisted row." }
                 a class="button-link" href="/app/settings" { "Open settings" }
             }
         }
     }
 }
 
-fn auth_markup(config: &AppConfig) -> Markup {
-    let supabase_state = if config.supabase_url.is_some() && config.supabase_anon_key.is_some() {
-        "ready"
-    } else {
-        "configure SUPABASE_URL and SUPABASE_ANON_KEY"
-    };
-
+fn auth_markup(customer: &CustomerCtx) -> Markup {
     html! {
-        div class="panel-grid panel-grid--forms" {
-            section class="panel" aria-labelledby="signin-heading" {
-                div class="panel__header" {
-                    h2 id="signin-heading" { "Login" }
-                    span { (supabase_state) }
-                }
-                form class="form-grid" data-auth-form="sign-in" {
-                    label {
-                        span { "Email" }
-                        input id="signin-email" type="email" name="email" autocomplete="email" required data-requires-supabase="";
-                    }
-                    label {
-                        span { "Password" }
-                        input id="signin-password" type="password" name="password" autocomplete="current-password" required data-requires-supabase="";
-                    }
-                    button type="submit" data-requires-supabase="" { "Login" }
-                }
-            }
-            section class="panel" aria-labelledby="signup-heading" {
-                div class="panel__header" {
-                    h2 id="signup-heading" { "Sign up" }
-                    span { "Supabase Auth" }
-                }
-                form class="form-grid" data-auth-form="sign-up" {
-                    label {
-                        span { "Work email" }
-                        input id="signup-email" type="email" name="email" autocomplete="email" required data-requires-supabase="";
-                    }
-                    label {
-                        span { "Full name" }
-                        input id="signup-name" type="text" name="full_name" autocomplete="name" required data-requires-supabase="";
-                    }
-                    label {
-                        span { "Company" }
-                        input id="signup-company" type="text" name="company_name" autocomplete="organization" data-requires-supabase="";
-                    }
-                    label {
-                        span { "Password" }
-                        input id="signup-password" type="password" name="password" autocomplete="new-password" minlength="8" required data-requires-supabase="";
-                    }
-                    button type="submit" data-requires-supabase="" { "Create account" }
-                }
-            }
-        }
-        section class="panel" aria-labelledby="magic-link-heading" {
+        section class="panel" aria-labelledby="customer-session-heading" {
             div class="panel__header" {
-                h2 id="magic-link-heading" { "Magic link" }
-                span data-auth-status="" { "signed out" }
+                h2 id="customer-session-heading" { "Customer identity" }
+                span class="status-pill" data-status="online" { "verified" }
             }
             div class="split-panel" {
-                form class="form-grid" data-auth-form="magic-link" {
-                    label {
-                        span { "Email" }
-                        input id="magic-email" type="email" name="email" autocomplete="email" required data-requires-supabase="";
-                    }
-                    button type="submit" data-requires-supabase="" { "Send link" }
+                div class="session-box" {
+                    p class="eyebrow" { "Supabase user" }
+                    p class="identity-row__primary" { (customer.email.as_deref().unwrap_or(&customer.user_id)) }
+                    p class="muted" { "Verified by fiducia-auth on this request." }
                 }
                 div class="session-box" {
-                    p class="eyebrow" { "Current session" }
-                    p class="identity-row__primary" data-auth-email="" { "No customer signed in" }
-                    div class="action-row" {
-                        button type="button" data-auth-action="sign-out" data-requires-supabase="" { "Log out" }
-                    }
-                }
-                div class="session-box" {
-                    p class="eyebrow" { "Passkeys" }
-                    p class="muted" { "Use WebAuthn passkeys as a phishing-resistant sign-in option once Supabase passkeys are enabled." }
-                    div class="action-row" {
-                        button type="button" data-passkey-action="sign-in" data-requires-supabase="" { "Sign in with passkey" }
+                    p class="eyebrow" { "Organization membership" }
+                    @for org in &customer.orgs {
+                        code { (org) }
                     }
                 }
             }
-            div class="inline-message" data-auth-message="" aria-live="polite" {}
+            form method="post" action="/logout" hx-post="/logout" {
+                button type="submit" { "Sign out" }
+            }
         }
     }
 }
@@ -1704,7 +2235,8 @@ fn api_keys_markup() -> Markup {
                 h2 id="create-api-key-heading" { "Create API key" }
                 span { "customer scoped" }
             }
-            form class="form-grid form-grid--inline" data-api-key-form="" {
+            form class="form-grid form-grid--inline" method="post" action="/app/api-keys"
+                hx-post="/app/api-keys" hx-target="#api-key-results" hx-swap="innerHTML" {
                 label {
                     span { "Name" }
                     input type="text" name="name" placeholder="Production checkout" required;
@@ -1735,105 +2267,47 @@ fn api_keys_markup() -> Markup {
                         option value="rate-limit:write" { "rate-limit:write" }
                     }
                 }
-                label class="checkbox-line" {
-                    input type="checkbox" name="require_idempotency" checked;
-                    span { "Require Idempotency-Key on mutating calls" }
-                }
                 button type="submit" { "Create key" }
             }
-            div class="inline-message" data-api-key-message="" aria-live="polite" {}
         }
-        section class="panel" aria-labelledby="api-keys-heading" {
-            div class="panel__header" {
-                h2 id="api-keys-heading" { "Customer API keys" }
-                span { "immediate rotation" }
-            }
-            div class="table-wrap" {
-                table data-api-keys-table="" {
-                    thead {
-                        tr {
-                            th { "Name" }
-                            th { "Prefix" }
-                            th { "Scopes" }
-                            th { "Last used" }
-                            th { "State" }
-                            th { "Action" }
-                        }
-                    }
-                    tbody {
-                        tr data-api-keys-loading="" {
-                            td colspan="6" class="muted" { "Loading customer API keys…" }
-                        }
-                    }
-                }
-            }
+        div id="api-key-results" hx-get="/app/fragments/api-keys" hx-trigger="load" hx-swap="innerHTML" {
+            p class="muted" { "Loading customer API keys…" }
         }
     }
 }
 
 fn security_markup() -> Markup {
     html! {
-        div class="panel-grid panel-grid--forms" {
-            section class="panel" aria-labelledby="mfa-heading" {
-                div class="panel__header" {
-                    h2 id="mfa-heading" { "Two-factor authentication" }
-                    span data-mfa-state="" { "not enrolled" }
-                }
-                div class="panel-body stack" {
-                    p class="muted" { "Enroll a TOTP authenticator before issuing or rotating production API keys." }
-                    div class="action-row" {
-                        button type="button" data-mfa-action="enroll-totp" data-requires-supabase="" { "Enroll TOTP" }
-                    }
-                    img class="mfa-qr" data-mfa-qr="" alt="TOTP QR code" hidden;
-                    p class="mono secret-line" data-mfa-secret="" hidden {}
-                    label class="form-field" {
-                        span { "Authenticator code" }
-                        input type="text" inputmode="numeric" autocomplete="one-time-code" data-mfa-code="" data-requires-supabase="";
-                    }
-                    button type="button" data-mfa-action="verify-totp" data-requires-supabase="" { "Verify 2FA" }
-                    div class="inline-message" data-mfa-message="" aria-live="polite" {}
-                }
+        section class="panel" aria-labelledby="auth-security-heading" {
+            div class="panel__header" {
+                h2 id="auth-security-heading" { "Supabase account security" }
+                span { "provider managed" }
             }
-            section class="panel" aria-labelledby="passkeys-heading" {
-                div class="panel__header" {
-                    h2 id="passkeys-heading" { "Passkeys" }
-                    span { "WebAuthn" }
-                }
-                div class="panel-body stack" {
-                    p class="muted" { "Register a passkey after sign-in so email and password accounts can step up to phishing-resistant authentication." }
-                    div class="action-row" {
-                        button type="button" data-passkey-action="register" data-requires-supabase="" { "Register passkey" }
-                        button type="button" data-passkey-action="sign-in" data-requires-supabase="" { "Test passkey sign-in" }
-                    }
-                }
-            }
-            section class="panel" aria-labelledby="recovery-heading" {
-                div class="panel__header" {
-                    h2 id="recovery-heading" { "Recovery" }
-                    span { "admin gated" }
-                }
-                div class="panel-body stack" {
-                    p class="muted" { "Recovery codes, break-glass review, and suspicious-login alerts belong to the same customer security workflow." }
-                    dl class="detail-list" {
-                        div {
-                            dt { "Recovery codes" }
-                            dd { "pending generation" }
-                        }
-                        div {
-                            dt { "Break-glass" }
-                            dd { "requires owner approval" }
-                        }
-                    }
-                }
+            p class="muted" {
+                "MFA and passkeys are managed by Supabase Auth. This application does not display guessed enrollment state; production-key policy will only claim enforcement after fiducia-auth exposes a verified assurance level."
             }
         }
+        div id="security-sessions" hx-get="/app/fragments/security-sessions" hx-trigger="load" hx-swap="innerHTML" {
+            p class="muted" { "Loading trusted sessions…" }
+        }
+    }
+}
+
+fn sessions_table_markup(
+    sessions: &[fiducia_interfaces_db::customer::CustomerSessionsRow],
+    message: Option<&str>,
+) -> Markup {
+    html! {
         section class="panel" aria-labelledby="sessions-heading" {
             div class="panel__header" {
                 h2 id="sessions-heading" { "Trusted sessions" }
-                span { "audit trail" }
+                span { (sessions.len()) " recorded" }
+            }
+            @if let Some(message) = message {
+                p class="inline-message" role="status" { (message) }
             }
             div class="table-wrap" {
-                table data-security-sessions-table="" {
+                table {
                     thead {
                         tr {
                             th { "Device" }
@@ -1844,8 +2318,28 @@ fn security_markup() -> Markup {
                         }
                     }
                     tbody {
-                        tr data-security-sessions-loading="" {
-                            td colspan="5" class="muted" { "Loading trusted sessions…" }
+                        @if sessions.is_empty() {
+                            tr { td colspan="5" class="muted" { "No trusted sessions have been recorded." } }
+                        } @else {
+                            @for session in sessions {
+                                tr {
+                                    td { (&session.device) }
+                                    td { (session.location.as_deref().unwrap_or("unknown")) }
+                                    td { (session.last_seen.to_rfc3339()) }
+                                    td { (&session.status) }
+                                    td {
+                                        @if session.status != "revoked" {
+                                            form method="post" action="/app/security/sessions/revoke"
+                                                hx-post="/app/security/sessions/revoke"
+                                                hx-target="#security-sessions"
+                                                hx-swap="innerHTML" {
+                                                input type="hidden" name="device" value=(&session.device);
+                                                button type="submit" { "Revoke" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1856,88 +2350,62 @@ fn security_markup() -> Markup {
 
 fn settings_markup() -> Markup {
     html! {
+        div id="customer-preferences" hx-get="/app/fragments/preferences" hx-trigger="load" hx-swap="innerHTML" {
+            p class="muted" { "Loading persisted preferences…" }
+        }
+    }
+}
+
+fn preferences_form_markup(preferences: &CustomerPreferences, saved: bool) -> Markup {
+    html! {
         section class="panel" aria-labelledby="preferences-heading" {
             div class="panel__header" {
                 h2 id="preferences-heading" { "Preferences" }
-                span { "saved per browser" }
+                span { "Postgres-backed" }
             }
-            form class="settings-grid" data-preference-form="" {
+            @if saved {
+                p class="inline-message" role="status" { "Preferences saved." }
+            }
+            form class="settings-grid" method="post" action="/app/settings"
+                hx-post="/app/settings" hx-target="#customer-preferences" hx-swap="innerHTML" {
                 label class="form-field" {
                     span { "Default region" }
                     select name="region" {
                         @for region in CUSTOMER_REGIONS {
-                            option value=(*region) { (*region) }
+                            option value=(*region) selected[preferences.region == *region] { (*region) }
                         }
                     }
                 }
                 label class="form-field" {
                     span { "Timezone" }
-                    select name="timezone" {
-                        option value="browser" { "Browser default" }
-                        option value="utc" { "UTC" }
-                        option value="america-lima" { "America/Lima" }
-                    }
+                    input name="timezone" value=(&preferences.timezone) required;
                 }
                 label class="form-field" {
                     span { "Dashboard density" }
                     select name="density" {
-                        option value="comfortable" { "Comfortable" }
-                        option value="compact" { "Compact" }
+                        option value="comfortable" selected[preferences.density == "comfortable"] { "Comfortable" }
+                        option value="compact" selected[preferences.density == "compact"] { "Compact" }
                     }
                 }
                 fieldset class="toggle-group" {
                     legend { "Notifications" }
                     label class="checkbox-line" {
-                        input type="checkbox" name="notify_lock_contention" checked;
+                        input type="checkbox" name="notify_lock_contention" value="1"
+                            checked[preferences.notify_lock_contention];
                         span { "Lock contention" }
                     }
                     label class="checkbox-line" {
-                        input type="checkbox" name="notify_key_rotation" checked;
+                        input type="checkbox" name="notify_key_rotation" value="1"
+                            checked[preferences.notify_key_rotation];
                         span { "API key rotation" }
                     }
                     label class="checkbox-line" {
-                        input type="checkbox" name="notify_mfa" checked;
-                        span { "2FA changes" }
+                        input type="checkbox" name="notify_mfa" value="1"
+                            checked[preferences.notify_mfa];
+                        span { "MFA changes" }
                     }
                 }
                 button type="submit" { "Save preferences" }
-            }
-            div class="inline-message" data-preference-message="" aria-live="polite" {}
-        }
-        section class="panel" aria-labelledby="organization-heading" {
-            div class="panel__header" {
-                h2 id="organization-heading" { "Organization settings" }
-                span { "customer tenant" }
-            }
-            div class="panel-body detail-grid" {
-                dl class="detail-list" {
-                    div {
-                        dt { "Tenant slug" }
-                        dd class="mono" { "tenant-42" }
-                    }
-                    div {
-                        dt { "Plan" }
-                        dd { "Production" }
-                    }
-                    div {
-                        dt { "Support route" }
-                        dd { "priority" }
-                    }
-                }
-                dl class="detail-list" {
-                    div {
-                        dt { "Webhook retries" }
-                        dd { "exponential backoff" }
-                    }
-                    div {
-                        dt { "Idempotency retention" }
-                        dd { "24 hours" }
-                    }
-                    div {
-                        dt { "Default consistency" }
-                        dd { "linearizable" }
-                    }
-                }
             }
         }
     }
@@ -1947,11 +2415,11 @@ fn realtime_events_markup() -> Markup {
     html! {
         section class="panel" aria-labelledby="events-heading" {
             div class="panel__header" {
-                h2 id="events-heading" { "Realtime Events" }
-                span { "Supabase" }
+                h2 id="events-heading" { "Refresh channel" }
+                span { "HTMX" }
             }
             div id="realtime-events" class="event-stream" aria-live="polite" {
-                div class="empty-state" { "Waiting for realtime changes." }
+                div class="empty-state" { "Authenticated fragments refresh from this Rust server every 15 seconds." }
             }
         }
     }
@@ -2105,24 +2573,16 @@ mod tests {
         dir
     }
 
-    fn temp_customer_static_dir() -> PathBuf {
-        let dir = temp_dir("fiducia-customer-test");
-        std::fs::create_dir_all(dir.join("assets")).unwrap();
-        std::fs::write(dir.join("assets/customer.js"), "window.customerLoaded=true").unwrap();
-        std::fs::write(dir.join("assets/customer.css"), "body{color:#18212b}").unwrap();
-        dir
-    }
-
     fn test_config() -> AppConfig {
         // No pool: authenticated route tests exercise dependency failures without
         // inventing customer data or requiring a live Postgres/node deployment.
         AppConfig {
             static_dir: temp_static_dir(),
-            customer_static_dir: temp_customer_static_dir(),
             customer_app_host: "app.fiducia.cloud".to_string(),
             customer_site_mode: false,
             supabase_url: None,
-            supabase_anon_key: None,
+            supabase_publishable_key: None,
+            auth_url: None,
             pool: None,
             // Tests exercise the handlers as an authenticated customer with a
             // fixed org; production uses `Authenticator::from_env()` (fail-closed).
@@ -2222,6 +2682,82 @@ mod tests {
         (status, ct, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    async fn spawn_mock(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn customer_login_is_server_mediated_and_issues_only_customer_cookie() {
+        let supabase = Router::new().route(
+            "/auth/v1/token",
+            axum::routing::post(|| async { Json(json!({ "access_token": "customer.jwt" })) }),
+        );
+        let auth = Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": {
+                        "user_id": "00000000-0000-4000-8000-000000000002",
+                        "email": "customer@example.com",
+                        "orgs": ["00000000-0000-4000-8000-000000000001"],
+                        "roles": []
+                    }
+                }))
+            }),
+        );
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let (auth_url, auth_task) = spawn_mock(auth).await;
+        let mut config = test_config();
+        config.supabase_url = Some(supabase_url);
+        config.supabase_publishable_key = Some("public-publishable-key".to_string());
+        config.authenticator = Authenticator::AuthService(auth_url);
+        let app = Router::new()
+            .route("/login", axum::routing::post(customer_login_submit))
+            .with_state(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("email=customer%40example.com&password=correct"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get("location").unwrap(), "/app");
+        let cookie = response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("fiducia_customer_session=customer.jwt"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(!cookie.contains("fiducia_admin_session"));
+        supabase_task.abort();
+        auth_task.abort();
+    }
+
+    #[tokio::test]
+    async fn customer_pages_redirect_missing_sessions_to_customer_login() {
+        let mut config = test_config();
+        config.authenticator = Authenticator::AuthService("http://127.0.0.1:1".to_string());
+        let response = build_router(config)
+            .oneshot(Request::builder().uri("/app").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get("location").unwrap(), "/login");
+    }
+
     async fn send_json(
         method: &str,
         uri: &str,
@@ -2274,10 +2810,10 @@ mod tests {
         assert_eq!(v["role"], "website");
         assert_eq!(v["customer_portal"]["host"], "app.fiducia.cloud");
         assert_eq!(v["customer_portal"]["path"], "/app");
-        assert_eq!(v["customer_portal"]["static_prefix"], "/_customer");
+        assert_eq!(v["customer_portal"]["rendering"], "maud+htmx");
         assert_eq!(v["customer_portal"]["streams"]["websocket"], "/app/ws");
         assert_eq!(v["customer_portal"]["streams"]["sse"], "/app/events");
-        assert_eq!(v["customer_portal"]["supabase_realtime"], false);
+        assert_eq!(v["customer_portal"]["supabase_login"], false);
         assert_eq!(v["components"]["data_plane"], "fiducia-node");
         assert_eq!(v["components"]["control_plane"], "fiducia-brain");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
@@ -2435,8 +2971,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(ct.contains("text/html"), "ct={ct}");
         assert!(body.contains("Fiducia Customer Portal"));
-        assert!(body.contains("/_customer/assets/customer.js"));
-        assert!(body.contains("\"backendWsPath\":\"/app/ws\""));
+        assert!(body.contains("/assets/htmx.min.js"));
+        assert!(!body.contains("/_customer/"));
     }
 
     #[tokio::test]
@@ -2446,10 +2982,10 @@ mod tests {
         assert!(ct.contains("text/html"), "ct={ct}");
         assert!(body.contains("Account posture, API access"));
         assert!(body.contains("Supabase Auth"));
-        assert!(body.contains("Login"));
-        assert!(body.contains("Sign up"));
+        assert!(body.contains("verified"));
+        assert!(body.contains("test@fiducia.cloud"));
         assert!(body.contains("API Keys"));
-        assert!(body.contains("2FA enrollment available"));
+        assert!(body.contains("Supabase-managed"));
         assert!(body.contains("Preferences"));
         assert!(body.contains("node observability API is cluster-wide"));
         assert!(!body.contains("checkout:tenant-42"));
@@ -2458,13 +2994,12 @@ mod tests {
     #[tokio::test]
     async fn customer_account_routes_render_customer_controls() {
         let cases = [
-            ("/app/auth", "Magic link"),
-            ("/app/auth", "Sign in with passkey"),
-            ("/app/signup", "Create account"),
-            ("/app/api-keys", "Require Idempotency-Key"),
-            ("/app/security", "Register passkey"),
-            ("/app/settings", "Organization settings"),
-            ("/app/preferences", "Save preferences"),
+            ("/app/auth", "Verified by fiducia-auth"),
+            ("/app/signup", "Organization membership"),
+            ("/app/api-keys", "Create API key"),
+            ("/app/security", "provider managed"),
+            ("/app/settings", "Loading persisted preferences"),
+            ("/app/preferences", "Loading persisted preferences"),
         ];
 
         for (uri, needle) in cases {
@@ -2586,13 +3121,13 @@ mod tests {
 
     #[tokio::test]
     async fn customer_asset_served_with_correct_mime() {
-        let (status, ct, body) = send("/_customer/assets/customer.js").await;
+        let (status, ct, body) = send("/assets/htmx.min.js").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             ct.contains("text/javascript") || ct.contains("application/javascript"),
             "ct={ct}"
         );
-        assert!(body.contains("customerLoaded"));
+        assert!(body.contains("htmx"));
     }
 
     #[tokio::test]

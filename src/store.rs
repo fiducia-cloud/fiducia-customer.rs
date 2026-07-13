@@ -10,26 +10,15 @@
 //! engine swap (raw SQL → ORM) is provably behaviour-preserving.
 
 use fiducia_interfaces_db::customer::{ApiKeysRow, CustomerPreferencesRow, CustomerSessionsRow};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::entity::api_keys::{ActiveModel, Column, Entity as ApiKeys, Model};
+use crate::entity::sync_idempotency_keys as idem;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, SqlxPostgresConnector,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait,
+    DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    Statement,
 };
-
-/// Wrap the shared sqlx pool as a SeaORM connection. The api_keys access below is
-/// expressed through the ORM; the pool (and its lifecycle) stays owned by the app.
-fn orm(pool: &PgPool) -> DatabaseConnection {
-    SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone())
-}
-
-/// The seam's error type is stable across engines: ORM errors are surfaced as an
-/// opaque `sqlx::Error` so handlers/tests need no changes when the engine swaps.
-fn map_err(e: sea_orm::DbErr) -> sqlx::Error {
-    sqlx::Error::Protocol(e.to_string())
-}
 
 /// Fields for a new api_keys row. The secret is never stored — only its hash.
 pub struct NewApiKey<'a> {
@@ -39,6 +28,7 @@ pub struct NewApiKey<'a> {
     pub secret_hash: String,
     pub scopes: serde_json::Value,
     pub env: &'a str,
+    pub require_idempotency: bool,
 }
 
 /// Patch for a sync upsert. `None` leaves a column untouched (COALESCE).
@@ -51,19 +41,24 @@ pub struct ApiKeyPatch {
 }
 
 /// List the caller's api keys (org-scoped), newest first.
-pub async fn list_api_keys(pool: &PgPool, orgs: &[Uuid]) -> Result<Vec<ApiKeysRow>, sqlx::Error> {
+pub async fn list_api_keys(
+    db: &DatabaseConnection,
+    orgs: &[Uuid],
+) -> Result<Vec<ApiKeysRow>, DbErr> {
     let rows = ApiKeys::find()
         .filter(Column::OrgId.is_in(orgs.iter().copied()))
-        .order_by_asc(Column::CreatedAt)
-        .all(&orm(pool))
-        .await
-        .map_err(map_err)?;
+        .order_by_desc(Column::CreatedAt)
+        .all(db)
+        .await?;
     Ok(rows.into_iter().map(Model::into_row).collect())
 }
 
 /// Insert a key under `new.org_id` and return the committed row. The primary key,
 /// version, and timestamps are left unset so the DB defaults/trigger populate them.
-pub async fn insert_api_key(pool: &PgPool, new: NewApiKey<'_>) -> Result<ApiKeysRow, sqlx::Error> {
+pub async fn insert_api_key(
+    db: &DatabaseConnection,
+    new: NewApiKey<'_>,
+) -> Result<ApiKeysRow, DbErr> {
     let model = ActiveModel {
         key_id: Set(new.key_id.to_string()),
         org_id: Set(new.org_id),
@@ -71,11 +66,11 @@ pub async fn insert_api_key(pool: &PgPool, new: NewApiKey<'_>) -> Result<ApiKeys
         secret_hash: Set(new.secret_hash),
         scopes: Set(new.scopes),
         env: Set(new.env.to_string()),
+        require_idempotency: Set(new.require_idempotency),
         ..Default::default()
     }
-    .insert(&orm(pool))
-    .await
-    .map_err(map_err)?;
+    .insert(db)
+    .await?;
     Ok(model.into_row())
 }
 
@@ -85,52 +80,45 @@ async fn find_owned(
     conn: &DatabaseConnection,
     filter: sea_orm::Select<ApiKeys>,
     orgs: &[Uuid],
-) -> Result<Option<Model>, sqlx::Error> {
+) -> Result<Option<Model>, DbErr> {
     filter
         .filter(Column::OrgId.is_in(orgs.iter().copied()))
         .one(conn)
         .await
-        .map_err(map_err)
 }
 
 /// Rotate the stored secret hash for a key, scoped to the caller's org(s).
 /// Returns `None` when no row in those orgs matches the prefix.
 pub async fn rotate_secret(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     key_id: &str,
     secret_hash: String,
     orgs: &[Uuid],
-) -> Result<Option<ApiKeysRow>, sqlx::Error> {
-    let conn = orm(pool);
-    let Some(model) = find_owned(
-        &conn,
-        ApiKeys::find().filter(Column::KeyId.eq(key_id)),
-        orgs,
-    )
-    .await?
+) -> Result<Option<ApiKeysRow>, DbErr> {
+    let Some(model) =
+        find_owned(db, ApiKeys::find().filter(Column::KeyId.eq(key_id)), orgs).await?
     else {
         return Ok(None);
     };
     let mut active: ActiveModel = model.into();
     active.secret_hash = Set(secret_hash);
     // Only secret_hash is dirty; the BEFORE UPDATE trigger bumps version + updated_at.
-    let updated = active.update(&conn).await.map_err(map_err)?;
+    let updated = active.update(db).await?;
     Ok(Some(updated.into_row()))
 }
 
 /// Soft-revoke a key by id, scoped to the caller's org(s).
 pub async fn soft_delete(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     id: Uuid,
     orgs: &[Uuid],
-) -> Result<Option<ApiKeysRow>, sqlx::Error> {
-    let conn = orm(pool);
-    let Some(model) = find_owned(&conn, ApiKeys::find_by_id(id), orgs).await? else {
+) -> Result<Option<ApiKeysRow>, DbErr> {
+    let Some(model) = find_owned(db, ApiKeys::find_by_id(id), orgs).await? else {
         return Ok(None);
     };
     let mut active: ActiveModel = model.into();
     active.revoked = Set(true);
-    let updated = active.update(&conn).await.map_err(map_err)?;
+    let updated = active.update(db).await?;
     Ok(Some(updated.into_row()))
 }
 
@@ -138,13 +126,12 @@ pub async fn soft_delete(
 /// the fields present in the patch are written (the COALESCE-equivalent); the
 /// trigger bumps version on any write.
 pub async fn upsert_fields(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     id: Uuid,
     orgs: &[Uuid],
     patch: ApiKeyPatch,
-) -> Result<Option<ApiKeysRow>, sqlx::Error> {
-    let conn = orm(pool);
-    let Some(model) = find_owned(&conn, ApiKeys::find_by_id(id), orgs).await? else {
+) -> Result<Option<ApiKeysRow>, DbErr> {
+    let Some(model) = find_owned(db, ApiKeys::find_by_id(id), orgs).await? else {
         return Ok(None);
     };
     // An empty patch is a no-op (SeaORM would reject an update with no dirty
@@ -169,7 +156,7 @@ pub async fn upsert_fields(
     if let Some(revoked) = patch.revoked {
         active.revoked = Set(revoked);
     }
-    let updated = active.update(&conn).await.map_err(map_err)?;
+    let updated = active.update(db).await?;
     Ok(Some(updated.into_row()))
 }
 
@@ -177,21 +164,19 @@ pub async fn upsert_fields(
 /// the monotonic `version`. Backed by the `api_keys (org_id, version)` index, so
 /// this is an index range scan, not a table scan. `limit` bounds one page.
 pub async fn catchup_api_keys(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     orgs: &[Uuid],
     since: i64,
     limit: i64,
-) -> Result<Vec<ApiKeysRow>, sqlx::Error> {
-    sqlx::query_as::<_, ApiKeysRow>(
-        "select * from api_keys \
-         where org_id = any($1) and version > $2 \
-         order by version asc limit $3",
-    )
-    .bind(orgs)
-    .bind(since)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+) -> Result<Vec<ApiKeysRow>, DbErr> {
+    let rows = ApiKeys::find()
+        .filter(Column::OrgId.is_in(orgs.iter().copied()))
+        .filter(Column::Version.gt(since))
+        .order_by_asc(Column::Version)
+        .limit(limit.max(1) as u64)
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(Model::into_row).collect())
 }
 
 // ─── Durable idempotency ledger ─────────────────────────────────────────────
@@ -202,47 +187,50 @@ pub async fn catchup_api_keys(
 
 /// Try to claim `key`. `Ok(true)` => we own it (run the mutation); `Ok(false)` =>
 /// it already existed (replay via [`idem_committed`]).
-pub async fn idem_claim(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
-    let claimed = sqlx::query_scalar::<_, i32>(
-        "insert into sync_idempotency_keys (key) values ($1) \
+pub async fn idem_claim(db: &DatabaseConnection, key: &str) -> Result<bool, DbErr> {
+    let claimed = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "insert into sync_idempotency_keys (key) values ($1) \
          on conflict (key) do update set created_at = excluded.created_at \
          where sync_idempotency_keys.committed_version is null \
            and sync_idempotency_keys.created_at < now() - interval '5 minutes' \
          returning 1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
+            [key.to_owned().into()],
+        ))
+        .await?;
     Ok(claimed.is_some())
 }
 
 /// Release an unsuccessful in-flight claim. A committed replay record is never
 /// deleted by this path.
-pub async fn idem_release(pool: &PgPool, key: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("delete from sync_idempotency_keys where key = $1 and committed_version is null")
-        .bind(key)
-        .execute(pool)
+pub async fn idem_release(db: &DatabaseConnection, key: &str) -> Result<(), DbErr> {
+    idem::Entity::delete_many()
+        .filter(idem::Column::Key.eq(key))
+        .filter(idem::Column::CommittedVersion.is_null())
+        .exec(db)
         .await?;
     Ok(())
 }
 
 /// The recorded outcome for `key`: `None` => no such key; `Some(None)` => claimed
 /// but still in-flight; `Some(Some(v))` => committed at version `v` (replay it).
-pub async fn idem_committed(pool: &PgPool, key: &str) -> Result<Option<Option<i64>>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<i64>>(
-        "select committed_version from sync_idempotency_keys where key = $1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await
+pub async fn idem_committed(
+    db: &DatabaseConnection,
+    key: &str,
+) -> Result<Option<Option<i64>>, DbErr> {
+    Ok(idem::Entity::find_by_id(key)
+        .one(db)
+        .await?
+        .map(|row| row.committed_version))
 }
 
 /// Record the committed version for a claimed key.
-pub async fn idem_record(pool: &PgPool, key: &str, version: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("update sync_idempotency_keys set committed_version = $2 where key = $1")
-        .bind(key)
-        .bind(version)
-        .execute(pool)
+pub async fn idem_record(db: &DatabaseConnection, key: &str, version: i64) -> Result<(), DbErr> {
+    idem::Entity::update_many()
+        .col_expr(idem::Column::CommittedVersion, Expr::value(version))
+        .filter(idem::Column::Key.eq(key))
+        .exec(db)
         .await?;
     Ok(())
 }
@@ -257,16 +245,14 @@ use crate::entity::{customer_preferences as prefs, customer_sessions as sess, us
 /// Ensure a local `users` row exists for the authenticated Supabase user and
 /// return its id (upsert on the unique `supabase_user_id`).
 pub async fn ensure_user(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     supabase_user_id: Uuid,
     email: &str,
-) -> Result<Uuid, sqlx::Error> {
-    let conn = orm(pool);
+) -> Result<Uuid, DbErr> {
     if let Some(u) = users::Entity::find()
         .filter(users::Column::SupabaseUserId.eq(supabase_user_id))
-        .one(&conn)
-        .await
-        .map_err(map_err)?
+        .one(db)
+        .await?
     {
         return Ok(u.id);
     }
@@ -275,28 +261,26 @@ pub async fn ensure_user(
         email: Set(email.to_string()),
         ..Default::default()
     };
-    match am.insert(&conn).await {
+    match am.insert(db).await {
         Ok(u) => Ok(u.id),
         // Lost a concurrent insert race → the unique index rejected us; re-read.
         Err(_) => users::Entity::find()
             .filter(users::Column::SupabaseUserId.eq(supabase_user_id))
-            .one(&conn)
-            .await
-            .map_err(map_err)?
+            .one(db)
+            .await?
             .map(|u| u.id)
-            .ok_or(sqlx::Error::RowNotFound),
+            .ok_or_else(|| DbErr::RecordNotFound("users upsert lost its row".to_string())),
     }
 }
 
 /// The user's stored preferences, or `None` if they've never saved any.
 pub async fn get_preferences(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     user_id: Uuid,
-) -> Result<Option<CustomerPreferencesRow>, sqlx::Error> {
+) -> Result<Option<CustomerPreferencesRow>, DbErr> {
     Ok(prefs::Entity::find_by_id(user_id)
-        .one(&orm(pool))
-        .await
-        .map_err(map_err)?
+        .one(db)
+        .await?
         .map(prefs::Model::into_row))
 }
 
@@ -304,7 +288,7 @@ pub async fn get_preferences(
 /// version/updated_at on update).
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_preferences(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     user_id: Uuid,
     region: String,
     timezone: String,
@@ -312,13 +296,8 @@ pub async fn upsert_preferences(
     notify_key_rotation: bool,
     notify_lock_contention: bool,
     notify_mfa: bool,
-) -> Result<CustomerPreferencesRow, sqlx::Error> {
-    let conn = orm(pool);
-    if let Some(existing) = prefs::Entity::find_by_id(user_id)
-        .one(&conn)
-        .await
-        .map_err(map_err)?
-    {
+) -> Result<CustomerPreferencesRow, DbErr> {
+    if let Some(existing) = prefs::Entity::find_by_id(user_id).one(db).await? {
         let mut am: prefs::ActiveModel = existing.into();
         am.region = Set(region);
         am.timezone = Set(timezone);
@@ -326,10 +305,7 @@ pub async fn upsert_preferences(
         am.notify_key_rotation = Set(notify_key_rotation);
         am.notify_lock_contention = Set(notify_lock_contention);
         am.notify_mfa = Set(notify_mfa);
-        am.update(&conn)
-            .await
-            .map_err(map_err)
-            .map(prefs::Model::into_row)
+        am.update(db).await.map(prefs::Model::into_row)
     } else {
         prefs::ActiveModel {
             user_id: Set(user_id),
@@ -341,24 +317,22 @@ pub async fn upsert_preferences(
             notify_mfa: Set(notify_mfa),
             ..Default::default()
         }
-        .insert(&conn)
+        .insert(db)
         .await
-        .map_err(map_err)
         .map(prefs::Model::into_row)
     }
 }
 
 /// The user's trusted sessions, most-recently-seen first.
 pub async fn list_sessions(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     user_id: Uuid,
-) -> Result<Vec<CustomerSessionsRow>, sqlx::Error> {
+) -> Result<Vec<CustomerSessionsRow>, DbErr> {
     Ok(sess::Entity::find()
         .filter(sess::Column::UserId.eq(user_id))
         .order_by_desc(sess::Column::LastSeen)
-        .all(&orm(pool))
-        .await
-        .map_err(map_err)?
+        .all(db)
+        .await?
         .into_iter()
         .map(sess::Model::into_row)
         .collect())
@@ -367,24 +341,22 @@ pub async fn list_sessions(
 /// Revoke a user's session by device label (soft: `status = 'revoked'`, scoped to
 /// the caller). Returns `false` when no matching active session exists.
 pub async fn revoke_session(
-    pool: &PgPool,
+    db: &DatabaseConnection,
     user_id: Uuid,
     device: &str,
-) -> Result<bool, sqlx::Error> {
-    let conn = orm(pool);
+) -> Result<bool, DbErr> {
     let existing = sess::Entity::find()
         .filter(sess::Column::UserId.eq(user_id))
         .filter(sess::Column::Device.eq(device))
         .filter(sess::Column::Status.ne("revoked"))
-        .one(&conn)
-        .await
-        .map_err(map_err)?;
+        .one(db)
+        .await?;
     let Some(model) = existing else {
         return Ok(false);
     };
     let mut am: sess::ActiveModel = model.into();
     am.status = Set("revoked".to_string());
-    am.update(&conn).await.map_err(map_err)?;
+    am.update(db).await?;
     Ok(true)
 }
 
@@ -399,7 +371,9 @@ pub async fn revoke_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
+    use sea_orm::SqlxPostgresConnector;
+    use sqlx::{postgres::PgPoolOptions, PgPool};
+    use std::ops::Deref;
 
     const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/customer.sql");
 
@@ -410,7 +384,20 @@ mod tests {
     // index, so we guard it behind an async mutex + a done-flag.
     static SCHEMA_READY: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
 
-    async fn pool_or_skip() -> Option<PgPool> {
+    struct TestDb {
+        sqlx: PgPool,
+        orm: DatabaseConnection,
+    }
+
+    impl Deref for TestDb {
+        type Target = DatabaseConnection;
+
+        fn deref(&self) -> &Self::Target {
+            &self.orm
+        }
+    }
+
+    async fn pool_or_skip() -> Option<TestDb> {
         let url = std::env::var("TEST_DATABASE_URL")
             .ok()
             .filter(|v| !v.is_empty())?;
@@ -431,19 +418,20 @@ mod tests {
                 *ready = true;
             }
         }
-        Some(pool)
+        let orm = SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
+        Some(TestDb { sqlx: pool, orm })
     }
 
     fn uniq(prefix: &str) -> String {
         format!("{prefix}-{}", Uuid::new_v4().simple())
     }
 
-    async fn make_org(pool: &PgPool) -> Uuid {
+    async fn make_org(pool: &TestDb) -> Uuid {
         let slug = uniq("org");
         sqlx::query_scalar::<_, Uuid>("insert into orgs (slug, name) values ($1, $2) returning id")
             .bind(&slug)
             .bind(&slug)
-            .fetch_one(pool)
+            .fetch_one(&pool.sqlx)
             .await
             .expect("insert org")
     }
@@ -456,6 +444,7 @@ mod tests {
             secret_hash: "sha256:deadbeef".to_string(),
             scopes: serde_json::json!(["requests:write"]),
             env: "live",
+            require_idempotency: true,
         }
     }
 
@@ -474,6 +463,7 @@ mod tests {
         let only_a = list_api_keys(&pool, &[org_a]).await.unwrap();
         assert_eq!(only_a.len(), 1, "org A sees exactly its own key");
         assert_eq!(only_a[0].key_id, ka);
+        assert!(only_a[0].require_idempotency);
         assert!(only_a.iter().all(|r| r.org_id == org_a));
 
         let only_b = list_api_keys(&pool, &[org_b]).await.unwrap();
@@ -733,7 +723,7 @@ mod tests {
             sqlx::query("insert into customer_sessions (user_id, device) values ($1, $2)")
                 .bind(uid)
                 .bind(&device)
-                .execute(&pool)
+                .execute(&pool.sqlx)
                 .await
                 .unwrap();
         }

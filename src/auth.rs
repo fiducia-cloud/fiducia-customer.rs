@@ -19,6 +19,8 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
+pub const CUSTOMER_SESSION_COOKIE: &str = "fiducia_customer_session";
+
 /// A verified customer session — who is calling and which orgs they belong to.
 /// `user_id`/`email` are carried for audit/attribution; not every handler reads
 /// them yet.
@@ -101,16 +103,12 @@ impl Authenticator {
                 "customer_auth_not_configured",
             )),
             Authenticator::AuthService(url) => {
-                let bearer = headers
-                    .get(AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|v| v.starts_with("Bearer "));
-                let Some(bearer) = bearer else {
-                    return Err(deny(StatusCode::UNAUTHORIZED, "missing_bearer_token"));
+                let Some(token) = bearer_token(headers) else {
+                    return Err(deny(StatusCode::UNAUTHORIZED, "missing_customer_session"));
                 };
                 let resp = http()
                     .get(format!("{url}/v1/me"))
-                    .header(AUTHORIZATION, bearer)
+                    .bearer_auth(token)
                     .send()
                     .await;
                 match resp {
@@ -133,5 +131,51 @@ impl Authenticator {
                 }
             }
         }
+    }
+}
+
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(token) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.trim().is_empty())
+    {
+        return Some(token.to_string());
+    }
+
+    for value in headers.get_all("cookie") {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for part in value.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name == CUSTOMER_SESSION_COOKIE && !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn customer_cookie_is_isolated_from_admin_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            "fiducia_admin_session=admin.jwt; fiducia_customer_session=customer.jwt"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(bearer_token(&headers).as_deref(), Some("customer.jwt"));
+
+        headers.insert("cookie", "fiducia_admin_session=admin.jwt".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
     }
 }

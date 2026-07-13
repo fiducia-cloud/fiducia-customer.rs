@@ -6,13 +6,12 @@ data/schema.
 
 - **`seed-customer.sql`** — idempotent seed: one org plus a few `api_keys` rows so
   `GET /api/customer/api-keys` returns real DB rows for local/portal development.
-- **`2026-07-add-require-idempotency.sql`** — migration adding the
-  `require_idempotency` column (default `true`) to `api_keys`. Must land together
-  with the backend code that binds/reads it (see
-  `docs/require-idempotency-wiring.md`).
+- **`2026-07-add-require-idempotency.sql`** — compatibility migration for older
+  customer databases. Fresh databases receive the same column from the canonical
+  `fiducia-interfaces/sql/customer.sql`; SeaORM binds and reads it.
 - **`with-flags2env.sh`** — bridges CLI flags to the environment variables this
-    backend reads (`PORT`, `STATIC_DIR`, `CUSTOMER_STATIC_DIR`, `FIDUCIA_*`,
-    and public `SUPABASE_*` settings). Database credentials and debug auth remain
+    backend reads (`PORT`, marketing `STATIC_DIR`, `FIDUCIA_*`, and public
+    `SUPABASE_*` settings). Database credentials and debug auth remain
     environment-only. It runs the pinned `flags2env` parser
   (`vendor/flags-2-env`) against the `.cli-flags.toml` schema, exports the
   resulting env map, then execs the given command

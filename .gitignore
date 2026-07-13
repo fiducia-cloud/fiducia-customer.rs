@@ -9,7 +9,6 @@
 # initContainer) and hands it to this backend via STATIC_DIR. For local dev,
 # point STATIC_DIR at ../fiducia-ui.web/dist (or run `npm run sync` there).
 /static
-/customer-static
 /dist
 
 # Scratch / git worktrees (tmp/worktrees/*)

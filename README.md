@@ -1,186 +1,146 @@
-<!-- BEGIN k8s-cluster-submodule-notice -->
-> [!NOTE]
-> **Canonical source.** This repository is the source of truth for its code. It
-> is also vendored as a **secondary** git submodule of
-> [ORESoftware/k8s-cluster](https://github.com/ORESoftware/k8s-cluster) at
-> `remote/deployments/fiducia-backend.rs` — make changes here, not in that submodule checkout.
->
-> On disk: source clone `~/codes/fiducia.cloud/fiducia-backend.rs` · submodule checkout `~/codes/ores/k8s-cluster/remote/deployments/fiducia-backend.rs`.
-<!-- END k8s-cluster-submodule-notice -->
-
 # fiducia-backend
 
-Rust + [axum](https://github.com/tokio-rs/axum) backend for **fiducia.cloud** —
-"consensus & coordination as a service".
+The canonical **customer web application and BFF** for
+[fiducia.cloud](https://fiducia.cloud). It is a Rust deployment built with the
+MASH stack:
 
-This is the **website tier only**: it serves the marketing site, the customer
-portal shell, and a couple of health/info endpoints. It does **not** implement
-coordination. The actual Raft-replicated coordination engine and its control
-plane live in sibling repos:
+- **Maud** renders compile-checked, escaped HTML.
+- **Axum** owns HTTP routes, middleware, cookies, WebSocket/SSE endpoints, and
+  server-mediated login.
+- **SeaORM** owns the customer Postgres connection and application CRUD.
+- **HTMX** progressively enhances same-origin forms and authenticated fragments.
 
-- [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane: sharded multi-Raft coordination (locks, rate limiting, cron, config KV + watches, leader election, service discovery).
-- [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) — control plane: shard placement, scaling, and node-failure handling.
+The static sibling `fiducia-ui.web` is the Astro **marketing site only**. Its
+build is served as the fallback for the public host. The customer application is
+rendered here; it no longer depends on `fiducia-customer-ui.web` or a Vite SPA.
 
-It serves two things:
+## Hard boundary from admin
 
-| Path        | Served                                                              |
-|-------------|---------------------------------------------------------------------|
-| `/healthz`, `/api/health` | health probe                                          |
-| `/api/info` | service / version JSON                                              |
-| `/app`, `/app/*` | customer portal rendered by axum + Maud and refreshed by HTMX |
-| `/app/ws` | customer portal WebSocket heartbeat for non-sensitive refresh events |
-| `/app/events` | SSE fallback heartbeat for non-sensitive refresh events           |
-| `/app/fragments/*` | customer-safe HTML views; cluster-wide data stays hidden    |
-| `/api/customer/*` | authenticated, Postgres-backed customer data APIs             |
-| `/_customer/*` | customer portal Vite assets (`CUSTOMER_STATIC_DIR`)             |
-| everything else | the static [Astro](https://astro.build) site (`STATIC_DIR`)     |
+The customer app and `fiducia-admin.rs` are separate deployments and security
+planes.
 
-The frontend is the sibling [`fiducia-ui.web`](https://github.com/fiducia-cloud/fiducia-ui.web)
-repo. It is **not** committed here — the deployment builds it in-pod and points
-this backend at the result via `STATIC_DIR`.
+| Boundary | Customer | Admin |
+|---|---|---|
+| Repository | `fiducia-backend.rs` | `fiducia-admin.rs` |
+| Cookie | `fiducia_customer_session` | `fiducia_admin_session` |
+| Database | `fiducia-interfaces/sql/customer.sql` | `fiducia-interfaces/sql/admin.sql` |
+| Authorization | verified user plus org membership | trusted operator role plus local operator registry |
+| Routes | `/app`, `/api/customer/*` | `/`, `/infra`, `/api/admin/*` |
 
-The customer portal assets are the sibling
-[`fiducia-customer-ui.web`](https://github.com/fiducia-cloud/fiducia-customer-ui.web)
-repo. They are also **not** committed here; build them and point this backend at
-the result via `CUSTOMER_STATIC_DIR`. Requests with `Host: app.fiducia.cloud`
-serve the customer portal at `/`; `/app` always serves it. Set
-`FIDUCIA_SITE_MODE=customer` if a dedicated deployment should render the portal
-at `/` regardless of host.
+Neither Rust server reads the other database or accepts the other cookie.
+
+## Authentication
+
+`POST /login` sends the email/password exchange from the Rust server to
+Supabase Auth. The returned access token is immediately verified through
+`fiducia-auth GET /v1/me`; a customer session is issued only when that verified
+identity has at least one trusted organization claim.
+
+The token then rides in an `HttpOnly; SameSite=Strict; Secure`
+`fiducia_customer_session` cookie. API clients may use the same Supabase token
+as `Authorization: Bearer ...`. Browser JavaScript never receives a service-role
+key or an application session token.
+
+API-key creation and rotation are delegated to `fiducia-auth`, which writes the
+authoritative verifier into Fiducia KV for edge/load-balancer introspection. This
+server mirrors the sanitized relational metadata into customer Postgres through
+SeaORM. If that mirror fails, it revokes the newly created/rotated authoritative
+key so a live orphan credential is not left behind.
+
+## Routes
+
+| Route | Purpose |
+|---|---|
+| `GET/POST /login` | server-mediated Supabase sign-in |
+| `POST /logout` | clear only the customer cookie |
+| `GET /app/*` | authenticated Maud customer pages |
+| `GET /app/fragments/*` | authenticated HTMX fragments |
+| `POST /app/api-keys` | HTMX API-key creation; plaintext shown once |
+| `POST /app/settings` | HTMX preference persistence |
+| `POST /app/security/sessions/revoke` | HTMX trusted-session revocation |
+| `GET/POST /api/customer/*` | authenticated JSON customer API |
+| `GET /app/ws`, `GET /app/events` | authenticated refresh channels |
+| `GET /healthz`, `GET /api/health` | health probes |
+| `GET /api/info` | deployment metadata |
+| other paths | static `fiducia-ui.web` marketing build |
+
+The lock, request, KV, and discovery panels deliberately report unavailable
+until `fiducia-node.rs` exposes a tenant-scoped observability API. The customer
+app never invents cluster rows or exposes cluster-wide data.
+
+## Database
+
+`DATABASE_URL` is required. Startup fails when the customer database is absent
+or unreachable. Production access goes through one SeaORM
+`DatabaseConnection`; Postgres-specific atomic idempotency claims use
+SeaORM-bound statements. SQLx is test-only for applying and seeding the canonical
+schema.
+
+The schema source of truth is
+[`fiducia-interfaces/sql/customer.sql`](../fiducia-interfaces/sql/customer.sql).
+It defines organizations, projects, users, memberships, API keys, preferences,
+trusted sessions, audit, RLS, realtime publication boundaries, and the durable
+sync idempotency ledger.
 
 ## Run locally
 
-```bash
-# Build the frontends somewhere and point at them:
+```sh
 STATIC_DIR=../fiducia-ui.web/dist \
-CUSTOMER_STATIC_DIR=../fiducia-customer-ui.web/dist \
 DATABASE_URL=postgres://... \
-cargo run   # listens on :8080 (override PORT)
+FIDUCIA_AUTH_URL=http://127.0.0.1:8081 \
+SUPABASE_URL=https://example.supabase.co \
+SUPABASE_PUBLISHABLE_KEY=public-key \
+cargo run
 ```
 
-Non-secret runtime settings can also be supplied as audited flags:
+The server listens on `:8080` by default. Set
+`FIDUCIA_INSECURE_COOKIES=1` only for local plain-HTTP development.
 
-```bash
+Non-secret options can be mapped from flags through the pinned
+`flags-2-env` helper:
+
+```sh
 make -B -C vendor/flags-2-env all
-scripts/with-flags2env.sh --port=8080 --site-mode=customer -- cargo run --locked
+scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- cargo run --locked
 ```
-
-Database credentials and authentication material remain environment-only.
-
-`STATIC_DIR` defaults to `static`. Files are served from its root; the backend
-does not add a path prefix (the gateway strips `/fiducia/` before requests
-arrive — the Astro build carries the `/fiducia` base so asset URLs round-trip).
-`CUSTOMER_STATIC_DIR` defaults to `customer-static`. If `SUPABASE_URL` and
-`SUPABASE_ANON_KEY` are set, the rendered portal passes them to the browser for
-Supabase realtime subscriptions.
-
-`DATABASE_URL` is required. The service refuses to start without durable
-customer Postgres. Customer preferences, sessions, API keys, and sync
-idempotency are persisted; dependency failures return explicit errors instead
-of invented successes or sample rows.
-
-API-key rotation replaces the old secret immediately (`overlap_seconds=0`);
-deploy callers accordingly. The portal can display locally observed session
-records, but provider-backed session revocation is intentionally reported as
-unsupported until Supabase session identifiers and Admin revocation are wired.
-TOTP enrollment is available in the UI, but production-key issuance is not yet
-gated on AAL2; do not treat enrollment as an enforced issuance policy. Privileged
-admin scopes are not issued by this customer-membership-only API.
-
-The customer browser keeps one tenant-filtered Supabase realtime WebSocket and
-one backend heartbeat stream. The heartbeat prefers `/app/ws` and falls back to
-`/app/events`; it carries only generic refresh frames and never customer rows,
-API-key metadata, or credentials. Durable customer changes are loaded through
-authenticated, tenant-scoped catch-up APIs or Supabase RLS subscriptions.
-The portal does not expose `fiducia-node`'s cluster-wide observability APIs as
-customer data. Those panels explicitly remain unavailable until the node has an
-authenticated tenant-scoped read contract.
 
 ## Configuration
 
-All configuration is read from the environment. Defaults are secure-by-default:
-an unset/unknown `FIDUCIA_SITE_MODE` uses host-based routing (not the permissive
-"customer" mode), and an unset `FIDUCIA_AUTH_URL` makes the customer APIs fail
-closed (`Deny`).
+| Variable | Meaning |
+|---|---|
+| `DATABASE_URL` | required customer Postgres credentials |
+| `FIDUCIA_AUTH_URL` | required `fiducia-auth` base URL |
+| `SUPABASE_URL` | required Supabase project URL |
+| `SUPABASE_PUBLISHABLE_KEY` | required public key for the server-mediated exchange |
+| `STATIC_DIR` | Astro marketing build; default `static` |
+| `CUSTOMER_APP_HOST` | customer host; default `app.fiducia.cloud` |
+| `FIDUCIA_SITE_MODE=customer` | render the customer app at `/` regardless of Host |
+| `PORT` | listen port; default `8080` |
+| `FIDUCIA_INSECURE_COOKIES=1` | local-only escape hatch removing `Secure` |
+| `TEST_DATABASE_URL` | opt-in real-Postgres behavior tests |
 
-| Var | Type | Secret? | Meaning | Default |
-|-----|------|---------|---------|---------|
-| `PORT` | integer | no | TCP port to listen on. | `8080` |
-| `STATIC_DIR` | string (dir) | no | Directory of the built Astro marketing site. | `static` |
-| `CUSTOMER_STATIC_DIR` | string (dir) | no | Directory of the built customer portal assets. | `customer-static` |
-| `CUSTOMER_APP_HOST` | string (host) | no | Host that serves the customer portal at `/`. | `app.fiducia.cloud` |
-| `FIDUCIA_SITE_MODE` | string (mode) | no | `customer` renders the portal at `/` regardless of host. Any other/unset value uses the **safe** host-based routing (portal only at `/app` or for `CUSTOMER_APP_HOST`). | unset → host-based (safe) |
-| `FIDUCIA_AUTH_URL` | string (URL) | no | Base URL of `fiducia-auth`; verifies customer Supabase sessions. **Unset → fail closed**: every `/api/customer/*` route denies. | unset → `Deny` |
-| `SUPABASE_URL` | string (URL) | no | Supabase project URL handed to the browser for realtime. | unset |
-| `SUPABASE_ANON_KEY` | string (key) | no (anon/public key) | Supabase **anon (public)** key handed to the browser for realtime. Not a service-role secret. | unset |
-| `DATABASE_URL` | string (URL) | **yes** (DB credentials) | Customer Postgres. **Required** — the service refuses to start without it. | none (required) |
-| `TEST_DATABASE_URL` | string (URL) | **yes** (DB credentials) | Postgres the test harness may create/drop freely; gates the store integration tests (unset → those tests skip). | unset |
+`FIDUCIA_E2E_STATIC_CUSTOMER_AUTH=1` exists only in debug builds. Release
+binaries remain fail-closed.
 
-`FIDUCIA_E2E_STATIC_CUSTOMER_AUTH=1` forces a fixed test identity, but only in
-**debug** builds — it is impossible in release binaries, so production stays
-fail-closed even if the variable leaks into the environment.
+## Verification
 
-### CLI flags (`flags-2-env`)
-
-The pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
-(`vendor/flags-2-env`) maps CLI flags to the env vars above via the
-`.cli-flags.toml` schema. Build the parser with
-`make -B -C vendor/flags-2-env all`, then run through `scripts/with-flags2env.sh`:
-
-```bash
-scripts/with-flags2env.sh --port 8080 --static-dir ../fiducia-ui.web/dist -- cargo run
+```sh
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+vendor/flags-2-env/build/flags2env audit .cli-flags.toml
+git diff --check
 ```
 
-`DATABASE_URL`, `TEST_DATABASE_URL`, and the debug-only static-auth switch are
-intentionally excluded from the CLI schema. Inject database credentials only
-through the environment or a secret store so they cannot leak through shell
-history or process listings. The browser-visible Supabase anonymous key is not a
-service-role secret and may be supplied as `--supabase-anon-key`. CI audits the
-schema in `.github/workflows/cli-flags.yml`.
+The DB behavior tests cover tenant isolation, API-key rotation/revocation,
+durable idempotency replay, user provisioning, preferences, and trusted-session
+revocation against the canonical Postgres schema.
 
-## Deployment
-
-Built and run in-cluster on both the AWS and Hetzner Kubernetes clusters behind
-the shared gateway under `/fiducia/`, mirroring `canonical.cloud`:
-
-1. a **node initContainer** clones `fiducia-ui.web`, runs `astro build --base /fiducia`, and writes `dist/` to a shared volume;
-2. a **node initContainer** clones `fiducia-customer-ui.web`, runs `npm run build`, and writes `dist/` to a shared volume;
-3. this **rust container** clones `fiducia-backend.rs`, `cargo run --release`, and serves those volumes via `STATIC_DIR` and `CUSTOMER_STATIC_DIR`.
-
-Manifests live in [`ORESoftware/k8s-cluster`](https://github.com/ORESoftware/k8s-cluster)
-at `remote/argocd/dd-next-runtime/dd-fiducia-rs.*`; this repo is wired in as the
-`remote/deployments/fiducia-backend.rs` git submodule.
-
-## Security
-
-**Secure-by-default posture.** The customer authenticator is fail-closed
-(`Authenticator::Deny` when `FIDUCIA_AUTH_URL` is unset), so `/api/customer/*`
-never serves data without a verified Supabase session; writes are scoped to the
-caller's org (never "first org"). `FIDUCIA_SITE_MODE` defaults to the restricted
-host-based routing — the permissive `customer` mode must be set explicitly.
-There is no `FIDUCIA_ALLOW_INSECURE_*`/dev-session toggle; the only test-auth
-escape hatch (`FIDUCIA_E2E_STATIC_CUSTOMER_AUTH`) is compiled out of release
-builds.
-
-**Hardening in place.** All SQL is parameterized (`sqlx` `.bind`, no string
-concatenation). The middleware stack sets `X-Content-Type-Options: nosniff`,
-`X-Frame-Options: DENY`, a referrer policy, a permissions policy, and a CSP; it
-bounds request time (`TimeoutLayer`, 30s), caps bodies (`RequestBodyLimitLayer`,
-64 KiB), and catches handler panics (`CatchPanicLayer`). API-key secrets use the
-OS CSPRNG and only their hash is persisted. There is no permissive CORS layer.
-
-**Heartbeat no longer fans out customer rows.** A process-wide broadcast channel
-that placed `api_keys` change frames onto the public `/app/ws` + `/app/events`
-portal heartbeat has been removed. The heartbeat now carries only generic
-refresh frames; durable customer changes are loaded through authenticated,
-tenant-scoped catch-up APIs or Supabase RLS subscriptions.
-
-**Accepted advisories** (no clean in-semver fix; recorded rather than force-fixed):
-
-- `rsa` [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071) —
-  Marvin timing side-channel. Transitive (via `sqlx`'s MySQL path, unused here);
-  no fixed upgrade is published.
-- `proc-macro-error` [RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370)
-  and `proc-macro-error2` [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173)
-  — unmaintained. Build-time proc-macro deps only; no runtime exposure.
-
-Run `cargo audit` to re-check. These three are the only known findings.
+<!-- BEGIN k8s-cluster-submodule-notice -->
+> [!NOTE]
+> **Canonical source.** This repository is the source of truth for its code. It
+> is also vendored as a secondary git submodule of
+> [ORESoftware/k8s-cluster](https://github.com/ORESoftware/k8s-cluster) at
+> `remote/deployments/fiducia-backend.rs`; make changes here, not in that
+> submodule checkout.
+<!-- END k8s-cluster-submodule-notice -->
