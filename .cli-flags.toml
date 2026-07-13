@@ -29,6 +29,12 @@ aliases = ["customer-app-host"]
 type = "string"
 help = "Canonical customer application host."
 
+[flags.customer-app-origin]
+env = "CUSTOMER_APP_ORIGIN"
+aliases = ["customer-app-origin"]
+type = "string"
+help = "Exact standalone customer application origin allowed by CORS."
+
 [flags.site-mode]
 env = "FIDUCIA_SITE_MODE"
 aliases = ["site-mode"]

@@ -1,6 +1,7 @@
 // fiducia-backend entrypoint: the axum app for fiducia.cloud's website tier.
 // Serves the static Astro marketing site, the Maud/HTMX customer portal and its
-// WS/SSE fragment streams, plus the DB-backed api_keys + @fiducia/sync endpoints.
+// WS/SSE fragment streams, plus authenticated customer APIs. API-key lifecycle
+// is delegated to fiducia-auth so there is exactly one credential authority.
 mod auth;
 mod entity;
 mod store;
@@ -8,14 +9,12 @@ mod store;
 use auth::{bearer_token, Authenticator, CustomerCtx, CUSTOMER_SESSION_COOKIE};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Form, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{routing::get, Json, Router};
-use fiducia_interfaces_db::customer::ApiKeysRow;
-use fiducia_sync_core::WriteAck;
 use maud::{html, Markup, DOCTYPE};
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
+use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
@@ -24,6 +23,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -42,6 +42,9 @@ const CUSTOMER_WS_PATH: &str = "/app/ws";
 const CUSTOMER_EVENTS_PATH: &str = "/app/events";
 const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 const CUSTOMER_CSS: &str = include_str!("../assets/customer.css");
+const CUSTOMER_ORG_HEADER: &str = "x-fiducia-org-id";
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const CORS_MAX_AGE_SECS: u64 = 10 * 60;
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -56,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "static".to_string())
         .into();
 
+    let customer_app_origin = customer_app_origin_from_env()?;
     // Customer state is always durable. A missing/unreachable database is a
     // deployment error, not permission to serve invented customer data.
     let pool = connect_customer_db().await?;
@@ -64,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         static_dir: static_dir.clone(),
         customer_app_host: std::env::var("CUSTOMER_APP_HOST")
             .unwrap_or_else(|_| "app.fiducia.cloud".to_string()),
+        customer_app_origin,
         customer_site_mode: std::env::var("FIDUCIA_SITE_MODE")
             .map(|v| v.eq_ignore_ascii_case("customer"))
             .unwrap_or(false),
@@ -110,6 +115,75 @@ fn required_env(name: &str) -> Result<String, io::Error> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} must be set")))
 }
 
+fn customer_app_origin_from_env() -> Result<Option<HeaderValue>, io::Error> {
+    match std::env::var("CUSTOMER_APP_ORIGIN") {
+        Ok(value) if !value.trim().is_empty() => parse_customer_app_origin(&value).map(Some),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be valid UTF-8",
+        )),
+    }
+}
+
+fn parse_customer_app_origin(value: &str) -> Result<HeaderValue, io::Error> {
+    let value = value.trim();
+    let uri = value.parse::<Uri>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be an absolute http(s) origin",
+        )
+    })?;
+    let scheme = uri
+        .scheme_str()
+        .filter(|scheme| matches!(*scheme, "http" | "https"));
+    let authority = uri
+        .authority()
+        .filter(|authority| !authority.as_str().contains('@'));
+    let root_only = uri
+        .path_and_query()
+        .map(|path| path.as_str() == "/")
+        .unwrap_or(true);
+    let (Some(scheme), Some(authority)) = (scheme, authority) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must contain only an http(s) scheme and host",
+        ));
+    };
+    if !root_only {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must not contain a path, query, or fragment",
+        ));
+    }
+    let canonical = format!("{scheme}://{authority}");
+    if value != canonical && value != format!("{canonical}/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN must be a single exact origin",
+        ));
+    }
+    HeaderValue::from_str(&canonical).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CUSTOMER_APP_ORIGIN is not a valid HTTP header origin",
+        )
+    })
+}
+
+fn customer_cors(origin: HeaderValue) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static(CUSTOMER_ORG_HEADER),
+            HeaderName::from_static(IDEMPOTENCY_KEY_HEADER),
+        ])
+        .max_age(Duration::from_secs(CORS_MAX_AGE_SECS))
+}
+
 /// Build the application router. Separated from `main` so tests can exercise the
 /// routes without binding a socket or initializing telemetry.
 fn build_router(config: AppConfig) -> Router {
@@ -119,10 +193,11 @@ fn build_router(config: AppConfig) -> Router {
     let serve_dir = ServeDir::new(&config.static_dir)
         .append_index_html_on_directories(true)
         .fallback(ServeFile::new(config.static_dir.join("404.html")));
+    let customer_app_origin = config.customer_app_origin.clone();
     // Routes are declared as flat literals (not nested) so the shared API-docs
     // generator (remote/tools/generate-api-docs.mjs, which scans the router's
     // route declarations) records their true paths.
-    Router::new()
+    let router = Router::new()
         // Liveness/readiness probe (matches the sibling canonical.cloud
         // convention); also available as /api/health.
         .route("/healthz", get(health))
@@ -132,6 +207,7 @@ fn build_router(config: AppConfig) -> Router {
         .route("/assets/customer.css", get(customer_css))
         .route("/login", get(customer_login).post(customer_login_submit))
         .route("/logout", axum::routing::post(customer_logout))
+        .route("/api/customer/context", get(customer_context_json))
         .route(
             "/api/customer/api-keys",
             get(customer_api_keys_json).post(create_customer_api_key),
@@ -140,14 +216,14 @@ fn build_router(config: AppConfig) -> Router {
             "/api/customer/api-keys/rotate",
             axum::routing::post(rotate_customer_api_key),
         )
-        // Local-first sync write path: the @fiducia/sync client POSTs queued
-        // optimistic writes to /api/customer/sync/{table}; we persist via SQLx and
-        // return the committed row version so the client can adopt it and clear
-        // `dirty`. Generic in the table (only api_keys is DB-wired today).
         .route(
-            "/api/customer/sync/:table",
-            axum::routing::post(sync_write).get(sync_catchup),
+            "/api/customer/api-keys/revoke",
+            axum::routing::post(revoke_customer_api_key),
         )
+        // Read-only authenticated catch-up for local browser hydration. Credential
+        // mutations go through the explicit create/rotate endpoints above and are
+        // owned by fiducia-auth; this BFF exposes no second write authority.
+        .route("/api/customer/sync/:table", get(sync_catchup))
         .route(
             "/api/customer/preferences",
             get(customer_preferences_json).put(update_customer_preferences),
@@ -180,10 +256,6 @@ fn build_router(config: AppConfig) -> Router {
             get(customer_settings).post(update_customer_preferences_form),
         )
         .route("/app/preferences", get(customer_settings))
-        .route("/app/locks", get(customer_locks))
-        .route("/app/requests", get(customer_requests))
-        .route("/app/kv", get(customer_kv))
-        .route("/app/services", get(customer_services))
         .route(CUSTOMER_WS_PATH, get(customer_ws))
         .route(CUSTOMER_EVENTS_PATH, get(customer_events))
         .route("/app/fragments/summary", get(summary_fragment))
@@ -196,10 +268,6 @@ fn build_router(config: AppConfig) -> Router {
             "/app/fragments/security-sessions",
             get(customer_sessions_fragment),
         )
-        .route("/app/fragments/locks", get(locks_fragment))
-        .route("/app/fragments/requests", get(requests_fragment))
-        .route("/app/fragments/kv", get(kv_fragment))
-        .route("/app/fragments/services", get(services_fragment))
         // Generated API docs (AGENTS.md "API Docs Contract").
         .route("/docs/api", get(api_docs_html))
         .route("/api/docs", get(api_docs_html))
@@ -237,13 +305,21 @@ fn build_router(config: AppConfig) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new())
+        .layer(CatchPanicLayer::new());
+
+    match customer_app_origin {
+        Some(origin) => router.layer(customer_cors(origin)),
+        None => router,
+    }
 }
 
 #[derive(Clone)]
 struct AppConfig {
     static_dir: PathBuf,
     customer_app_host: String,
+    /// Exact standalone customer origin allowed to call this service from a
+    /// browser. `None` keeps the service same-origin-only.
+    customer_app_origin: Option<HeaderValue>,
     customer_site_mode: bool,
     supabase_url: Option<String>,
     supabase_publishable_key: Option<String>,
@@ -265,20 +341,6 @@ struct CustomerLoginForm {
 #[derive(Debug, Deserialize)]
 struct SupabasePasswordSession {
     access_token: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AuthCreatedKeyResponse {
-    api_key: String,
-    key: AuthCreatedKeyMeta,
-}
-
-#[derive(Debug, Deserialize)]
-struct AuthCreatedKeyMeta {
-    key_id: String,
-    org_id: String,
-    env: String,
-    require_idempotency: bool,
 }
 
 async fn htmx_js() -> impl IntoResponse {
@@ -500,23 +562,45 @@ struct RotateCustomerApiKeyRequest {
     prefix: String,
 }
 
-/// One queued optimistic write from the @fiducia/sync client. `table` is implied
-/// by the route (`api_keys`) but echoed by the client, so we accept it. `payload`
-/// is the row the client optimistically stored; `base_version` is the version it
-/// was edited on top of (for the ack the client reconciles against).
-#[derive(Debug, Deserialize, Serialize)]
-struct SyncWriteRequest {
-    id: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    table: Option<String>,
-    #[serde(default)]
-    op: Option<String>,
-    #[serde(default)]
-    payload: Option<serde_json::Value>,
-    #[serde(default)]
-    #[serde(rename = "base_version")]
-    _base_version: Option<i64>,
+#[derive(Debug, Deserialize)]
+struct RevokeCustomerApiKeyRequest {
+    prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyMeta {
+    key_id: String,
+    org_id: String,
+    name: String,
+    scopes: Vec<String>,
+    env: String,
+    last_used_ms: Option<u64>,
+    revoked: bool,
+    version: u64,
+    require_idempotency: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyListResponse {
+    keys: Vec<AuthKeyMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyCreateResponse {
+    api_key: String,
+    key: AuthKeyMeta,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyRotateResponse {
+    api_key: String,
+    key: AuthKeyMeta,
+    overlap_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthKeyRevokeResponse {
+    revoked: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -573,28 +657,270 @@ fn dependency_error(dependency: &str, code: &str, error: impl std::fmt::Display)
         .into_response()
 }
 
+fn no_store_json(status: StatusCode, body: serde_json::Value) -> Response {
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
+fn valid_org_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+}
+
+#[allow(clippy::result_large_err)]
+fn selected_customer_org(ctx: &CustomerCtx, headers: &HeaderMap) -> Result<String, Response> {
+    if let Some(requested) = headers.get(CUSTOMER_ORG_HEADER) {
+        let requested = requested.to_str().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_org_selection" })),
+            )
+                .into_response()
+        })?;
+        if !valid_org_id(requested) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "invalid_org_selection" })),
+            )
+                .into_response());
+        }
+        if ctx.orgs.iter().any(|org_id| org_id == requested) {
+            return Ok(requested.to_string());
+        }
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "forbidden_org" })),
+        )
+            .into_response());
+    }
+
+    match ctx.orgs.as_slice() {
+        [] => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "no_org_membership" })),
+        )
+            .into_response()),
+        [org_id] => Ok(org_id.clone()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "org_selection_required" })),
+        )
+            .into_response()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_idempotency_key(headers: &HeaderMap) -> Result<&HeaderValue, Response> {
+    let value = headers.get(IDEMPOTENCY_KEY_HEADER).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "idempotency_key_required" })),
+        )
+            .into_response()
+    })?;
+    let valid = value.to_str().is_ok_and(|value| {
+        !value.is_empty()
+            && value.len() <= 200
+            && value.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+    });
+    if !valid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid_idempotency_key" })),
+        )
+            .into_response());
+    }
+    Ok(value)
+}
+
+async fn auth_json(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<(StatusCode, serde_json::Value), Response> {
+    let Some(base) = config.auth_url.as_deref() else {
+        return Err(dependency_error(
+            "fiducia-auth",
+            "customer_key_authority_not_configured",
+            "FIDUCIA_AUTH_URL is unset",
+        ));
+    };
+    let Some(token) = bearer_token(headers) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "missing_customer_session" })),
+        )
+            .into_response());
+    };
+    let mut request = reqwest::Client::new()
+        .request(method, format!("{base}{path}"))
+        .bearer_auth(token);
+    if let Some(idempotency_key) = headers.get(IDEMPOTENCY_KEY_HEADER) {
+        request = request.header(IDEMPOTENCY_KEY_HEADER, idempotency_key);
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.map_err(|error| {
+        dependency_error("fiducia-auth", "customer_key_authority_unreachable", error)
+    })?;
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| {
+            dependency_error("fiducia-auth", "customer_key_authority_bad_response", error)
+        })?;
+    Ok((status, body))
+}
+
+fn proxied_auth_error(status: StatusCode, body: serde_json::Value) -> Response {
+    let error = body
+        .get("error")
+        .cloned()
+        .unwrap_or_else(|| json!("credential_authority_rejected_request"));
+    (status, Json(json!({ "ok": false, "error": error }))).into_response()
+}
+
+fn auth_key_to_display(
+    key: &AuthKeyMeta,
+    expected_org_id: &str,
+) -> Result<serde_json::Value, &'static str> {
+    if key.org_id != expected_org_id
+        || !valid_key_id(&key.key_id)
+        || !matches!(key.env.as_str(), "live" | "test")
+        || key.version == 0
+        || key
+            .scopes
+            .iter()
+            .any(|scope| !allowed_api_key_scopes().contains(&scope.as_str()))
+    {
+        return Err("invalid key metadata");
+    }
+    Ok(json!({
+        "id": key.key_id,
+        "name": key.name,
+        "prefix": format!("fdc_{}_{}", key.env, key.key_id),
+        "scopes": key.scopes.join(", "),
+        "last_used": if key.last_used_ms.is_some() { "recently" } else { "never" },
+        "status": if key.revoked { "revoked" } else { "active" },
+        "environment": key.env,
+        "require_idempotency": key.require_idempotency,
+        "version": key.version,
+    }))
+}
+
+fn auth_key_id_from_prefix(prefix: &str) -> Option<&str> {
+    let rest = prefix.strip_prefix("fdc_")?;
+    let (environment, key_id) = rest.split_once('_')?;
+    if matches!(environment, "live" | "test") && valid_key_id(key_id) {
+        Some(key_id)
+    } else {
+        None
+    }
+}
+
+fn valid_key_id(key_id: &str) -> bool {
+    key_id.len() == 16
+        && key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn raw_api_key_matches(raw: &str, key: &AuthKeyMeta) -> bool {
+    let expected_prefix = format!("fdc_{}_{}.", key.env, key.key_id);
+    raw.strip_prefix(&expected_prefix).is_some_and(|secret| {
+        secret.len() == 64
+            && secret
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
+}
+
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 async fn customer_api_keys_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
     let ctx = match config.authenticator.authenticate(&headers).await {
         Ok(c) => c,
         Err(e) => return e,
     };
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
+    let org_id = match selected_customer_org(&ctx, &headers) {
+        Ok(org_id) => org_id,
         Err(response) => return response,
     };
-    // Scoped to the caller's org(s) — a key list must never disclose other tenants.
-    let keys = match store::list_api_keys(pool, &ctx.org_uuids()).await {
-        Ok(rows) => rows.iter().map(api_key_row_to_display).collect::<Vec<_>>(),
-        Err(err) => return dependency_error("postgres", "api_keys_list_failed", err),
+    let path = format!("/v1/keys?org_id={}", encode_query_value(&org_id));
+    let (status, body) = match auth_json(&config, &headers, reqwest::Method::GET, &path, None).await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
+    }
+    let response: AuthKeyListResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => return dependency_error("fiducia-auth", "auth_key_list_bad_response", error),
+    };
+    let keys = match response
+        .keys
+        .iter()
+        .map(|key| auth_key_to_display(key, &org_id))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(keys) => keys,
+        Err(error) => return dependency_error("fiducia-auth", "auth_key_list_bad_response", error),
     };
 
-    Json(json!({
-        "api_keys": keys,
-        "default_require_idempotency": true,
-        "allowed_environments": ["live", "test"],
-        "allowed_scopes": allowed_api_key_scopes(),
-    }))
-    .into_response()
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "api_keys": keys,
+            "default_require_idempotency": true,
+            "allowed_environments": ["live", "test"],
+            "allowed_scopes": allowed_api_key_scopes(),
+        }),
+    )
+}
+
+async fn customer_context_json(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    let ctx = match config.authenticator.authenticate(&headers).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "user": {
+                "user_id": ctx.user_id,
+                "email": ctx.email,
+                "orgs": ctx.orgs,
+            }
+        }),
+    )
 }
 
 async fn create_customer_api_key(
@@ -606,139 +932,66 @@ async fn create_customer_api_key(
         Ok(c) => c,
         Err(e) => return e,
     };
-    if let Some(error) = validate_api_key_request(&payload) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": error, "ok": false })),
-        )
-            .into_response();
-    }
-    let token = bearer_token(&headers);
-    let (row, secret) =
-        match issue_customer_api_key(&config, &ctx, token.as_deref(), &payload).await {
-            Ok(issued) => issued,
-            Err(response) => return response,
-        };
-    let mut api_key = api_key_row_to_display(&row);
-    api_key["environment"] = json!(payload.environment);
-    api_key["require_idempotency"] = json!(payload.require_idempotency.unwrap_or(true));
-    (
+    let (display, secret) = match issue_customer_api_key(&config, &headers, &ctx, &payload).await {
+        Ok(issued) => issued,
+        Err(response) => return response,
+    };
+    no_store_json(
         StatusCode::CREATED,
-        Json(json!({
+        json!({
             "ok": true,
-            "api_key": api_key,
+            "api_key": display,
             "secret": secret,
             "secret_once": true,
-        })),
+        }),
     )
-        .into_response()
 }
 
 async fn issue_customer_api_key(
     config: &AppConfig,
+    headers: &HeaderMap,
     ctx: &CustomerCtx,
-    token: Option<&str>,
     payload: &CreateCustomerApiKeyRequest,
-) -> Result<(ApiKeysRow, String), Response> {
+) -> Result<(serde_json::Value, String), Response> {
+    require_idempotency_key(headers)?;
     if let Some(error) = validate_api_key_request(payload) {
-        return Err((StatusCode::BAD_REQUEST, error).into_response());
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error, "ok": false })),
+        )
+            .into_response());
     }
-    let pool = customer_pool(config)?;
-    let Some(org_id) = ctx.org_uuids().into_iter().next() else {
-        return Err((StatusCode::FORBIDDEN, "no_org_membership").into_response());
-    };
-    let Some(token) = token else {
-        return Err((StatusCode::UNAUTHORIZED, "missing_customer_session").into_response());
-    };
-    let Some(auth_url) = config.auth_url.as_deref() else {
+    let org_id = selected_customer_org(ctx, headers)?;
+    let request = json!({
+        "name": payload.name.trim(),
+        "org_id": &org_id,
+        "scopes": [&payload.scope],
+        "env": &payload.environment,
+        "require_idempotency": payload.require_idempotency.unwrap_or(true),
+    });
+    let (status, body) = auth_json(
+        config,
+        headers,
+        reqwest::Method::POST,
+        "/v1/keys",
+        Some(request),
+    )
+    .await?;
+    if !status.is_success() {
+        return Err(proxied_auth_error(status, body));
+    }
+    let response: AuthKeyCreateResponse = serde_json::from_value(body)
+        .map_err(|error| dependency_error("fiducia-auth", "auth_key_create_bad_response", error))?;
+    if !raw_api_key_matches(&response.api_key, &response.key) {
         return Err(dependency_error(
             "fiducia-auth",
-            "key_authority_not_configured",
-            "FIDUCIA_AUTH_URL is required",
-        ));
-    };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| dependency_error("fiducia-auth", "key_create_failed", error))?;
-    let response = client
-        .post(format!("{}/v1/keys", auth_url.trim_end_matches('/')))
-        .bearer_auth(token)
-        .json(&json!({
-            "name": payload.name.trim(),
-            "org_id": org_id,
-            "scopes": [payload.scope.as_str()],
-            "env": payload.environment,
-            "require_idempotency": payload.require_idempotency.unwrap_or(true),
-        }))
-        .send()
-        .await
-        .map_err(|error| dependency_error("fiducia-auth", "key_create_failed", error))?;
-    if !response.status().is_success() {
-        return Err(dependency_error(
-            "fiducia-auth",
-            "key_create_rejected",
-            response.status(),
+            "auth_key_create_bad_response",
+            "raw key does not match metadata",
         ));
     }
-    let issued = response
-        .json::<AuthCreatedKeyResponse>()
-        .await
-        .map_err(|error| dependency_error("fiducia-auth", "key_create_bad_response", error))?;
-    if issued.key.org_id != org_id.to_string()
-        || issued.key.require_idempotency != payload.require_idempotency.unwrap_or(true)
-    {
-        return Err(dependency_error(
-            "fiducia-auth",
-            "key_create_contract_mismatch",
-            "auth response did not match the requested organization or policy",
-        ));
-    }
-    let verifier_secret = issued
-        .api_key
-        .split_once('.')
-        .map(|(_, secret)| secret)
-        .ok_or_else(|| {
-            dependency_error(
-                "fiducia-auth",
-                "key_create_bad_response",
-                "raw key did not contain a verifier secret",
-            )
-        })?;
-    let new_key = store::NewApiKey {
-        key_id: &issued.key.key_id,
-        org_id,
-        name: payload.name.trim(),
-        secret_hash: hash_secret(verifier_secret),
-        scopes: json!([payload.scope]),
-        env: &payload.environment,
-        require_idempotency: payload.require_idempotency.unwrap_or(true),
-    };
-    match store::insert_api_key(pool, new_key).await {
-        Ok(row) => Ok((row, issued.api_key)),
-        Err(error) => {
-            let compensation = client
-                .delete(format!(
-                    "{}/v1/keys/{}",
-                    auth_url.trim_end_matches('/'),
-                    issued.key.key_id
-                ))
-                .bearer_auth(token)
-                .send()
-                .await;
-            if compensation
-                .as_ref()
-                .map(|response| !response.status().is_success())
-                .unwrap_or(true)
-            {
-                tracing::error!(
-                    key_id = %issued.key.key_id,
-                    "failed to compensate auth key after customer Postgres insert failure"
-                );
-            }
-            Err(dependency_error("postgres", "api_key_insert_failed", error))
-        }
-    }
+    let display = auth_key_to_display(&response.key, &org_id)
+        .map_err(|error| dependency_error("fiducia-auth", "auth_key_create_bad_response", error))?;
+    Ok((display, response.api_key))
 }
 
 async fn rotate_customer_api_key(
@@ -746,316 +999,146 @@ async fn rotate_customer_api_key(
     headers: HeaderMap,
     Json(payload): Json<RotateCustomerApiKeyRequest>,
 ) -> Response {
-    let customer = match config.authenticator.authenticate(&headers).await {
+    let ctx = match config.authenticator.authenticate(&headers).await {
         Ok(customer) => customer,
         Err(response) => return response,
     };
-    let pool = match customer_pool(&config) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
-    let presented = payload.prefix.trim();
-    let left = presented
-        .split_once('.')
-        .map(|(left, _)| left)
-        .unwrap_or(presented);
-    let key_id = left.rsplit('_').next().unwrap_or_default();
-    if key_id.is_empty()
-        || !key_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-')
-    {
+    if let Err(response) = require_idempotency_key(&headers) {
+        return response;
+    }
+    let prefix = payload.prefix.trim();
+    let Some(key_id) = auth_key_id_from_prefix(prefix) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_key_prefix", "ok": false })),
         )
             .into_response();
-    }
-    let Some(token) = bearer_token(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing_customer_session").into_response();
     };
-    let Some(auth_url) = config.auth_url.as_deref() else {
-        return dependency_error(
-            "fiducia-auth",
-            "key_authority_not_configured",
-            "FIDUCIA_AUTH_URL is required",
-        );
-    };
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => return dependency_error("fiducia-auth", "key_rotate_failed", error),
-    };
-    let response = match client
-        .post(format!(
-            "{}/v1/keys/{key_id}/rotate",
-            auth_url.trim_end_matches('/')
-        ))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => response,
-        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "ok": false, "error": "key_not_found" })),
-            )
-                .into_response()
-        }
-        Ok(response) => {
-            return dependency_error("fiducia-auth", "key_rotate_rejected", response.status())
-        }
-        Err(error) => return dependency_error("fiducia-auth", "key_rotate_failed", error),
-    };
-    let issued = match response.json::<AuthCreatedKeyResponse>().await {
-        Ok(issued) => issued,
-        Err(error) => return dependency_error("fiducia-auth", "key_rotate_bad_response", error),
-    };
-    if issued.key.key_id != key_id || !customer.orgs.iter().any(|org| org == &issued.key.org_id) {
-        return dependency_error(
-            "fiducia-auth",
-            "key_rotate_contract_mismatch",
-            "auth response did not match the requested key or customer organization",
-        );
-    }
-    let verifier_secret = match issued.api_key.split_once('.') {
-        Some((_, secret)) => secret,
-        None => {
-            return dependency_error(
-                "fiducia-auth",
-                "key_rotate_bad_response",
-                "raw key did not contain a verifier secret",
-            )
-        }
-    };
-    let updated = store::rotate_secret(
-        pool,
-        key_id,
-        hash_secret(verifier_secret),
-        &customer.org_uuids(),
-    )
-    .await;
-    if !matches!(updated, Ok(Some(_))) {
-        let compensation = client
-            .delete(format!(
-                "{}/v1/keys/{key_id}",
-                auth_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&token)
-            .send()
-            .await;
-        if compensation
-            .as_ref()
-            .map(|response| !response.status().is_success())
-            .unwrap_or(true)
-        {
-            tracing::error!(
-                key_id,
-                "failed to revoke authoritative key after relational rotation failure"
-            );
-        }
-        return match updated {
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "ok": false, "error": "key_not_found" })),
-            )
-                .into_response(),
-            Err(error) => dependency_error("postgres", "api_key_rotate_failed", error),
-            Ok(Some(_)) => unreachable!(),
-        };
-    }
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "prefix": format!("fdc_{}_{}", issued.key.env, key_id),
-            "rotated_at_ms": unix_epoch_ms(),
-            "replacement_secret": issued.api_key,
-            "overlap_seconds": 0,
-        })),
+    let org_id = match selected_customer_org(&ctx, &headers) {
+        Ok(org_id) => org_id,
+        Err(response) => return response,
+    };
+    let path = format!(
+        "/v1/keys/{}/rotate?org_id={}",
+        encode_query_value(key_id),
+        encode_query_value(&org_id)
+    );
+    let (status, body) = match auth_json(
+        &config,
+        &headers,
+        reqwest::Method::POST,
+        &path,
+        Some(json!({})),
     )
-        .into_response()
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
+    }
+    let response: AuthKeyRotateResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_rotate_bad_response", error)
+        }
+    };
+    if !raw_api_key_matches(&response.api_key, &response.key) {
+        return dependency_error(
+            "fiducia-auth",
+            "auth_key_rotate_bad_response",
+            "raw key does not match metadata",
+        );
+    }
+    let display = match auth_key_to_display(&response.key, &org_id) {
+        Ok(display) => display,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_rotate_bad_response", error)
+        }
+    };
+
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "prefix": prefix,
+            "rotated_at_ms": unix_epoch_ms(),
+            "replacement_secret": response.api_key,
+            "api_key": display,
+            "overlap_seconds": response.overlap_seconds,
+        }),
+    )
 }
 
-/// The @fiducia/sync write path, generic in `{table}` (only `api_keys` is DB-wired
-/// today). Persists the queued optimistic write and returns the committed row
-/// version (a shared `WriteAck`) so the client adopts it and clears `dirty`.
-/// Other clients reconcile through tenant-scoped catch-up or Supabase RLS.
-async fn sync_write(
+async fn revoke_customer_api_key(
     State(config): State<AppConfig>,
-    Path(table): Path<String>,
     headers: HeaderMap,
-    Json(req): Json<SyncWriteRequest>,
+    Json(payload): Json<RevokeCustomerApiKeyRequest>,
 ) -> Response {
-    // Authenticate before any state read/write: the sync path is a row-mutating
-    // surface and was previously an unauthenticated IDOR into api_keys.
     let ctx = match config.authenticator.authenticate(&headers).await {
-        Ok(c) => c,
-        Err(e) => return e,
+        Ok(ctx) => ctx,
+        Err(response) => return response,
     };
-    if table != "api_keys" {
+    if let Err(response) = require_idempotency_key(&headers) {
+        return response;
+    }
+    let prefix = payload.prefix.trim();
+    let Some(key_id) = auth_key_id_from_prefix(prefix) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_key_prefix", "ok": false })),
+        )
+            .into_response();
+    };
+    let org_id = match selected_customer_org(&ctx, &headers) {
+        Ok(org_id) => org_id,
+        Err(response) => return response,
+    };
+    let path = format!(
+        "/v1/keys/{}?org_id={}",
+        encode_query_value(key_id),
+        encode_query_value(&org_id)
+    );
+    let (status, body) =
+        match auth_json(&config, &headers, reqwest::Method::DELETE, &path, None).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
+    }
+    let response: AuthKeyRevokeResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => {
+            return dependency_error("fiducia-auth", "auth_key_revoke_bad_response", error)
+        }
+    };
+    if !response.revoked {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "ok": false, "error": "unsupported_sync_table", "table": table })),
+            Json(json!({ "ok": false, "error": "key_not_found" })),
         )
             .into_response();
     }
-    // Idempotency: replay the original ack for a retried key instead of re-running
-    // the UPDATE (whose trigger would re-bump `version`). Matches the client's
-    // stable `Idempotency-Key: table:id:op:base_version`.
-    let idem_key = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|key| scoped_idempotency_key(&ctx, &table, key, &req));
-    if let Some(key) = &idem_key {
-        match idempotency_begin(&config, key).await {
-            Ok(Idem::Replay(v)) => return ack(&req.id, v).into_response(),
-            Ok(Idem::InFlight) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "ok": false, "error": "idempotency_in_flight" })),
-                )
-                    .into_response()
-            }
-            Ok(Idem::Proceed) => {}
-            Err(err) => return dependency_error("postgres", "idempotency_claim_failed", err),
-        }
-    }
-
-    // Scoped to the caller's org so a client can only mutate its own rows.
-    let version = sync_write_api_keys_row(&config, &req, &ctx).await;
-    let version = match version {
-        Ok(version) => version,
-        Err(error) => {
-            if let Some(key) = &idem_key {
-                if let Err(release_error) = idempotency_release(&config, key).await {
-                    tracing::error!(error = %release_error, "failed to release unsuccessful idempotency claim");
-                }
-            }
-            match error {
-                SyncMutationError::InvalidId => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "ok": false, "error": "invalid_row_id" })),
-                    )
-                        .into_response()
-                }
-                SyncMutationError::NoOrg => {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({ "ok": false, "error": "no_org_membership" })),
-                    )
-                        .into_response()
-                }
-                SyncMutationError::NotFound => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({ "ok": false, "error": "row_not_found" })),
-                    )
-                        .into_response()
-                }
-                SyncMutationError::Database(err) => {
-                    return dependency_error("postgres", "sync_write_failed", err)
-                }
-            }
-        }
-    };
-
-    if let Some(key) = &idem_key {
-        if let Err(err) = idempotency_commit(&config, key, version).await {
-            return dependency_error("postgres", "idempotency_commit_failed", err);
-        }
-    }
-    ack(&req.id, version).into_response()
-}
-
-/// Namespace client-provided idempotency keys by authenticated identity, org set,
-/// endpoint, and request body. The database never stores attacker-controlled key
-/// text directly, and one tenant cannot claim another tenant's retry key.
-fn scoped_idempotency_key(
-    ctx: &CustomerCtx,
-    table: &str,
-    client_key: &str,
-    request: &SyncWriteRequest,
-) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut orgs = ctx.orgs.clone();
-    orgs.sort();
-    orgs.dedup();
-    let request_json = serde_json::to_vec(request).unwrap_or_default();
-    let mut digest = Sha256::new();
-    digest.update(client_key.as_bytes());
-    digest.update([0]);
-    digest.update(request_json);
-    format!(
-        "v2:{}:{}:{table}:{:x}",
-        ctx.user_id,
-        orgs.join(","),
-        digest.finalize()
+    no_store_json(
+        StatusCode::OK,
+        json!({ "ok": true, "prefix": prefix, "status": "revoked" }),
     )
-}
-
-/// Idempotency decision for a claimed/seen key.
-enum Idem {
-    /// A previously-committed write — replay this version.
-    Replay(i64),
-    /// A concurrent claim is still in-flight — do not re-run.
-    InFlight,
-    /// We own the durable key — run the mutation.
-    Proceed,
-}
-
-/// Begin idempotent handling of `key` in the durable ledger.
-async fn idempotency_begin(config: &AppConfig, key: &str) -> Result<Idem, DbErr> {
-    let pool = config
-        .pool
-        .as_ref()
-        .ok_or_else(|| DbErr::Custom("customer database unavailable".to_string()))?;
-    if store::idem_claim(pool, key).await? {
-        return Ok(Idem::Proceed);
-    }
-    Ok(match store::idem_committed(pool, key).await? {
-        Some(Some(version)) => Idem::Replay(version),
-        Some(None) => Idem::InFlight,
-        None => Idem::InFlight,
-    })
-}
-
-/// Record the committed version for `key` in the durable ledger.
-async fn idempotency_commit(config: &AppConfig, key: &str, version: i64) -> Result<(), DbErr> {
-    let pool = config
-        .pool
-        .as_ref()
-        .ok_or_else(|| DbErr::Custom("customer database unavailable".to_string()))?;
-    store::idem_record(pool, key, version).await
-}
-
-/// Release a claim when the protected mutation did not commit. Stale in-flight
-/// claims are also recoverable in the store, covering process crashes.
-async fn idempotency_release(config: &AppConfig, key: &str) -> Result<(), DbErr> {
-    let pool = config
-        .pool
-        .as_ref()
-        .ok_or_else(|| DbErr::Custom("customer database unavailable".to_string()))?;
-    store::idem_release(pool, key).await
 }
 
 #[derive(Debug, Deserialize)]
 struct CatchupParams {
-    /// Return rows with `version` strictly greater than this cursor (default 0).
+    /// Accepted for client compatibility and observability. API-key hydration is
+    /// a full authoritative snapshot because fiducia-auth owns the key store.
     #[serde(default)]
     since: i64,
 }
 
-/// Catch-up hydration: `GET /api/customer/sync/{table}?since=<version>` returns the
-/// authoritative rows newer than the client's cursor (org-scoped, ordered by
-/// version, index-backed) so anything missed while offline reconciles. Feeds the
-/// SDK's `hydrate()`.
+/// Catch-up hydration returns a complete, sanitized, org-scoped API-key snapshot
+/// from fiducia-auth. The browser uses `hydrate(..., { prune: true })`, so rows
+/// removed or revoked while it was offline reconcile without raw database CDC.
 async fn sync_catchup(
     State(config): State<AppConfig>,
     Path(table): Path<String>,
@@ -1068,17 +1151,34 @@ async fn sync_catchup(
     };
     let rows: Vec<serde_json::Value> = match table.as_str() {
         "api_keys" => {
-            let pool = match customer_pool(&config) {
-                Ok(pool) => pool,
+            let org_id = match selected_customer_org(&ctx, &headers) {
+                Ok(org_id) => org_id,
                 Err(response) => return response,
             };
-            let orgs = ctx.org_uuids();
-            if orgs.is_empty() {
-                vec![]
-            } else {
-                match store::catchup_api_keys(pool, &orgs, params.since, 500).await {
-                    Ok(rows) => rows.iter().map(api_key_row_to_display).collect(),
-                    Err(err) => return dependency_error("postgres", "sync_catchup_failed", err),
+            let path = format!("/v1/keys?org_id={}", encode_query_value(&org_id));
+            let (status, body) =
+                match auth_json(&config, &headers, reqwest::Method::GET, &path, None).await {
+                    Ok(result) => result,
+                    Err(response) => return response,
+                };
+            if !status.is_success() {
+                return proxied_auth_error(status, body);
+            }
+            let response: AuthKeyListResponse = match serde_json::from_value(body) {
+                Ok(response) => response,
+                Err(error) => {
+                    return dependency_error("fiducia-auth", "auth_key_list_bad_response", error)
+                }
+            };
+            match response
+                .keys
+                .iter()
+                .map(|key| auth_key_to_display(key, &org_id))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(keys) => keys,
+                Err(error) => {
+                    return dependency_error("fiducia-auth", "auth_key_list_bad_response", error)
                 }
             }
         }
@@ -1090,135 +1190,15 @@ async fn sync_catchup(
                 .into_response()
         }
     };
-    Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
-}
-
-/// Build the shared write-ack the @fiducia/sync client reconciles against.
-fn ack(id: &str, committed_version: i64) -> (StatusCode, Json<WriteAck>) {
-    (
+    no_store_json(
         StatusCode::OK,
-        Json(WriteAck {
-            id: id.to_string(),
-            committed_version,
+        json!({
+            "table": table,
+            "snapshot": true,
+            "requested_since": params.since,
+            "rows": rows,
         }),
     )
-}
-
-/// Persist one queued optimistic write to `api_keys`. Returns the committed row
-/// version or a concrete error.
-enum SyncMutationError {
-    InvalidId,
-    NoOrg,
-    NotFound,
-    Database(DbErr),
-}
-
-async fn sync_write_api_keys_row(
-    config: &AppConfig,
-    req: &SyncWriteRequest,
-    ctx: &CustomerCtx,
-) -> Result<i64, SyncMutationError> {
-    let pool = config.pool.as_ref().ok_or_else(|| {
-        SyncMutationError::Database(DbErr::Custom("customer database unavailable".to_string()))
-    })?;
-    let id = Uuid::parse_str(&req.id).map_err(|_| SyncMutationError::InvalidId)?;
-    let op = req.op.as_deref().unwrap_or("upsert");
-    // Every mutation is scoped to the caller's org(s); a row in another tenant's
-    // org yields no match (Option::None), so this is not a cross-tenant IDOR.
-    let orgs = ctx.org_uuids();
-    if orgs.is_empty() {
-        return Err(SyncMutationError::NoOrg);
-    }
-
-    let committed = if op == "delete" {
-        // A delete on a revocable credential is a soft revoke, not a row drop, so
-        // audit/history stay intact. Version still bumps.
-        store::soft_delete(pool, id, &orgs).await
-    } else {
-        let payload = req.payload.clone().unwrap_or_else(|| json!({}));
-        let revoked = match payload.get("status").and_then(|v| v.as_str()) {
-            Some("revoked") => Some(true),
-            Some(_) => Some(false),
-            None => payload.get("revoked").and_then(|v| v.as_bool()),
-        };
-        let patch = store::ApiKeyPatch {
-            name: payload
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned),
-            scopes: payload_scopes(&payload),
-            env: payload
-                .get("environment")
-                .and_then(|v| v.as_str())
-                .or_else(|| payload.get("env").and_then(|v| v.as_str()))
-                .map(str::to_owned),
-            revoked,
-        };
-        // COALESCE keeps existing values for any field the client omitted; the
-        // trigger bumps version + updated_at on the UPDATE.
-        store::upsert_fields(pool, id, &orgs, patch).await
-    };
-
-    match committed {
-        Ok(Some(row)) => Ok(row.version),
-        Ok(None) => Err(SyncMutationError::NotFound),
-        Err(err) => Err(SyncMutationError::Database(err)),
-    }
-}
-
-/// SHA-256 of an API-key secret. Only the hash is ever persisted — the plaintext
-/// secret is shown to the caller once and never stored.
-fn hash_secret(secret: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(secret.as_bytes());
-    format!("sha256:{digest:x}")
-}
-
-/// Normalize a client `scopes` field to a jsonb array, or `None` to leave it
-/// untouched. The display row stores scopes as a comma string; the column is an
-/// array — accept either shape.
-fn payload_scopes(payload: &serde_json::Value) -> Option<serde_json::Value> {
-    match payload.get("scopes") {
-        Some(serde_json::Value::Array(items)) => Some(serde_json::Value::Array(items.clone())),
-        Some(serde_json::Value::String(csv)) => {
-            let items: Vec<serde_json::Value> = csv
-                .split(',')
-                .map(|part| part.trim())
-                .filter(|part| !part.is_empty())
-                .map(|part| json!(part))
-                .collect();
-            Some(json!(items))
-        }
-        _ => None,
-    }
-}
-
-/// Map a DB row to the display shape the frontend renders (and stores in
-/// IndexedDB). `prefix` is the public `key_id`; scopes collapse to a comma string.
-fn api_key_row_to_display(row: &ApiKeysRow) -> serde_json::Value {
-    let scopes = row
-        .scopes
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-
-    json!({
-        "id": row.id.to_string(),
-        "name": row.name,
-        "prefix": format!("fdc_{}_{}", row.env, row.key_id),
-        "scopes": scopes,
-        "last_used": if row.last_used_at.is_some() { "recently" } else { "never" },
-        "status": if row.revoked { "revoked" } else { "active" },
-        "environment": row.env,
-        "require_idempotency": row.require_idempotency,
-        "version": row.version,
-    })
 }
 
 /// Resolve the caller's local `users.id`, provisioning the row on first access.
@@ -1620,25 +1600,9 @@ async fn customer_settings(State(config): State<AppConfig>, headers: HeaderMap) 
     customer_page_response(&config, &headers, CustomerTab::Settings).await
 }
 
-async fn customer_locks(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::Locks).await
-}
-
-async fn customer_requests(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::Requests).await
-}
-
-async fn customer_kv(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::Kv).await
-}
-
-async fn customer_services(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    customer_page_response(&config, &headers, CustomerTab::Services).await
-}
-
 async fn create_customer_api_key_form(
     State(config): State<AppConfig>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     Form(form): Form<CreateCustomerApiKeyForm>,
 ) -> Response {
     let customer = match config.authenticator.authenticate(&headers).await {
@@ -1651,13 +1615,17 @@ async fn create_customer_api_key_form(
         scope: form.scope,
         require_idempotency: Some(true),
     };
-    let token = bearer_token(&headers);
-    let (_row, secret) =
-        match issue_customer_api_key(&config, &customer, token.as_deref(), &payload).await {
+    if !headers.contains_key(IDEMPOTENCY_KEY_HEADER) {
+        let value = HeaderValue::from_str(&Uuid::new_v4().to_string())
+            .expect("UUID idempotency key is a valid header value");
+        headers.insert(HeaderName::from_static(IDEMPOTENCY_KEY_HEADER), value);
+    }
+    let (_display, secret) =
+        match issue_customer_api_key(&config, &headers, &customer, &payload).await {
             Ok(issued) => issued,
             Err(response) => return response,
         };
-    api_keys_fragment_markup(&config, &customer, Some(&secret)).await
+    api_keys_fragment_markup(&config, &headers, &customer, Some(&secret)).await
 }
 
 async fn api_keys_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
@@ -1665,32 +1633,50 @@ async fn api_keys_fragment(State(config): State<AppConfig>, headers: HeaderMap) 
         Ok(customer) => customer,
         Err(response) => return response,
     };
-    api_keys_fragment_markup(&config, &customer, None).await
+    api_keys_fragment_markup(&config, &headers, &customer, None).await
 }
 
 async fn api_keys_fragment_markup(
     config: &AppConfig,
+    headers: &HeaderMap,
     customer: &CustomerCtx,
     secret: Option<&str>,
 ) -> Response {
-    let pool = match customer_pool(config) {
-        Ok(pool) => pool,
+    let org_id = match selected_customer_org(customer, headers) {
+        Ok(org_id) => org_id,
         Err(response) => return response,
     };
-    let keys = match store::list_api_keys(pool, &customer.org_uuids()).await {
+    let path = format!("/v1/keys?org_id={}", encode_query_value(&org_id));
+    let (status, body) = match auth_json(config, headers, reqwest::Method::GET, &path, None).await {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    if !status.is_success() {
+        return proxied_auth_error(status, body);
+    }
+    let response: AuthKeyListResponse = match serde_json::from_value(body) {
+        Ok(response) => response,
+        Err(error) => return dependency_error("fiducia-auth", "auth_key_list_bad_response", error),
+    };
+    let keys = match response
+        .keys
+        .iter()
+        .map(|key| auth_key_to_display(key, &org_id))
+        .collect::<Result<Vec<_>, _>>()
+    {
         Ok(keys) => keys,
-        Err(error) => return dependency_error("postgres", "api_keys_list_failed", error),
+        Err(error) => return dependency_error("fiducia-auth", "auth_key_list_bad_response", error),
     };
     api_keys_table_markup(&keys, secret).into_response()
 }
 
-fn api_keys_table_markup(keys: &[ApiKeysRow], secret: Option<&str>) -> Markup {
+fn api_keys_table_markup(keys: &[serde_json::Value], secret: Option<&str>) -> Markup {
     html! {
         @if let Some(secret) = secret {
             section class="panel secret-once" role="status" {
                 h2 { "Copy this secret now" }
                 code { (secret) }
-                p class="muted" { "The plaintext is shown once. Only its SHA-256 verifier is stored." }
+                p class="muted" { "The plaintext is returned only by the authoritative auth service for this replay-safe request." }
             }
         }
         section class="panel" aria-labelledby="api-keys-heading" {
@@ -1715,11 +1701,11 @@ fn api_keys_table_markup(keys: &[ApiKeysRow], secret: Option<&str>) -> Markup {
                         } @else {
                             @for key in keys {
                                 tr {
-                                    td { (&key.name) }
-                                    td { code { (format!("fdc_{}_{}", key.env, key.key_id)) } }
-                                    td { (&key.env) }
-                                    td { code { (key.scopes.to_string()) } }
-                                    td { @if key.revoked { "revoked" } @else { "active" } }
+                                    td { (key.get("name").and_then(|value| value.as_str()).unwrap_or("")) }
+                                    td { code { (key.get("prefix").and_then(|value| value.as_str()).unwrap_or("")) } }
+                                    td { (key.get("environment").and_then(|value| value.as_str()).unwrap_or("")) }
+                                    td { code { (key.get("scopes").and_then(|value| value.as_str()).unwrap_or("")) } }
+                                    td { (key.get("status").and_then(|value| value.as_str()).unwrap_or("")) }
                                 }
                             }
                         }
@@ -1746,22 +1732,6 @@ async fn customer_page_response(
 
 async fn summary_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
     protected_fragment(&config, &headers, summary_markup()).await
-}
-
-async fn locks_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    protected_fragment(&config, &headers, locks_markup()).await
-}
-
-async fn requests_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    protected_fragment(&config, &headers, requests_markup()).await
-}
-
-async fn kv_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    protected_fragment(&config, &headers, kv_markup()).await
-}
-
-async fn services_fragment(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
-    protected_fragment(&config, &headers, services_markup()).await
 }
 
 async fn protected_fragment(config: &AppConfig, headers: &HeaderMap, fragment: Markup) -> Response {
@@ -1862,13 +1832,7 @@ fn stream_payload(kind: &str, sequence: u64, transport: &str) -> serde_json::Val
         "transport": transport,
         "event": "fiducia:refresh",
         "at_ms": unix_epoch_ms(),
-        "fragments": {
-            "summary": summary_markup().into_string(),
-            "locks": locks_markup().into_string(),
-            "requests": requests_markup().into_string(),
-            "kv": kv_markup().into_string(),
-            "services": services_markup().into_string(),
-        },
+        "fragments": { "summary": summary_markup().into_string() },
     })
 }
 
@@ -1898,24 +1862,16 @@ enum CustomerTab {
     ApiKeys,
     Security,
     Settings,
-    Locks,
-    Requests,
-    Kv,
-    Services,
 }
 
 impl CustomerTab {
-    fn all() -> [CustomerTab; 9] {
+    fn all() -> [CustomerTab; 5] {
         [
             CustomerTab::Dashboard,
             CustomerTab::Auth,
             CustomerTab::ApiKeys,
             CustomerTab::Security,
             CustomerTab::Settings,
-            CustomerTab::Locks,
-            CustomerTab::Requests,
-            CustomerTab::Kv,
-            CustomerTab::Services,
         ]
     }
 
@@ -1926,10 +1882,6 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "/app/api-keys",
             CustomerTab::Security => "/app/security",
             CustomerTab::Settings => "/app/settings",
-            CustomerTab::Locks => "/app/locks",
-            CustomerTab::Requests => "/app/requests",
-            CustomerTab::Kv => "/app/kv",
-            CustomerTab::Services => "/app/services",
         }
     }
 
@@ -1940,24 +1892,16 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "API Keys",
             CustomerTab::Security => "Security",
             CustomerTab::Settings => "Settings",
-            CustomerTab::Locks => "Locks",
-            CustomerTab::Requests => "Requests",
-            CustomerTab::Kv => "Config KV",
-            CustomerTab::Services => "Services",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            CustomerTab::Dashboard => "Account posture, API access, realtime health, and customer operations in one workspace.",
+            CustomerTab::Dashboard => "Account posture, API access, preferences, and customer security in one workspace.",
             CustomerTab::Auth => "Your Supabase identity, verified organization membership, and isolated customer session.",
             CustomerTab::ApiKeys => "Create, rotate, scope, and audit customer API keys for production integrations.",
             CustomerTab::Security => "Two-factor authentication, trusted sessions, recovery, and account protection.",
             CustomerTab::Settings => "Preferences, notifications, default region, and team-level customer settings.",
-            CustomerTab::Locks => "Live distributed lock state, fencing tokens, and wait queues.",
-            CustomerTab::Requests => "Recent mutating requests, routing outcomes, idempotency posture, and leader decisions.",
-            CustomerTab::Kv => "Configuration KV revisions, TTL status, and regional consistency.",
-            CustomerTab::Services => "Service discovery registrations, leader health, and instance counts.",
         }
     }
 }
@@ -2048,29 +1992,6 @@ fn customer_tab_content(config: &AppConfig, customer: &CustomerCtx, active: Cust
         CustomerTab::ApiKeys => api_keys_markup(),
         CustomerTab::Security => security_markup(),
         CustomerTab::Settings => settings_markup(),
-        CustomerTab::Locks => html! {
-            div class="panel-grid" {
-                section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="load, every 15s" hx-swap="innerHTML" {
-                    (locks_markup())
-                }
-                (realtime_events_markup())
-            }
-        },
-        CustomerTab::Requests => html! {
-            section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="load, every 15s" hx-swap="innerHTML" {
-                (requests_markup())
-            }
-        },
-        CustomerTab::Kv => html! {
-            section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="load, every 15s" hx-swap="innerHTML" {
-                (kv_markup())
-            }
-        },
-        CustomerTab::Services => html! {
-            section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="load, every 15s" hx-swap="innerHTML" {
-                (services_markup())
-            }
-        },
     }
 }
 
@@ -2084,21 +2005,6 @@ fn dashboard_markup(config: &AppConfig, customer: &CustomerCtx) -> Markup {
             (api_key_summary_panel())
             (security_summary_panel())
             (preferences_summary_panel())
-        }
-        div class="panel-grid" {
-            section id="locks-panel" class="panel" hx-get="/app/fragments/locks" hx-trigger="load, every 15s" hx-swap="innerHTML" {
-                (locks_markup())
-            }
-            (realtime_events_markup())
-        }
-        section id="requests-panel" class="panel" hx-get="/app/fragments/requests" hx-trigger="load, every 15s" hx-swap="innerHTML" {
-            (requests_markup())
-        }
-        section id="kv-panel" class="panel" hx-get="/app/fragments/kv" hx-trigger="load, every 15s" hx-swap="innerHTML" {
-            (kv_markup())
-        }
-        section id="services-panel" class="panel" hx-get="/app/fragments/services" hx-trigger="load, every 15s" hx-swap="innerHTML" {
-            (services_markup())
         }
     }
 }
@@ -2151,7 +2057,7 @@ fn api_key_summary_panel() -> Markup {
                     }
                     div {
                         dt { "Rotation" }
-                        dd { "rotation invalidates the previous secret immediately" }
+                        dd { "rotation reports the remaining edge/LB cache overlap" }
                     }
                 }
                 a class="button-link" href="/app/api-keys" { "Manage keys" }
@@ -2411,27 +2317,13 @@ fn preferences_form_markup(preferences: &CustomerPreferences, saved: bool) -> Ma
     }
 }
 
-fn realtime_events_markup() -> Markup {
-    html! {
-        section class="panel" aria-labelledby="events-heading" {
-            div class="panel__header" {
-                h2 id="events-heading" { "Refresh channel" }
-                span { "HTMX" }
-            }
-            div id="realtime-events" class="event-stream" aria-live="polite" {
-                div class="empty-state" { "Authenticated fragments refresh from this Rust server every 15 seconds." }
-            }
-        }
-    }
-}
-
 fn summary_markup() -> Markup {
     html! {
         div class="summary-grid" {
             div class="metric" {
                 p class="metric__label" { "API keys" }
                 p class="metric__value" { "live" }
-                p class="metric__hint" { "loaded from customer PostgreSQL after sign-in" }
+                p class="metric__hint" { "sanitized metadata from fiducia-auth after sign-in" }
             }
             div class="metric" {
                 p class="metric__label" { "Preferences" }
@@ -2444,58 +2336,10 @@ fn summary_markup() -> Markup {
                 p class="metric__hint" { "trusted sessions from customer PostgreSQL" }
             }
             div class="metric" {
-                p class="metric__label" { "Coordination telemetry" }
-                p class="metric__value" { "scoped" }
-                p class="metric__hint" { "hidden until node observability is tenant-aware" }
+                p class="metric__label" { "Application boundary" }
+                p class="metric__value" { "customer" }
+                p class="metric__hint" { "operator infrastructure controls live only in the admin app" }
             }
-        }
-    }
-}
-
-fn locks_markup() -> Markup {
-    html! {
-        div class="panel__header" {
-            h2 { "Locks" }
-            span { "unavailable" }
-        }
-        div class="empty-state" {
-            "Lock inventory is not shown because the node observability API is cluster-wide, not customer-scoped."
-        }
-    }
-}
-
-fn requests_markup() -> Markup {
-    html! {
-        div class="panel__header" {
-            h2 { "Requests" }
-            span { "unavailable" }
-        }
-        div class="empty-state" {
-            "Per-request telemetry requires a customer-scoped audit source; invented request samples are never displayed."
-        }
-    }
-}
-
-fn kv_markup() -> Markup {
-    html! {
-        div class="panel__header" {
-            h2 { "Config KV" }
-            span { "unavailable" }
-        }
-        div class="empty-state" {
-            "KV inventory is hidden until the node can enforce an authenticated customer namespace."
-        }
-    }
-}
-
-fn services_markup() -> Markup {
-    html! {
-        div class="panel__header" {
-            h2 { "Service Discovery" }
-            span { "unavailable" }
-        }
-        div class="empty-state" {
-            "Service discovery is cluster-wide today and is not exposed as customer-owned data."
         }
     }
 }
@@ -2542,7 +2386,126 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt; // for `oneshot`
+
+    const ORG_A: &str = "00000000-0000-4000-8000-000000000001";
+    const ORG_B: &str = "00000000-0000-4000-8000-000000000002";
+    const KEY_ID: &str = "0123456789abcdef";
+
+    #[derive(Clone, Debug)]
+    struct CapturedAuthRequest {
+        method: Method,
+        path_and_query: String,
+        authorization: Option<String>,
+        idempotency_key: Option<String>,
+        body: serde_json::Value,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockAuthState {
+        requests: Arc<Mutex<Vec<CapturedAuthRequest>>>,
+    }
+
+    fn mock_key_meta() -> serde_json::Value {
+        json!({
+            "key_id": KEY_ID,
+            "org_id": ORG_B,
+            "name": "Production webhooks",
+            "scopes": ["requests:write"],
+            "env": "live",
+            "last_used_ms": null,
+            "revoked": false,
+            "version": 1,
+            "require_idempotency": true,
+            // The upstream contract must never include this, but even a drifted
+            // response cannot pass it through the BFF's typed sanitizer.
+            "secret_hash": "sha256:must-not-leak"
+        })
+    }
+
+    async fn mock_auth_request(
+        State(state): State<MockAuthState>,
+        request: axum::extract::Request,
+    ) -> Response {
+        let method = request.method().clone();
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
+            .to_string();
+        let authorization = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let idempotency_key = request
+            .headers()
+            .get(IDEMPOTENCY_KEY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let (parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
+            .await
+            .expect("read mock auth request body");
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("mock auth request JSON")
+        };
+        state.requests.lock().unwrap().push(CapturedAuthRequest {
+            method: method.clone(),
+            path_and_query: path_and_query.clone(),
+            authorization,
+            idempotency_key,
+            body,
+        });
+
+        let path = parts.uri.path();
+        let mut rotated_meta = mock_key_meta();
+        rotated_meta["version"] = json!(2);
+        let response = match (method, path) {
+            (Method::GET, "/v1/keys") => json!({ "keys": [mock_key_meta()] }),
+            (Method::POST, "/v1/keys") => json!({
+                "api_key": format!("fdc_live_{KEY_ID}.{}", "a".repeat(64)),
+                "key": mock_key_meta()
+            }),
+            (Method::POST, "/v1/keys/0123456789abcdef/rotate") => json!({
+                "ok": true,
+                "api_key": format!("fdc_live_{KEY_ID}.{}", "b".repeat(64)),
+                "key": rotated_meta,
+                "secret_once": true,
+                "overlap_seconds": 60
+            }),
+            (Method::DELETE, "/v1/keys/0123456789abcdef") => {
+                json!({ "revoked": true })
+            }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "unexpected_mock_auth_route" })),
+                )
+                    .into_response()
+            }
+        };
+        Json(response).into_response()
+    }
+
+    async fn spawn_mock_auth() -> (String, MockAuthState, tokio::task::JoinHandle<()>) {
+        let state = MockAuthState::default();
+        let app = Router::new()
+            .fallback(mock_auth_request)
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), state, server)
+    }
 
     /// Create a throwaway `static/` dir with the minimum files the static
     /// handler serves (home page, 404 fallback, a hashed asset).
@@ -2579,6 +2542,7 @@ mod tests {
         AppConfig {
             static_dir: temp_static_dir(),
             customer_app_host: "app.fiducia.cloud".to_string(),
+            customer_app_origin: None,
             customer_site_mode: false,
             supabase_url: None,
             supabase_publishable_key: None,
@@ -2602,6 +2566,60 @@ mod tests {
         }
     }
 
+    fn multi_org_config() -> AppConfig {
+        config_with_auth(Authenticator::Static(Arc::new(CustomerCtx {
+            user_id: "00000000-0000-4000-8000-000000000099".to_string(),
+            email: Some("multi-org@fiducia.cloud".to_string()),
+            orgs: vec![ORG_A.to_string(), ORG_B.to_string()],
+        })))
+    }
+
+    async fn bff_request(
+        config: AppConfig,
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        org_id: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Response {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, "Bearer verified-supabase-session");
+        if let Some(org_id) = org_id {
+            builder = builder.header(CUSTOMER_ORG_HEADER, org_id);
+        }
+        if let Some(idempotency_key) = idempotency_key {
+            builder = builder.header(IDEMPOTENCY_KEY_HEADER, idempotency_key);
+        }
+        let body = match body {
+            Some(body) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        build_router(config)
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "response was not JSON ({error}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, headers, body)
+    }
+
     async fn post_json(config: AppConfig, uri: &str, body: &str) -> StatusCode {
         build_router(config)
             .oneshot(
@@ -2609,6 +2627,7 @@ mod tests {
                     .method("POST")
                     .uri(uri)
                     .header("content-type", "application/json")
+                    .header(IDEMPOTENCY_KEY_HEADER, "test-request-1")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -2618,6 +2637,347 @@ mod tests {
     }
 
     const CREATE_KEY_BODY: &str = r#"{"name":"k","environment":"live","scope":"requests:write"}"#;
+
+    #[test]
+    fn customer_origin_validation_accepts_one_exact_http_origin() {
+        assert_eq!(
+            parse_customer_app_origin("https://app.fiducia.cloud")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "https://app.fiducia.cloud"
+        );
+        assert_eq!(
+            parse_customer_app_origin("http://127.0.0.1:4173/")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "http://127.0.0.1:4173"
+        );
+        for invalid in [
+            "*",
+            "app.fiducia.cloud",
+            "https://app.fiducia.cloud/path",
+            "https://app.fiducia.cloud?query=1",
+            "https://user@app.fiducia.cloud",
+            "https://app.fiducia.cloud,https://evil.example",
+        ] {
+            assert!(
+                parse_customer_app_origin(invalid).is_err(),
+                "accepted invalid origin {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn org_selection_is_explicit_and_membership_checked() {
+        let config = multi_org_config();
+        let Authenticator::Static(ctx) = &config.authenticator else {
+            panic!("multi-org test config must use static auth");
+        };
+
+        assert_eq!(
+            selected_customer_org(ctx, &HeaderMap::new())
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut selected = HeaderMap::new();
+        selected.insert(CUSTOMER_ORG_HEADER, HeaderValue::from_static(ORG_B));
+        assert_eq!(selected_customer_org(ctx, &selected).unwrap(), ORG_B);
+
+        selected.insert(
+            CUSTOMER_ORG_HEADER,
+            HeaderValue::from_static("00000000-0000-4000-8000-000000000003"),
+        );
+        assert_eq!(
+            selected_customer_org(ctx, &selected).unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        selected.insert(
+            CUSTOMER_ORG_HEADER,
+            HeaderValue::from_static("org with whitespace"),
+        );
+        assert_eq!(
+            selected_customer_org(ctx, &selected).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn auth_key_sanitizer_checks_org_wire_shape_and_scopes() {
+        let key: AuthKeyMeta = serde_json::from_value(mock_key_meta()).unwrap();
+        let display = auth_key_to_display(&key, ORG_B).unwrap();
+        assert_eq!(display["prefix"], format!("fdc_live_{KEY_ID}"));
+        assert!(display.get("secret_hash").is_none());
+        assert!(auth_key_to_display(&key, ORG_A).is_err());
+        assert!(raw_api_key_matches(
+            &format!("fdc_live_{KEY_ID}.{}", "a".repeat(64)),
+            &key
+        ));
+        assert!(!raw_api_key_matches(
+            &format!("fdc_live_{KEY_ID}.short"),
+            &key
+        ));
+    }
+
+    #[tokio::test]
+    async fn cors_allows_only_the_configured_customer_origin_and_headers() {
+        let mut config = test_config();
+        config.customer_app_origin =
+            Some(parse_customer_app_origin("https://app.fiducia.cloud").unwrap());
+        let preflight = |origin: &'static str| {
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/customer/api-keys")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,content-type,idempotency-key,x-fiducia-org-id",
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let allowed = build_router(config.clone())
+            .oneshot(preflight("https://app.fiducia.cloud"))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            allowed
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://app.fiducia.cloud"
+        );
+        let allowed_headers = allowed
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        for required in [
+            "authorization",
+            "content-type",
+            IDEMPOTENCY_KEY_HEADER,
+            CUSTOMER_ORG_HEADER,
+        ] {
+            assert!(allowed_headers.contains(required), "missing {required}");
+        }
+
+        let denied = build_router(config)
+            .oneshot(preflight("https://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(
+            denied
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://app.fiducia.cloud",
+            "the fixed allow-origin must never reflect a foreign Origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn customer_key_bff_is_org_scoped_sanitized_and_forwards_idempotency() {
+        let (auth_url, state, server) = spawn_mock_auth().await;
+        let mut config = multi_org_config();
+        config.auth_url = Some(auth_url);
+
+        let context = bff_request(
+            config.clone(),
+            Method::GET,
+            "/api/customer/context",
+            None,
+            None,
+            None,
+        )
+        .await;
+        let (status, headers, body) = response_json(context).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["user"]["orgs"].as_array().unwrap().len(), 2);
+
+        let missing_org = bff_request(
+            config.clone(),
+            Method::GET,
+            "/api/customer/api-keys",
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(missing_org.status(), StatusCode::BAD_REQUEST);
+
+        let listed = bff_request(
+            config.clone(),
+            Method::GET,
+            "/api/customer/api-keys",
+            None,
+            Some(ORG_B),
+            None,
+        )
+        .await;
+        let (status, headers, body) = response_json(listed).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["api_keys"][0]["prefix"], format!("fdc_live_{KEY_ID}"));
+        assert!(body.to_string().find("secret_hash").is_none());
+
+        let create_body = json!({
+            "name": "Production webhooks",
+            "environment": "live",
+            "scope": "requests:write",
+            "require_idempotency": true
+        });
+        let missing_idempotency = bff_request(
+            config.clone(),
+            Method::POST,
+            "/api/customer/api-keys",
+            Some(create_body.clone()),
+            Some(ORG_B),
+            None,
+        )
+        .await;
+        let (status, _, body) = response_json(missing_idempotency).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "idempotency_key_required");
+
+        let created = bff_request(
+            config.clone(),
+            Method::POST,
+            "/api/customer/api-keys",
+            Some(create_body),
+            Some(ORG_B),
+            Some("customer-create-key-1"),
+        )
+        .await;
+        let (status, headers, body) = response_json(created).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(headers.get(header::PRAGMA).unwrap(), "no-cache");
+        assert!(body["secret"].as_str().unwrap().starts_with("fdc_live_"));
+        assert!(body.to_string().find("secret_hash").is_none());
+
+        let rotated = bff_request(
+            config.clone(),
+            Method::POST,
+            "/api/customer/api-keys/rotate",
+            Some(json!({ "prefix": format!("fdc_live_{KEY_ID}") })),
+            Some(ORG_B),
+            Some("customer-rotate-key-1"),
+        )
+        .await;
+        let (status, headers, body) = response_json(rotated).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["api_key"]["version"], 2);
+        assert_eq!(body["overlap_seconds"], 60);
+
+        let revoked = bff_request(
+            config.clone(),
+            Method::POST,
+            "/api/customer/api-keys/revoke",
+            Some(json!({ "prefix": format!("fdc_live_{KEY_ID}") })),
+            Some(ORG_B),
+            Some("customer-revoke-key-1"),
+        )
+        .await;
+        let (status, headers, body) = response_json(revoked).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["status"], "revoked");
+
+        let catchup = bff_request(
+            config,
+            Method::GET,
+            "/api/customer/sync/api_keys?since=99",
+            None,
+            Some(ORG_B),
+            None,
+        )
+        .await;
+        let (status, headers, body) = response_json(catchup).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body["snapshot"], true);
+        assert_eq!(body["requested_since"], 99);
+        assert!(body.to_string().find("secret_hash").is_none());
+
+        let requests = state.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 5);
+        assert!(requests
+            .iter()
+            .all(|request| request.authorization.as_deref()
+                == Some("Bearer verified-supabase-session")));
+        let create = requests
+            .iter()
+            .find(|request| request.method == Method::POST && request.path_and_query == "/v1/keys")
+            .unwrap();
+        assert_eq!(
+            create.idempotency_key.as_deref(),
+            Some("customer-create-key-1")
+        );
+        assert_eq!(create.body["org_id"], ORG_B);
+        let rotate = requests
+            .iter()
+            .find(|request| request.path_and_query.contains("/rotate"))
+            .unwrap();
+        assert_eq!(
+            rotate.idempotency_key.as_deref(),
+            Some("customer-rotate-key-1")
+        );
+        assert!(rotate.path_and_query.ends_with(&format!("org_id={ORG_B}")));
+        let revoke = requests
+            .iter()
+            .find(|request| request.method == Method::DELETE)
+            .unwrap();
+        assert_eq!(
+            revoke.idempotency_key.as_deref(),
+            Some("customer-revoke-key-1")
+        );
+        assert!(revoke.path_and_query.ends_with(&format!("org_id={ORG_B}")));
+        assert!(requests
+            .iter()
+            .filter(|request| request.method == Method::GET)
+            .all(|request| request.path_and_query.ends_with(&format!("org_id={ORG_B}"))));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn server_managed_customer_cookie_is_forwarded_to_the_key_authority() {
+        let (auth_url, state, server) = spawn_mock_auth().await;
+        let mut config = multi_org_config();
+        config.auth_url = Some(auth_url);
+        let response = build_router(config)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/customer/api-keys")
+                    .header(
+                        header::COOKIE,
+                        format!("{CUSTOMER_SESSION_COOKIE}=cookie-supabase-session"),
+                    )
+                    .header(CUSTOMER_ORG_HEADER, ORG_B)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer cookie-supabase-session")
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn unauthenticated_customer_mutations_fail_closed() {
@@ -2637,14 +2997,10 @@ mod tests {
             .await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+        // The catch-up endpoint is GET-only; mutation attempts never reach auth.
         assert_eq!(
-            post_json(
-                deny(),
-                "/api/customer/sync/api_keys",
-                r#"{"id":"x","op":"upsert"}"#
-            )
-            .await,
-            StatusCode::SERVICE_UNAVAILABLE
+            post_json(deny(), "/api/customer/sync/api_keys", "{}").await,
+            StatusCode::METHOD_NOT_ALLOWED
         );
     }
 
@@ -2770,6 +3126,7 @@ mod tests {
                     .method(method)
                     .uri(uri)
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(IDEMPOTENCY_KEY_HEADER, "test-request-1")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
             )
@@ -2987,8 +3344,9 @@ mod tests {
         assert!(body.contains("API Keys"));
         assert!(body.contains("Supabase-managed"));
         assert!(body.contains("Preferences"));
-        assert!(body.contains("node observability API is cluster-wide"));
-        assert!(!body.contains("checkout:tenant-42"));
+        assert!(body.contains("operator infrastructure controls live only in the admin app"));
+        assert!(!body.contains("Config KV"));
+        assert!(!body.contains("Service Discovery"));
     }
 
     #[tokio::test]
@@ -3011,12 +3369,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn htmx_locks_fragment_is_rendered() {
-        let (status, ct, body) = send("/app/fragments/locks").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(ct.contains("text/html"), "ct={ct}");
-        assert!(body.contains("not shown"));
-        assert!(!body.contains("checkout:tenant-42"));
+    async fn operator_pages_are_absent_from_the_customer_app() {
+        for uri in [
+            "/app/locks",
+            "/app/requests",
+            "/app/kv",
+            "/app/services",
+            "/app/fragments/locks",
+        ] {
+            let (status, _, body) = send(uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(body.contains("no quorum on this page"), "{uri}");
+            assert!(!body.contains("operator"), "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -3040,60 +3405,20 @@ mod tests {
         assert!(ct.contains("text/event-stream"), "ct={ct}");
     }
 
-    async fn post_sync(config: AppConfig, key: Option<&str>, base: i64) -> serde_json::Value {
-        let app = build_router(config);
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("/api/customer/sync/api_keys")
-            .header(header::CONTENT_TYPE, "application/json");
-        if let Some(k) = key {
-            builder = builder.header("idempotency-key", k);
-        }
-        let body = json!({ "id": "k1", "op": "upsert", "base_version": base }).to_string();
-        let resp = app
-            .oneshot(builder.body(Body::from(body)).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
     #[tokio::test]
-    async fn sync_write_requires_durable_storage_and_rejects_unknown_tables() {
-        let acked = post_sync(test_config(), None, 4).await;
-        assert_eq!(acked["error"], "sync_write_failed");
-
-        // A table with no implementation is rejected instead of acknowledging a
-        // write that was never persisted.
-        let app = build_router(test_config());
-        let resp = app
+    async fn customer_sync_is_read_only() {
+        let resp = build_router(test_config())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/customer/sync/customer_preferences")
+                    .uri("/api/customer/sync/api_keys")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({ "id": "p1", "base_version": 0 }).to_string(),
-                    ))
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn sync_write_idempotency_requires_durable_ledger() {
-        let config = test_config();
-        let first = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 7).await;
-        assert_eq!(first["error"], "idempotency_claim_failed");
-        let retry = post_sync(config.clone(), Some("api_keys:k1:upsert:7"), 999).await;
-        assert_eq!(retry["error"], "idempotency_claim_failed");
-        let other = post_sync(config.clone(), Some("api_keys:k2:upsert:2"), 2).await;
-        assert_eq!(other["error"], "idempotency_claim_failed");
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

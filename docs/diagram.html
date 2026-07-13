@@ -56,7 +56,8 @@ flowchart TB
   SIDE -->|"heartbeat + failure-domain"| BRAIN
   BRAIN -->|placement map| LB
   ADMIN -->|infra ops| BRAIN
-  AUTH --> SUPA[("Supabase / Postgres<br/>orgs · users · API keys")]
+  AUTH --> SUPA[("Supabase<br/>users · org membership")]
+  AUTH --> AUTHKV[("Fiducia KV<br/>API-key hashes · versions")]
   NODE -->|"Raft log + state machine"| DISK[("per-node disk / PVC<br/>RF = 3 replicas")]
   SIDE -. OTLP .-> OBS[("Tempo · Prometheus · Loki")]
     </pre></div>

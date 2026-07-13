@@ -1,9 +1,8 @@
 //! Customer session authentication for the `/api/customer/*` surface.
 //!
 //! Before this module these routes were unauthenticated: anyone on the internet
-//! could mint a live API key (and receive the plaintext secret) or drive the
-//! `/sync/:table` write path against arbitrary rows. They are now gated on a
-//! verified Supabase session and scoped to the caller's org.
+//! could mint a live API key (and receive the plaintext secret). They are now
+//! gated on a verified Supabase session and scoped to the caller's org.
 //!
 //! Verification is delegated to **fiducia-auth** (`GET /v1/me`) — the one place
 //! that verifies Supabase JWTs — rather than re-implementing JWKS crypto here.
@@ -27,23 +26,10 @@ pub const CUSTOMER_SESSION_COOKIE: &str = "fiducia_customer_session";
 #[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct CustomerCtx {
-    #[serde(default)]
     pub user_id: String,
-    #[serde(default)]
     pub email: Option<String>,
     /// Orgs the user belongs to (admin-controlled claims; see fiducia-auth).
-    #[serde(default)]
     pub orgs: Vec<String>,
-}
-
-impl CustomerCtx {
-    /// Caller's orgs parsed to UUIDs, for scoping SQL to rows they own.
-    pub fn org_uuids(&self) -> Vec<uuid::Uuid> {
-        self.orgs
-            .iter()
-            .filter_map(|o| uuid::Uuid::parse_str(o).ok())
-            .collect()
-    }
 }
 
 /// How a request is authenticated. Production verifies via fiducia-auth; tests
@@ -121,12 +107,23 @@ impl Authenticator {
                             body.get("user").cloned().unwrap_or(serde_json::Value::Null),
                         )
                         .map_err(|_| deny(StatusCode::BAD_GATEWAY, "auth_bad_response"))?;
+                        if ctx.user_id.trim().is_empty() {
+                            return Err(deny(StatusCode::BAD_GATEWAY, "auth_bad_response"));
+                        }
                         if ctx.orgs.is_empty() {
                             return Err(deny(StatusCode::FORBIDDEN, "no_org_membership"));
                         }
                         Ok(ctx)
                     }
-                    Ok(_) => Err(deny(StatusCode::UNAUTHORIZED, "invalid_or_expired_session")),
+                    Ok(r)
+                        if matches!(
+                            r.status(),
+                            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                        ) =>
+                    {
+                        Err(deny(StatusCode::UNAUTHORIZED, "invalid_or_expired_session"))
+                    }
+                    Ok(_) => Err(deny(StatusCode::SERVICE_UNAVAILABLE, "auth_unavailable")),
                     Err(_) => Err(deny(StatusCode::SERVICE_UNAVAILABLE, "auth_unreachable")),
                 }
             }

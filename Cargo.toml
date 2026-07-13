@@ -12,13 +12,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 maud = { version = "0.26", features = ["axum"] }
 async-stream = "0.3"
-tower-http = { version = "0.5", features = ["trace", "fs", "timeout", "limit", "catch-panic", "set-header"] }
+tower-http = { version = "0.5", features = ["trace", "fs", "timeout", "limit", "catch-panic", "set-header", "cors"] }
 # Verifies the customer's Supabase session by calling fiducia-auth `GET /v1/me`
 # (the single source of truth for session verification), so /api/customer/*
 # mutations are authenticated + org-scoped instead of open to the internet.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Typed ORM for the customer api_keys data access (over the existing sqlx pool).
-# No migration tooling — the schema is declarative (fiducia-interfaces/sql).
+# Typed ORM and connection manager for customer profile/session persistence.
+# API-key lifecycle lives in fiducia-auth, not this database.
 sea-orm = { version = "1.1", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono", "with-json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -30,18 +30,10 @@ fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.
 # the one source of truth for the types every fiducia service speaks.
 fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 
-# Generated sqlx::FromRow row types for the customer Postgres plane. The api_keys
-# vertical reads/writes these against the customer DB when DATABASE_URL is set.
+# Generated customer-plane contract row types returned by the SeaORM store.
 fiducia-interfaces-db = { path = "../fiducia-interfaces/generated/rust-db" }
 
-# The local-first sync protocol core (native build, no wasm). The server builds
-# its `fiducia:sync` change frames and write-acks from THESE types, so the backend
-# and the @fiducia/sync browser client share exactly one protocol definition.
-fiducia-sync-core = { path = "../fiducia-sync" }
-
 uuid = { version = "1", features = ["serde", "v4"] }
-# Never persist a raw API-key secret — store only a SHA-256 hash of it.
-sha2 = "0.10"
 
 [dev-dependencies]
 # `ServiceExt::oneshot` drives the router in tests without binding a socket.

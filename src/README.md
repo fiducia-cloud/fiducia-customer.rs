@@ -6,15 +6,19 @@ The customer MASH server is a bin-only crate (no `lib.rs`).
   - health/info probes (`/healthz`, `/api/health`, `/api/info`);
   - server-mediated Supabase login/logout and the isolated customer cookie;
   - the customer portal, rendered server-side with Maud and refreshed with the
-    vendored HTMX bundle (`/app`, `/app/*`);
-  - Postgres-backed API keys, users, preferences, sessions, and the durable
-    `@fiducia/sync` write/idempotency path (`/api/customer/...`);
-  - customer-safe coordination fragments that explicitly withhold cluster-wide
-    locks, metrics, KV, and discovery data until a tenant-scoped API exists;
+    vendored HTMX bundle (`/app`, `/app/*`), plus authenticated WebSocket/SSE
+    endpoints that push non-sensitive refresh events;
+  - Postgres-backed users, preferences, and user-scoped session observations;
+  - the authenticated, organization-scoped customer BFF for API-key
+    list/create/rotate/revoke and read-only `@fiducia/sync` hydration; key
+    authority and idempotent lifecycle state remain in `fiducia-auth`;
+  - no cluster-wide locks, metrics, KV, or discovery routes; those controls
+    belong only to `fiducia-admin.rs`;
 - **`auth.rs`** — accepts the customer cookie or bearer token and delegates
   verification to `fiducia-auth`; admin cookies are deliberately ignored.
-- **`store.rs`** — SeaORM-owned customer CRUD, tenant scoping, and durable sync
-  idempotency over the canonical `fiducia-interfaces` schema.
+- **`store.rs`** — SeaORM-owned customer profile, preference, and local-session
+  CRUD over the canonical `fiducia-interfaces` schema. Credential storage is
+  intentionally absent.
 - **`entity/`** — SeaORM models for customer tables.
 
 The static-file fallback serves only the built Astro marketing site

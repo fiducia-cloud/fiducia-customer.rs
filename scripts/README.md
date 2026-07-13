@@ -1,14 +1,8 @@
 # scripts
 
-SQL against the **customer Postgres plane** that backs the `api_keys` vertical
-(used when `DATABASE_URL` is set). Review before running — these touch customer
-data/schema.
+The customer BFF does not seed or migrate API-key rows: `fiducia-auth` owns the
+entire credential lifecycle and durable key policy.
 
-- **`seed-customer.sql`** — idempotent seed: one org plus a few `api_keys` rows so
-  `GET /api/customer/api-keys` returns real DB rows for local/portal development.
-- **`2026-07-add-require-idempotency.sql`** — compatibility migration for older
-  customer databases. Fresh databases receive the same column from the canonical
-  `fiducia-interfaces/sql/customer.sql`; SeaORM binds and reads it.
 - **`with-flags2env.sh`** — bridges CLI flags to the environment variables this
     backend reads (`PORT`, marketing `STATIC_DIR`, `FIDUCIA_*`, and public
     `SUPABASE_*` settings). Database credentials and debug auth remain
