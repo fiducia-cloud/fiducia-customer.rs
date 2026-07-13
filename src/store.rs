@@ -9,7 +9,7 @@
 //! DB-behavior tests in `tests/api_keys_store.rs` pin this seam's semantics so an
 //! engine swap (raw SQL → ORM) is provably behaviour-preserving.
 
-use fiducia_interfaces_db::customer::ApiKeysRow;
+use fiducia_interfaces_db::customer::{ApiKeysRow, CustomerPreferencesRow, CustomerSessionsRow};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -279,11 +279,12 @@ pub async fn ensure_user(
 pub async fn get_preferences(
     pool: &PgPool,
     user_id: Uuid,
-) -> Result<Option<prefs::Model>, sqlx::Error> {
-    prefs::Entity::find_by_id(user_id)
+) -> Result<Option<CustomerPreferencesRow>, sqlx::Error> {
+    Ok(prefs::Entity::find_by_id(user_id)
         .one(&orm(pool))
         .await
-        .map_err(map_err)
+        .map_err(map_err)?
+        .map(prefs::Model::into_row))
 }
 
 /// Upsert the user's preferences and return the committed row (trigger bumps
@@ -298,7 +299,7 @@ pub async fn upsert_preferences(
     notify_key_rotation: bool,
     notify_lock_contention: bool,
     notify_mfa: bool,
-) -> Result<prefs::Model, sqlx::Error> {
+) -> Result<CustomerPreferencesRow, sqlx::Error> {
     let conn = orm(pool);
     if let Some(existing) = prefs::Entity::find_by_id(user_id)
         .one(&conn)
@@ -312,7 +313,7 @@ pub async fn upsert_preferences(
         am.notify_key_rotation = Set(notify_key_rotation);
         am.notify_lock_contention = Set(notify_lock_contention);
         am.notify_mfa = Set(notify_mfa);
-        am.update(&conn).await.map_err(map_err)
+        am.update(&conn).await.map_err(map_err).map(prefs::Model::into_row)
     } else {
         prefs::ActiveModel {
             user_id: Set(user_id),
@@ -327,17 +328,24 @@ pub async fn upsert_preferences(
         .insert(&conn)
         .await
         .map_err(map_err)
+        .map(prefs::Model::into_row)
     }
 }
 
 /// The user's trusted sessions, most-recently-seen first.
-pub async fn list_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<sess::Model>, sqlx::Error> {
-    sess::Entity::find()
+pub async fn list_sessions(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<CustomerSessionsRow>, sqlx::Error> {
+    Ok(sess::Entity::find()
         .filter(sess::Column::UserId.eq(user_id))
         .order_by_desc(sess::Column::LastSeen)
         .all(&orm(pool))
         .await
-        .map_err(map_err)
+        .map_err(map_err)?
+        .into_iter()
+        .map(sess::Model::into_row)
+        .collect())
 }
 
 /// Revoke a user's session by device label (soft: `status = 'revoked'`, scoped to

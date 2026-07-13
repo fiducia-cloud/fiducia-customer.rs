@@ -21,3 +21,19 @@ pub struct Model {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+
+impl Model {
+    /// Map to the shared `fiducia-interfaces` contract row.
+    pub fn into_row(self) -> fiducia_interfaces_db::customer::CustomerSessionsRow {
+        fiducia_interfaces_db::customer::CustomerSessionsRow {
+            id: self.id,
+            user_id: self.user_id,
+            device: self.device,
+            location: self.location,
+            last_seen: self.last_seen.into(),
+            status: self.status,
+            updated_at: self.updated_at.into(),
+            version: self.version,
+        }
+    }
+}

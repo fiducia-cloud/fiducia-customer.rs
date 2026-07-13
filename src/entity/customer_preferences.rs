@@ -23,3 +23,21 @@ pub struct Model {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+
+impl Model {
+    /// Map to the shared `fiducia-interfaces` contract row, so the store seam
+    /// returns the one type every fiducia service speaks (like `ApiKeysRow`).
+    pub fn into_row(self) -> fiducia_interfaces_db::customer::CustomerPreferencesRow {
+        fiducia_interfaces_db::customer::CustomerPreferencesRow {
+            user_id: self.user_id,
+            density: self.density,
+            timezone: self.timezone,
+            region: self.region,
+            notify_key_rotation: self.notify_key_rotation,
+            notify_lock_contention: self.notify_lock_contention,
+            notify_mfa: self.notify_mfa,
+            updated_at: self.updated_at.into(),
+            version: self.version,
+        }
+    }
+}
