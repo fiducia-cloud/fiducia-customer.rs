@@ -470,9 +470,16 @@ fn apply_sensitive_response_headers(headers: &mut HeaderMap) {
             "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'self'",
         ),
     );
+    // `same-origin`, NOT `no-referrer`: under `no-referrer` a browser
+    // serializes the Origin of any non-GET request (form POST, SPA fetch) as
+    // `null`, so `require_same_origin` / `require_api_host` would reject every
+    // real-browser mutation while hand-crafted clients that set Origin
+    // themselves pass — the inversion of the intent. `same-origin` still never
+    // leaks the referrer cross-origin and keeps Origin intact for the gate.
+    // Proven by the real-Chromium journeys in fiducia-e2e (npm run test:browser).
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
 }
 
