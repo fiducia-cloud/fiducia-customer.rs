@@ -56,6 +56,8 @@ const CORS_MAX_AGE_SECS: u64 = 10 * 60;
 const MAX_API_KEY_NAME_CHARS: usize = 100;
 const MAX_TIMEZONE_CHARS: usize = 64;
 const MAX_SESSION_DEVICE_CHARS: usize = 200;
+const DEFAULT_ACTIVITY_LIMIT: u64 = 50;
+const MAX_ACTIVITY_LIMIT: u64 = 100;
 
 const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin1", "syd1"];
 
@@ -255,6 +257,7 @@ fn build_router(config: AppConfig) -> Router {
             "/api/customer/security/sessions/revoke",
             axum::routing::post(revoke_customer_security_session),
         )
+        .route("/api/customer/activity", get(customer_activity_json))
         .route("/", get(root))
         .route("/app", get(customer_home))
         .route("/app/", get(customer_home))
@@ -274,6 +277,7 @@ fn build_router(config: AppConfig) -> Router {
             axum::routing::post(revoke_customer_api_key_form),
         )
         .route("/app/security", get(customer_security))
+        .route("/app/activity", get(customer_activity))
         .route(
             "/app/security/sessions/revoke",
             axum::routing::post(revoke_customer_session_form),
@@ -298,6 +302,7 @@ fn build_router(config: AppConfig) -> Router {
             "/app/fragments/security-sessions",
             get(customer_sessions_fragment),
         )
+        .route("/app/fragments/activity", get(customer_activity_fragment))
         // Generated API docs (AGENTS.md "API Docs Contract").
         .route("/docs/api", get(api_docs_html))
         .route("/api/docs", get(api_docs_html))
@@ -896,6 +901,14 @@ struct CustomerOrgSelection {
     org_id: Option<String>,
 }
 
+/// Optional page size for the customer activity API. It is bounded before the
+/// SeaORM query so a browser-controlled query string cannot create an unbounded
+/// audit-log read.
+#[derive(Debug, Default, Deserialize)]
+struct CustomerActivityQuery {
+    limit: Option<u16>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CustomerPreferences {
     region: String,
@@ -904,6 +917,18 @@ struct CustomerPreferences {
     notify_lock_contention: bool,
     notify_key_rotation: bool,
     notify_mfa: bool,
+}
+
+/// Deliberately small customer-facing view of an audit record. In particular,
+/// diagnostic metadata, source addresses, and user agents remain server-only.
+#[derive(Clone, Debug, Serialize)]
+struct CustomerAuditEvent {
+    id: Uuid,
+    actor: Option<String>,
+    action: String,
+    target: Option<String>,
+    request_id: Option<String>,
+    created_at: String,
 }
 
 #[allow(clippy::result_large_err)] // Axum handlers return the framework Response directly.
@@ -1724,6 +1749,72 @@ async fn customer_security_sessions_json(
     Json(json!({ "sessions": sessions_json, "revoke_supported": true })).into_response()
 }
 
+fn customer_activity_limit(requested: Option<u16>) -> u64 {
+    requested
+        .map(u64::from)
+        .unwrap_or(DEFAULT_ACTIVITY_LIMIT)
+        .clamp(1, MAX_ACTIVITY_LIMIT)
+}
+
+fn customer_audit_event(row: crate::entity::audit_log::Model) -> CustomerAuditEvent {
+    CustomerAuditEvent {
+        id: row.id,
+        actor: row.actor,
+        action: row.action,
+        target: row.target,
+        request_id: row.request_id,
+        created_at: row.created_at.to_rfc3339(),
+    }
+}
+
+/// Load activity only after the authenticated Supabase identity has selected an
+/// organization it is actually a member of. The canonical schema's indexed
+/// `org_id` predicate is the second tenant boundary below the auth claim.
+async fn customer_activity_events(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    customer: &CustomerCtx,
+    explicit_org: Option<&str>,
+    limit: u64,
+) -> Result<Vec<CustomerAuditEvent>, Response> {
+    let org_id = selected_customer_org_from(customer, headers, explicit_org)?;
+    let org_id = Uuid::parse_str(&org_id).map_err(|_| {
+        dependency_error(
+            "fiducia-auth",
+            "invalid_verified_org_id",
+            "verified organization membership was not a UUID",
+        )
+    })?;
+    let pool = customer_pool(config)?;
+    let rows = store::list_audit_events(pool, org_id, limit)
+        .await
+        .map_err(|error| dependency_error("postgres", "activity_list_failed", error))?;
+    Ok(rows.into_iter().map(customer_audit_event).collect())
+}
+
+async fn customer_activity_json(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(query): Query<CustomerActivityQuery>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    match customer_activity_events(
+        &config,
+        &headers,
+        &customer,
+        None,
+        customer_activity_limit(query.limit),
+    )
+    .await
+    {
+        Ok(events) => no_store_json(StatusCode::OK, json!({ "events": events })),
+        Err(response) => response,
+    }
+}
+
 async fn revoke_customer_security_session(
     State(config): State<AppConfig>,
     headers: HeaderMap,
@@ -1856,6 +1947,29 @@ async fn customer_sessions_fragment(
         Err(response) => return response,
     };
     sessions_fragment_markup(&config, &customer, None).await
+}
+
+async fn customer_activity_fragment(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    match customer_activity_events(
+        &config,
+        &headers,
+        &customer,
+        selection.org_id.as_deref(),
+        DEFAULT_ACTIVITY_LIMIT,
+    )
+    .await
+    {
+        Ok(events) => customer_activity_table_markup(&events).into_response(),
+        Err(response) => response,
+    }
 }
 
 async fn revoke_customer_session_form(
@@ -2030,6 +2144,20 @@ async fn customer_security(
         &config,
         &headers,
         CustomerTab::Security,
+        selection.org_id.as_deref(),
+    )
+    .await
+}
+
+async fn customer_activity(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    customer_page_response(
+        &config,
+        &headers,
+        CustomerTab::Activity,
         selection.org_id.as_deref(),
     )
     .await
@@ -2467,7 +2595,11 @@ fn host_serves_customer_app(
 }
 
 fn should_serve_customer_app(config: &AppConfig, headers: &HeaderMap) -> bool {
-    host_serves_customer_app(headers, &config.customer_app_host, config.customer_site_mode)
+    host_serves_customer_app(
+        headers,
+        &config.customer_app_host,
+        config.customer_site_mode,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2476,16 +2608,18 @@ enum CustomerTab {
     Auth,
     ApiKeys,
     Security,
+    Activity,
     Settings,
 }
 
 impl CustomerTab {
-    fn all() -> [CustomerTab; 5] {
+    fn all() -> [CustomerTab; 6] {
         [
             CustomerTab::Dashboard,
             CustomerTab::Auth,
             CustomerTab::ApiKeys,
             CustomerTab::Security,
+            CustomerTab::Activity,
             CustomerTab::Settings,
         ]
     }
@@ -2496,6 +2630,7 @@ impl CustomerTab {
             CustomerTab::Auth => "/app/auth",
             CustomerTab::ApiKeys => "/app/api-keys",
             CustomerTab::Security => "/app/security",
+            CustomerTab::Activity => "/app/activity",
             CustomerTab::Settings => "/app/settings",
         }
     }
@@ -2506,6 +2641,7 @@ impl CustomerTab {
             CustomerTab::Auth => "Account",
             CustomerTab::ApiKeys => "API Keys",
             CustomerTab::Security => "Security",
+            CustomerTab::Activity => "Activity",
             CustomerTab::Settings => "Settings",
         }
     }
@@ -2516,6 +2652,7 @@ impl CustomerTab {
             CustomerTab::Auth => "Your Supabase identity, verified organization membership, and isolated customer session.",
             CustomerTab::ApiKeys => "Create, rotate, scope, and audit customer API keys for production integrations.",
             CustomerTab::Security => "Two-factor authentication, trusted sessions, recovery, and account protection.",
+            CustomerTab::Activity => "Organization-scoped account and API activity from the durable customer audit log.",
             CustomerTab::Settings => "Preferences, notifications, default region, and team-level customer settings.",
         }
     }
@@ -2631,6 +2768,7 @@ fn customer_tab_content(
         CustomerTab::Auth => auth_markup(customer, csrf_token),
         CustomerTab::ApiKeys => api_keys_markup(org_id, csrf_token),
         CustomerTab::Security => security_markup(org_id),
+        CustomerTab::Activity => activity_markup(org_id),
         CustomerTab::Settings => settings_markup(org_id),
     }
 }
@@ -2851,6 +2989,67 @@ fn security_markup(org_id: &str) -> Markup {
         }
         div id="security-sessions" hx-get=(fragment_href) hx-trigger="load" hx-swap="innerHTML" {
             p class="muted" { "Loading trusted sessions…" }
+        }
+    }
+}
+
+fn activity_markup(org_id: &str) -> Markup {
+    let fragment_href = format!(
+        "/app/fragments/activity?org_id={}",
+        encode_query_value(org_id)
+    );
+    html! {
+        section class="panel" aria-labelledby="activity-heading" {
+            div class="panel__header" {
+                h2 id="activity-heading" { "Organization activity" }
+                span { "audit log" }
+            }
+            p class="muted" {
+                "Only records for the organization selected from your verified Supabase membership are shown. "
+                "Network addresses, user agents, and internal audit metadata are never exposed here."
+            }
+        }
+        div id="customer-activity" hx-get=(fragment_href) hx-trigger="load" hx-swap="innerHTML" {
+            p class="muted" { "Loading organization activity…" }
+        }
+    }
+}
+
+fn customer_activity_table_markup(events: &[CustomerAuditEvent]) -> Markup {
+    html! {
+        section class="panel" aria-labelledby="activity-table-heading" {
+            div class="panel__header" {
+                h2 id="activity-table-heading" { "Recent activity" }
+                span { (events.len()) " shown" }
+            }
+            div class="table-wrap" {
+                table {
+                    thead {
+                        tr {
+                            th { "When" }
+                            th { "Actor" }
+                            th { "Action" }
+                            th { "Target" }
+                            th { "Request" }
+                        }
+                    }
+                    tbody {
+                        @if events.is_empty() {
+                            tr { td colspan="5" class="muted" { "No customer-visible activity is recorded for this organization yet." } }
+                        } @else {
+                            @for event in events {
+                                tr {
+                                    td { (event.created_at) }
+                                    td { (event.actor.as_deref().unwrap_or("system")) }
+                                    td { code { (&event.action) } }
+                                    td { (event.target.as_deref().unwrap_or("—")) }
+                                    td { code { (event.request_id.as_deref().unwrap_or("—")) } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -4020,6 +4219,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn customer_activity_requires_database() {
+        // Auth is static in this unit test, but the activity route must still
+        // fail closed rather than inventing an empty tenant audit feed.
+        let (status, _, _) = send("/api/customer/activity?limit=0").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn docs_api_and_alias_serve_html() {
         for uri in ["/docs/api", "/api/docs"] {
             let (status, ct, body) = send(uri).await;
@@ -4123,6 +4330,7 @@ mod tests {
             ("/app/signup", "Organization membership"),
             ("/app/api-keys", "Create API key"),
             ("/app/security", "provider managed"),
+            ("/app/activity", "Organization activity"),
             ("/app/settings", "Loading persisted preferences"),
             ("/app/preferences", "Loading persisted preferences"),
         ];

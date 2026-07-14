@@ -5,11 +5,11 @@
 use fiducia_interfaces_db::customer::{CustomerPreferencesRow, CustomerSessionsRow};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter, QueryOrder,
+    QueryFilter, QueryOrder, QuerySelect,
 };
 use uuid::Uuid;
 
-use crate::entity::{customer_preferences as prefs, customer_sessions as sess, users};
+use crate::entity::{audit_log, customer_preferences as prefs, customer_sessions as sess, users};
 
 /// Ensure a local `users` row exists for the authenticated Supabase user and
 /// return its id. Supabase remains the source of truth for identity.
@@ -102,6 +102,22 @@ pub async fn list_sessions(
         .into_iter()
         .map(sess::Model::into_row)
         .collect())
+}
+
+/// Read a bounded, organization-scoped activity feed. The caller has already
+/// established membership from the verified Supabase session; this query adds
+/// the database-side org predicate so one tenant can never read another's log.
+pub async fn list_audit_events(
+    db: &DatabaseConnection,
+    org_id: Uuid,
+    limit: u64,
+) -> Result<Vec<audit_log::Model>, DbErr> {
+    audit_log::Entity::find()
+        .filter(audit_log::Column::OrgId.eq(org_id))
+        .order_by_desc(audit_log::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await
 }
 
 /// Revoke a user's locally observed session record by device label (soft:

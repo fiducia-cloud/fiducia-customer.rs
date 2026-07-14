@@ -79,6 +79,7 @@ the auth service.
 | `POST /app/api-keys/revoke` | replay-safe HTMX revocation |
 | `POST /app/settings` | SeaORM preference persistence |
 | `POST /app/security/sessions/revoke` | user-scoped local session audit update |
+| `GET /app/activity`, `GET /api/customer/activity` | verified-org, bounded audit activity; sensitive diagnostics excluded |
 | `GET/POST /api/customer/*` | authenticated JSON customer BFF |
 | `GET /app/ws`, `GET /app/events` | authenticated non-sensitive refresh heartbeat |
 | `GET /healthz`, `GET /api/health` | health probes |
@@ -103,6 +104,30 @@ The schema source of truth is
 [`fiducia-interfaces/sql/customer.sql`](../fiducia-interfaces/sql/customer.sql).
 Real Postgres tests use `TEST_DATABASE_URL` when supplied and otherwise skip
 without inventing database state.
+
+### Declarative Supabase migrations
+
+The operator workflow is [`scripts/dpm-schema.sh`](scripts/dpm-schema.sh), built
+around [`dpm`](https://github.com/declarative-migrations/declarative-postgres-migrate.rs).
+It materializes the canonical SQL as the desired catalog, compares it with the
+customer Supabase database, and uses a shadow database to prove convergence.
+Use the Supabase direct connection (or session pooler on port 5432), never the
+transaction pooler on port 6543.
+
+```sh
+cargo install --git https://github.com/declarative-migrations/declarative-postgres-migrate.rs --locked
+DATABASE_URL=postgres://customer-target \
+SHADOW_DATABASE_URL=postgres://scratch-admin \
+scripts/dpm-schema.sh diff
+
+DATABASE_URL=postgres://customer-target \
+SHADOW_DATABASE_URL=postgres://scratch-admin \
+scripts/dpm-schema.sh verify
+```
+
+`verify` does not write the target. Only after reviewed output has verified can
+an operator set `DPM_APPLY_APPROVED=1` and run `scripts/dpm-schema.sh apply`.
+The wrapper never opts into DPM's separate destructive-operation consent.
 
 ## Run locally
 
