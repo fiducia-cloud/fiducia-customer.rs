@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Converge the canonical customer-plane schema onto a Supabase Postgres target.
-# This wrapper deliberately keeps credentials in environment variables and makes
-# target mutation an explicit second decision after diff/verify have passed.
+# This wrapper keeps credentials in environment variables and makes target
+# mutation an explicit second decision after diff/verify have passed.
+#
+# dpm's CLI flags (--source/--target/--shadow/--schemas) are the flags-2-env
+# front end; the installed binary itself reads the ENVIRONMENT VARIABLES those
+# flags map to (SOURCE_SQL_FILE, TARGET_DATABASE_URL, SHADOW_DATABASE_URL,
+# DPM_SCHEMAS, DPM_YES). We set those directly so this works against a plain
+# `dpm` install without the flags-2-env shim.
 set -euo pipefail
 
 command=${1:-verify}
@@ -32,24 +38,34 @@ if [[ ! -f "$schema" ]]; then
   exit 66
 fi
 
-common=(--source "$schema" --target "$DATABASE_URL" --shadow "$SHADOW_DATABASE_URL" --schemas public)
+# The declarative schema file is the desired state; the live Supabase database is
+# the current state; the shadow server is where dpm materializes the .sql source
+# and rehearses. Scope to `public` so managed Supabase schemas (auth, storage, …)
+# are never diffed. Set TARGET_DATABASE_URL explicitly rather than relying on the
+# DATABASE_URL fallback so the target is unambiguous.
+export SOURCE_SQL_FILE="$schema"
+export TARGET_DATABASE_URL="$DATABASE_URL"
+export SHADOW_DATABASE_URL="$SHADOW_DATABASE_URL"
+export DPM_SCHEMAS="${DPM_SCHEMAS:-public}"
 
 case "$command" in
   diff)
-    exec "$dpm_bin" diff "${common[@]}"
+    exec "$dpm_bin" diff
     ;;
   verify)
     # `verify` never writes the real target: it rehearses the generated plan on
     # a shadow replica and proves the post-apply catalog converges.
-    exec "$dpm_bin" verify "${common[@]}"
+    exec "$dpm_bin" verify
     ;;
   apply)
-    # DPM itself refuses destructive operations unless separate destructive
-    # consent is supplied. This wrapper never supplies that consent.
+    # dpm refuses destructive operations unless separate destructive consent is
+    # supplied; this wrapper never supplies it. Non-destructive convergence
+    # (new tables/columns/indexes) still requires an explicit human opt-in here.
     if [[ ${DPM_APPLY_APPROVED:-} != 1 ]]; then
       printf '%s\n' "refusing apply: run diff and verify first, then set DPM_APPLY_APPROVED=1" >&2
       exit 77
     fi
-    exec "$dpm_bin" apply "${common[@]}" --yes
+    export DPM_YES=1
+    exec "$dpm_bin" apply
     ;;
 esac
