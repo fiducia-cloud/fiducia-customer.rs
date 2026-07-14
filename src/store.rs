@@ -148,6 +148,93 @@ pub async fn revoke_session(
     Ok(true)
 }
 
+/// The signed-in user's most recent notifications, newest first. Bounded by
+/// `limit` and always scoped to `user_id` at the database, so one user can
+/// never read another's feed even if a caller passes a foreign id.
+pub async fn list_notifications(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    limit: u64,
+) -> Result<Vec<notif::Model>, DbErr> {
+    notif::Entity::find()
+        .filter(notif::Column::UserId.eq(user_id))
+        .order_by_desc(notif::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+/// Count the user's unread notifications (for the nav badge).
+pub async fn unread_notification_count(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+) -> Result<u64, DbErr> {
+    notif::Entity::find()
+        .filter(notif::Column::UserId.eq(user_id))
+        .filter(notif::Column::ReadAt.is_null())
+        .count(db)
+        .await
+}
+
+/// Mark one notification read, scoped to the owner. Returns `false` when no
+/// matching unread row exists (already read, or not this user's). The BEFORE
+/// UPDATE trigger bumps `version`/`updated_at`/`sync_sequence`, so the change
+/// propagates through the sync catch-up cursor like any other row edit.
+pub async fn mark_notification_read(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    id: Uuid,
+) -> Result<bool, DbErr> {
+    let Some(model) = notif::Entity::find_by_id(id)
+        .filter(notif::Column::UserId.eq(user_id))
+        .filter(notif::Column::ReadAt.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let mut active: notif::ActiveModel = model.into();
+    active.read_at = Set(Some(sea_orm::prelude::DateTimeWithTimeZone::from(
+        chrono_now(),
+    )));
+    active.update(db).await?;
+    Ok(true)
+}
+
+/// Deliver a notification to a user. Server-authoritative: callers are trusted
+/// internal code paths (key-rotation reminders, contention alerts), never the
+/// browser. `sync_sequence` is assigned by the trigger.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_notification(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    org_id: Option<Uuid>,
+    kind: &str,
+    severity: &str,
+    title: &str,
+    body: &str,
+    link: Option<&str>,
+) -> Result<notif::Model, DbErr> {
+    notif::ActiveModel {
+        user_id: Set(user_id),
+        org_id: Set(org_id),
+        kind: Set(kind.to_string()),
+        severity: Set(severity.to_string()),
+        title: Set(title.to_string()),
+        body: Set(body.to_string()),
+        link: Set(link.map(str::to_string)),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+}
+
+/// `now()` as a fixed-offset timestamp. Kept in one place so tests and prod
+/// agree on the type SeaORM expects for `timestamptz` columns.
+fn chrono_now() -> sea_orm::prelude::DateTimeWithTimeZone {
+    sea_orm::prelude::DateTimeWithTimeZone::from(std::time::SystemTime::now())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
