@@ -278,6 +278,11 @@ fn build_router(config: AppConfig) -> Router {
         )
         .route("/app/security", get(customer_security))
         .route("/app/activity", get(customer_activity))
+        .route("/app/notifications", get(customer_notifications))
+        .route(
+            "/app/notifications/read",
+            axum::routing::post(read_customer_notification_form),
+        )
         .route(
             "/app/security/sessions/revoke",
             axum::routing::post(revoke_customer_session_form),
