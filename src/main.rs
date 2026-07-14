@@ -3111,6 +3111,94 @@ fn activity_markup(org_id: &str) -> Markup {
     }
 }
 
+fn notifications_markup(org_id: &str) -> Markup {
+    let fragment_href = format!(
+        "/app/fragments/notifications?org_id={}",
+        encode_query_value(org_id)
+    );
+    html! {
+        section class="panel" aria-labelledby="notifications-heading" {
+            div class="panel__header" {
+                h2 id="notifications-heading" { "Your notifications" }
+                span { "account feed" }
+            }
+            p class="muted" {
+                "Key-rotation reminders, lock-contention alerts, MFA nudges, and operator notices "
+                "delivered to your account. Delivery preferences live under Settings."
+            }
+        }
+        div id="customer-notifications" hx-get=(fragment_href) hx-trigger="load" hx-swap="innerHTML" {
+            p class="muted" { "Loading notifications…" }
+        }
+    }
+}
+
+fn notifications_table_markup(
+    notifications: &[entity::customer_notifications::Model],
+    message: Option<&str>,
+    csrf_token: &str,
+) -> Markup {
+    let unread = notifications.iter().filter(|n| n.read_at.is_none()).count();
+    html! {
+        section class="panel" aria-labelledby="notifications-table-heading" {
+            div class="panel__header" {
+                h2 id="notifications-table-heading" { "Recent notifications" }
+                span { (unread) " unread / " (notifications.len()) " shown" }
+            }
+            @if let Some(message) = message {
+                p class="inline-message" role="status" { (message) }
+            }
+            div class="table-wrap" {
+                table {
+                    thead {
+                        tr {
+                            th { "When" }
+                            th { "Severity" }
+                            th { "Notification" }
+                            th { "State" }
+                            th { "Action" }
+                        }
+                    }
+                    tbody {
+                        @if notifications.is_empty() {
+                            tr { td colspan="5" class="muted" { "You have no notifications." } }
+                        } @else {
+                            @for note in notifications {
+                                tr {
+                                    td { (note.created_at.to_rfc3339()) }
+                                    td { span class="status-pill" data-severity=(&note.severity) { (&note.severity) } }
+                                    td {
+                                        strong { (&note.title) }
+                                        @if !note.body.is_empty() {
+                                            div class="muted" { (&note.body) }
+                                        }
+                                        @if let Some(link) = &note.link {
+                                            div { a href=(link) { "View" } }
+                                        }
+                                    }
+                                    td { @if note.read_at.is_some() { "read" } @else { "unread" } }
+                                    td {
+                                        @if note.read_at.is_none() {
+                                            form method="post" action="/app/notifications/read"
+                                                hx-post="/app/notifications/read"
+                                                hx-target="#customer-notifications"
+                                                hx-swap="innerHTML" {
+                                                input type="hidden" name="csrf_token" value=(csrf_token);
+                                                input type="hidden" name="id" value=(note.id.to_string());
+                                                button type="submit" { "Mark read" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn customer_activity_table_markup(events: &[CustomerAuditEvent]) -> Markup {
     html! {
         section class="panel" aria-labelledby="activity-table-heading" {
