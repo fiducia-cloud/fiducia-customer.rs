@@ -2774,6 +2774,7 @@ fn customer_tab_content(
         CustomerTab::ApiKeys => api_keys_markup(org_id, csrf_token),
         CustomerTab::Security => security_markup(org_id),
         CustomerTab::Activity => activity_markup(org_id),
+        CustomerTab::Notifications => notifications_markup(org_id),
         CustomerTab::Settings => settings_markup(org_id),
     }
 }
