@@ -201,7 +201,10 @@ pub async fn mark_notification_read(
 
 /// Deliver a notification to a user. Server-authoritative: callers are trusted
 /// internal code paths (key-rotation reminders, contention alerts), never the
-/// browser. `sync_sequence` is assigned by the trigger.
+/// browser. `sync_sequence` is assigned by the trigger. Exercised by the store
+/// tests; the production delivery jobs that call it are not yet wired, hence
+/// `allow(dead_code)`.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub async fn create_notification(
     db: &DatabaseConnection,
