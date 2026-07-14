@@ -5,11 +5,14 @@
 use fiducia_interfaces_db::customer::{CustomerPreferencesRow, CustomerSessionsRow};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use uuid::Uuid;
 
-use crate::entity::{audit_log, customer_preferences as prefs, customer_sessions as sess, users};
+use crate::entity::{
+    audit_log, customer_notifications as notif, customer_preferences as prefs,
+    customer_sessions as sess, users,
+};
 
 /// Ensure a local `users` row exists for the authenticated Supabase user and
 /// return its id. Supabase remains the source of truth for identity.
@@ -145,6 +148,88 @@ pub async fn revoke_session(
     Ok(true)
 }
 
+/// The signed-in user's most recent notifications, newest first. Bounded by
+/// `limit` and always scoped to `user_id` at the database, so one user can
+/// never read another's feed even if a caller passes a foreign id.
+pub async fn list_notifications(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    limit: u64,
+) -> Result<Vec<notif::Model>, DbErr> {
+    notif::Entity::find()
+        .filter(notif::Column::UserId.eq(user_id))
+        .order_by_desc(notif::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+/// Count the user's unread notifications (for the nav badge).
+pub async fn unread_notification_count(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+) -> Result<u64, DbErr> {
+    notif::Entity::find()
+        .filter(notif::Column::UserId.eq(user_id))
+        .filter(notif::Column::ReadAt.is_null())
+        .count(db)
+        .await
+}
+
+/// Mark one notification read, scoped to the owner. Returns `false` when no
+/// matching unread row exists (already read, or not this user's). The BEFORE
+/// UPDATE trigger bumps `version`/`updated_at`/`sync_sequence`, so the change
+/// propagates through the sync catch-up cursor like any other row edit.
+pub async fn mark_notification_read(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    id: Uuid,
+) -> Result<bool, DbErr> {
+    let Some(model) = notif::Entity::find_by_id(id)
+        .filter(notif::Column::UserId.eq(user_id))
+        .filter(notif::Column::ReadAt.is_null())
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let mut active: notif::ActiveModel = model.into();
+    active.read_at = Set(Some(chrono::Utc::now().into()));
+    active.update(db).await?;
+    Ok(true)
+}
+
+/// Deliver a notification to a user. Server-authoritative: callers are trusted
+/// internal code paths (key-rotation reminders, contention alerts), never the
+/// browser. `sync_sequence` is assigned by the trigger. Exercised by the store
+/// tests; the production delivery jobs that call it are not yet wired, hence
+/// `allow(dead_code)`.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_notification(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    org_id: Option<Uuid>,
+    kind: &str,
+    severity: &str,
+    title: &str,
+    body: &str,
+    link: Option<&str>,
+) -> Result<notif::Model, DbErr> {
+    notif::ActiveModel {
+        user_id: Set(user_id),
+        org_id: Set(org_id),
+        kind: Set(kind.to_string()),
+        severity: Set(severity.to_string()),
+        title: Set(title.to_string()),
+        body: Set(body.to_string()),
+        link: Set(link.map(str::to_string)),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +345,59 @@ mod tests {
         assert!(!revoke_session(&db, mine, &device).await.unwrap());
         assert_eq!(list_sessions(&db, mine).await.unwrap()[0].status, "revoked");
         assert_eq!(list_sessions(&db, other).await.unwrap()[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn notifications_are_user_scoped_and_read_marking_is_idempotent() {
+        let Some(db) = db_or_skip().await else {
+            eprintln!("skip notifications_are_user_scoped...: TEST_DATABASE_URL unset");
+            return;
+        };
+        let mine = ensure_user(&db, Uuid::new_v4(), "n-me@example.com")
+            .await
+            .unwrap();
+        let other = ensure_user(&db, Uuid::new_v4(), "n-other@example.com")
+            .await
+            .unwrap();
+
+        let created = create_notification(
+            &db,
+            mine,
+            None,
+            "key.rotation_due",
+            "warning",
+            "Rotate your production key",
+            "The key `fk_live_…ab12` is 85 days old.",
+            Some("/app/security"),
+        )
+        .await
+        .unwrap();
+        // Trigger-assigned sync fields must be populated.
+        assert_eq!(created.version, 1);
+        assert!(created.sync_sequence > 0);
+        assert!(created.read_at.is_none());
+        create_notification(
+            &db, other, None, "mfa.enabled", "success", "MFA on", "", None,
+        )
+        .await
+        .unwrap();
+
+        // Each user sees only their own feed.
+        assert_eq!(list_notifications(&db, mine, 50).await.unwrap().len(), 1);
+        assert_eq!(unread_notification_count(&db, mine).await.unwrap(), 1);
+        assert_eq!(unread_notification_count(&db, other).await.unwrap(), 1);
+
+        // A different user cannot mark my notification read.
+        assert!(!mark_notification_read(&db, other, created.id).await.unwrap());
+        assert_eq!(unread_notification_count(&db, mine).await.unwrap(), 1);
+
+        // The owner marks it read exactly once; the second call is a no-op.
+        assert!(mark_notification_read(&db, mine, created.id).await.unwrap());
+        assert!(!mark_notification_read(&db, mine, created.id).await.unwrap());
+        assert_eq!(unread_notification_count(&db, mine).await.unwrap(), 0);
+        let row = &list_notifications(&db, mine, 50).await.unwrap()[0];
+        assert!(row.read_at.is_some());
+        // The BEFORE UPDATE trigger advanced the row version on read.
+        assert_eq!(row.version, 2);
     }
 }

@@ -278,6 +278,11 @@ fn build_router(config: AppConfig) -> Router {
         )
         .route("/app/security", get(customer_security))
         .route("/app/activity", get(customer_activity))
+        .route("/app/notifications", get(customer_notifications))
+        .route(
+            "/app/notifications/read",
+            axum::routing::post(read_customer_notification_form),
+        )
         .route(
             "/app/security/sessions/revoke",
             axum::routing::post(revoke_customer_session_form),
@@ -303,6 +308,10 @@ fn build_router(config: AppConfig) -> Router {
             get(customer_sessions_fragment),
         )
         .route("/app/fragments/activity", get(customer_activity_fragment))
+        .route(
+            "/app/fragments/notifications",
+            get(customer_notifications_fragment),
+        )
         // Generated API docs (AGENTS.md "API Docs Contract").
         .route("/docs/api", get(api_docs_html))
         .route("/api/docs", get(api_docs_html))
@@ -2170,6 +2179,20 @@ async fn customer_activity(
     .await
 }
 
+async fn customer_notifications(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Query(selection): Query<CustomerOrgSelection>,
+) -> Response {
+    customer_page_response(
+        &config,
+        &headers,
+        CustomerTab::Notifications,
+        selection.org_id.as_deref(),
+    )
+    .await
+}
+
 async fn customer_settings(
     State(config): State<AppConfig>,
     headers: HeaderMap,
@@ -2182,6 +2205,92 @@ async fn customer_settings(
         selection.org_id.as_deref(),
     )
     .await
+}
+
+/// Fragment: the signed-in user's notification feed. Reads are scoped to the
+/// verified caller's `user_id` at the database, so a forged `org_id` can never
+/// surface another user's notifications.
+async fn customer_notifications_fragment(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    notifications_fragment_markup(&config, &customer, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadNotificationForm {
+    csrf_token: String,
+    id: String,
+}
+
+/// Mark one notification read. CSRF-protected like every other browser
+/// mutation, and scoped to the caller's `user_id` in the store, so a user can
+/// only ever clear their own notifications. Returns the refreshed fragment.
+async fn read_customer_notification_form(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<ReadNotificationForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let Ok(id) = Uuid::parse_str(form.id.trim()) else {
+        return (StatusCode::BAD_REQUEST, "invalid_notification_id").into_response();
+    };
+    let user_id = match caller_user_id(&config, &customer).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(&config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let message = match store::mark_notification_read(pool, user_id, id).await {
+        Ok(true) => Some("Notification marked read."),
+        Ok(false) => Some("Notification was already read or no longer exists."),
+        Err(error) => return dependency_error("postgres", "notification_read_failed", error),
+    };
+    notifications_fragment_markup(&config, &customer, message).await
+}
+
+async fn notifications_fragment_markup(
+    config: &AppConfig,
+    customer: &CustomerCtx,
+    message: Option<&str>,
+) -> Response {
+    let user_id = match caller_user_id(config, customer).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let pool = match customer_pool(config) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    let notifications =
+        match store::list_notifications(pool, user_id, DEFAULT_ACTIVITY_LIMIT).await {
+            Ok(rows) => rows,
+            Err(error) => return dependency_error("postgres", "notifications_list_failed", error),
+        };
+    // True unread total (not just within the shown page) for an accurate badge.
+    let unread = match store::unread_notification_count(pool, user_id).await {
+        Ok(count) => count,
+        Err(error) => return dependency_error("postgres", "notifications_count_failed", error),
+    };
+    notifications_table_markup(
+        &notifications,
+        unread,
+        message,
+        &customer_csrf_token(config, customer),
+    )
+    .into_response()
 }
 
 async fn create_customer_api_key_form(
@@ -2616,17 +2725,19 @@ enum CustomerTab {
     ApiKeys,
     Security,
     Activity,
+    Notifications,
     Settings,
 }
 
 impl CustomerTab {
-    fn all() -> [CustomerTab; 6] {
+    fn all() -> [CustomerTab; 7] {
         [
             CustomerTab::Dashboard,
             CustomerTab::Auth,
             CustomerTab::ApiKeys,
             CustomerTab::Security,
             CustomerTab::Activity,
+            CustomerTab::Notifications,
             CustomerTab::Settings,
         ]
     }
@@ -2638,6 +2749,7 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "/app/api-keys",
             CustomerTab::Security => "/app/security",
             CustomerTab::Activity => "/app/activity",
+            CustomerTab::Notifications => "/app/notifications",
             CustomerTab::Settings => "/app/settings",
         }
     }
@@ -2649,6 +2761,7 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "API Keys",
             CustomerTab::Security => "Security",
             CustomerTab::Activity => "Activity",
+            CustomerTab::Notifications => "Notifications",
             CustomerTab::Settings => "Settings",
         }
     }
@@ -2660,6 +2773,7 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "Create, rotate, scope, and audit customer API keys for production integrations.",
             CustomerTab::Security => "Two-factor authentication, trusted sessions, recovery, and account protection.",
             CustomerTab::Activity => "Organization-scoped account and API activity from the durable customer audit log.",
+            CustomerTab::Notifications => "Key-rotation reminders, lock-contention alerts, and account notices delivered to you.",
             CustomerTab::Settings => "Preferences, notifications, default region, and team-level customer settings.",
         }
     }
@@ -2776,6 +2890,7 @@ fn customer_tab_content(
         CustomerTab::ApiKeys => api_keys_markup(org_id, csrf_token),
         CustomerTab::Security => security_markup(org_id),
         CustomerTab::Activity => activity_markup(org_id),
+        CustomerTab::Notifications => notifications_markup(org_id),
         CustomerTab::Settings => settings_markup(org_id),
     }
 }
@@ -3018,6 +3133,94 @@ fn activity_markup(org_id: &str) -> Markup {
         }
         div id="customer-activity" hx-get=(fragment_href) hx-trigger="load" hx-swap="innerHTML" {
             p class="muted" { "Loading organization activity…" }
+        }
+    }
+}
+
+fn notifications_markup(org_id: &str) -> Markup {
+    let fragment_href = format!(
+        "/app/fragments/notifications?org_id={}",
+        encode_query_value(org_id)
+    );
+    html! {
+        section class="panel" aria-labelledby="notifications-heading" {
+            div class="panel__header" {
+                h2 id="notifications-heading" { "Your notifications" }
+                span { "account feed" }
+            }
+            p class="muted" {
+                "Key-rotation reminders, lock-contention alerts, MFA nudges, and operator notices "
+                "delivered to your account. Delivery preferences live under Settings."
+            }
+        }
+        div id="customer-notifications" hx-get=(fragment_href) hx-trigger="load" hx-swap="innerHTML" {
+            p class="muted" { "Loading notifications…" }
+        }
+    }
+}
+
+fn notifications_table_markup(
+    notifications: &[entity::customer_notifications::Model],
+    unread: u64,
+    message: Option<&str>,
+    csrf_token: &str,
+) -> Markup {
+    html! {
+        section class="panel" aria-labelledby="notifications-table-heading" {
+            div class="panel__header" {
+                h2 id="notifications-table-heading" { "Recent notifications" }
+                span { (unread) " unread / " (notifications.len()) " shown" }
+            }
+            @if let Some(message) = message {
+                p class="inline-message" role="status" { (message) }
+            }
+            div class="table-wrap" {
+                table {
+                    thead {
+                        tr {
+                            th { "When" }
+                            th { "Severity" }
+                            th { "Notification" }
+                            th { "State" }
+                            th { "Action" }
+                        }
+                    }
+                    tbody {
+                        @if notifications.is_empty() {
+                            tr { td colspan="5" class="muted" { "You have no notifications." } }
+                        } @else {
+                            @for note in notifications {
+                                tr {
+                                    td { (note.created_at.to_rfc3339()) }
+                                    td { span class="status-pill" data-severity=(&note.severity) { (&note.severity) } }
+                                    td {
+                                        strong { (&note.title) }
+                                        @if !note.body.is_empty() {
+                                            div class="muted" { (&note.body) }
+                                        }
+                                        @if let Some(link) = &note.link {
+                                            div { a href=(link) { "View" } }
+                                        }
+                                    }
+                                    td { @if note.read_at.is_some() { "read" } @else { "unread" } }
+                                    td {
+                                        @if note.read_at.is_none() {
+                                            form method="post" action="/app/notifications/read"
+                                                hx-post="/app/notifications/read"
+                                                hx-target="#customer-notifications"
+                                                hx-swap="innerHTML" {
+                                                input type="hidden" name="csrf_token" value=(csrf_token);
+                                                input type="hidden" name="id" value=(note.id.to_string());
+                                                button type="submit" { "Mark read" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
