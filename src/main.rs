@@ -2609,17 +2609,19 @@ enum CustomerTab {
     ApiKeys,
     Security,
     Activity,
+    Notifications,
     Settings,
 }
 
 impl CustomerTab {
-    fn all() -> [CustomerTab; 6] {
+    fn all() -> [CustomerTab; 7] {
         [
             CustomerTab::Dashboard,
             CustomerTab::Auth,
             CustomerTab::ApiKeys,
             CustomerTab::Security,
             CustomerTab::Activity,
+            CustomerTab::Notifications,
             CustomerTab::Settings,
         ]
     }
@@ -2631,6 +2633,7 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "/app/api-keys",
             CustomerTab::Security => "/app/security",
             CustomerTab::Activity => "/app/activity",
+            CustomerTab::Notifications => "/app/notifications",
             CustomerTab::Settings => "/app/settings",
         }
     }
@@ -2642,6 +2645,7 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "API Keys",
             CustomerTab::Security => "Security",
             CustomerTab::Activity => "Activity",
+            CustomerTab::Notifications => "Notifications",
             CustomerTab::Settings => "Settings",
         }
     }
@@ -2653,6 +2657,7 @@ impl CustomerTab {
             CustomerTab::ApiKeys => "Create, rotate, scope, and audit customer API keys for production integrations.",
             CustomerTab::Security => "Two-factor authentication, trusted sessions, recovery, and account protection.",
             CustomerTab::Activity => "Organization-scoped account and API activity from the durable customer audit log.",
+            CustomerTab::Notifications => "Key-rotation reminders, lock-contention alerts, and account notices delivered to you.",
             CustomerTab::Settings => "Preferences, notifications, default region, and team-level customer settings.",
         }
     }
