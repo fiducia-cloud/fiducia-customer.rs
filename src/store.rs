@@ -5,11 +5,14 @@
 use fiducia_interfaces_db::customer::{CustomerPreferencesRow, CustomerSessionsRow};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use uuid::Uuid;
 
-use crate::entity::{audit_log, customer_preferences as prefs, customer_sessions as sess, users};
+use crate::entity::{
+    audit_log, customer_notifications as notif, customer_preferences as prefs,
+    customer_sessions as sess, users,
+};
 
 /// Ensure a local `users` row exists for the authenticated Supabase user and
 /// return its id. Supabase remains the source of truth for identity.
