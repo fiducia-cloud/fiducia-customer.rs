@@ -2274,11 +2274,11 @@ async fn notifications_fragment_markup(
         Ok(pool) => pool,
         Err(response) => return response,
     };
-    let notifications =
-        match store::list_notifications(pool, user_id, DEFAULT_ACTIVITY_LIMIT).await {
-            Ok(rows) => rows,
-            Err(error) => return dependency_error("postgres", "notifications_list_failed", error),
-        };
+    let notifications = match store::list_notifications(pool, user_id, DEFAULT_ACTIVITY_LIMIT).await
+    {
+        Ok(rows) => rows,
+        Err(error) => return dependency_error("postgres", "notifications_list_failed", error),
+    };
     // True unread total (not just within the shown page) for an accurate badge.
     let unread = match store::unread_notification_count(pool, user_id).await {
         Ok(count) => count,

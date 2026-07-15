@@ -377,7 +377,14 @@ mod tests {
         assert!(created.sync_sequence > 0);
         assert!(created.read_at.is_none());
         create_notification(
-            &db, other, None, "mfa.enabled", "success", "MFA on", "", None,
+            &db,
+            other,
+            None,
+            "mfa.enabled",
+            "success",
+            "MFA on",
+            "",
+            None,
         )
         .await
         .unwrap();
@@ -388,7 +395,9 @@ mod tests {
         assert_eq!(unread_notification_count(&db, other).await.unwrap(), 1);
 
         // A different user cannot mark my notification read.
-        assert!(!mark_notification_read(&db, other, created.id).await.unwrap());
+        assert!(!mark_notification_read(&db, other, created.id)
+            .await
+            .unwrap());
         assert_eq!(unread_notification_count(&db, mine).await.unwrap(), 1);
 
         // The owner marks it read exactly once; the second call is a no-op.
