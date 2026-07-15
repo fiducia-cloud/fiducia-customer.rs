@@ -8,8 +8,14 @@ GitHub Actions pipelines for this service.
   `fiducia-cloud/fiducia-interfaces` repo at the exact commit also pinned by the
   Dockerfile so the path-dependency crates
   (`../fiducia-interfaces/generated/...`) resolve reproducibly.
-- **`deploy-test.yml`** — secret-gated rollout to the `fiducia-test` Kubernetes
-  namespace (sets the deployment image to the commit-SHA tag and waits for the
-  rollout). Missing credentials, a missing deployment, or rollout failure stops
-  the job; validation-only work belongs in `ci.yml`. PROD deploys happen from
-  the fiducia-monorepo, not here.
+
+This repository is validation-only: it does not receive kubeconfig credentials
+or deploy itself. Fleet deployment is owned by `fiducia-monorepo`.
+
+## Security baseline
+
+Every executable workflow uses explicit least-privilege permissions, immutable
+third-party action or container references, non-persisted checkout credentials,
+concurrency control, and a job timeout. The main CI workflow validates this
+directory with the digest-pinned actionlint container. Environment mutation is
+forbidden unless this README documents a repository-specific platform exception.
