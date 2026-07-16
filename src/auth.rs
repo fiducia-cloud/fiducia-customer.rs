@@ -276,6 +276,35 @@ fn authorization_token(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The portal must FAIL CLOSED when its identity dependency is broken:
+    /// unconfigured auth denies with 503, and an unreachable auth service
+    /// denies with 503 — a presented credential is never trusted, and no
+    /// unauthenticated fall-through exists on either path.
+    #[tokio::test]
+    async fn identity_outage_denies_instead_of_falling_through() {
+        // Unconfigured deployment: every customer route is refused.
+        let deny_all = Authenticator::Deny;
+        let denied = deny_all
+            .authenticate(&HeaderMap::new())
+            .await
+            .expect_err("unconfigured auth must deny");
+        assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Configured but DOWN: a well-formed session credential still denies.
+        // Bind-then-drop a listener so the port refuses connections.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_url = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let unreachable = Authenticator::AuthService(dead_url);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer plausible.jwt".parse().unwrap());
+        let refused = unreachable
+            .authenticate(&headers)
+            .await
+            .expect_err("an unreachable identity provider must deny, never trust");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[test]
     fn customer_cookie_is_isolated_from_admin_cookie() {
         let mut headers = HeaderMap::new();
