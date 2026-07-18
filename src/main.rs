@@ -800,40 +800,158 @@ async fn customer_logout(
     response
 }
 
-fn customer_login_markup(message: Option<&str>, csrf_token: &str) -> Markup {
+/// Shared chrome for every unauthenticated auth page (login, OTP entry, MFA
+/// step-up). Keeps one `head`/shell so the flows are visually one surface.
+fn auth_page_shell(title: &str, inner: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Sign in · Fiducia Customer" }
+                title { (title) }
                 link rel="stylesheet" href="/assets/customer.css";
                 script src="/assets/htmx.min.js" defer {}
             }
             body {
                 main class="auth-shell" {
                     section class="auth-card" {
-                        p class="eyebrow" { "Customer application" }
-                        h1 { "Sign in to Fiducia" }
-                        p class="muted" { "Supabase authenticates your credentials; fiducia-auth verifies the resulting identity and organization membership." }
-                        @if let Some(message) = message {
-                            p class="auth-message" role="alert" { (message) }
-                        }
-                        form method="post" action="/login" hx-post="/login" hx-target="body" hx-swap="outerHTML" {
-                            input type="hidden" name="csrf_token" value=(csrf_token);
-                            label for="email" { "Email" }
-                            input id="email" name="email" type="email" autocomplete="email" required;
-                            label for="password" { "Password" }
-                            input id="password" name="password" type="password" autocomplete="current-password" required;
-                            button type="submit" { "Sign in" }
-                        }
-                        p class="muted" { "Operator accounts use the separate admin application and cookie boundary." }
+                        (inner)
                     }
                 }
             }
         }
     }
+}
+
+fn customer_login_markup(message: Option<&str>, csrf_token: &str) -> Markup {
+    auth_page_shell(
+        "Sign in · Fiducia Customer",
+        html! {
+            p class="eyebrow" { "Customer application" }
+            h1 { "Sign in to Fiducia" }
+            p class="muted" { "Supabase authenticates you; fiducia-auth verifies the resulting identity and organization membership." }
+            @if let Some(message) = message {
+                p class="auth-message" role="alert" { (message) }
+            }
+
+            // Password grant (unchanged surface).
+            form method="post" action="/login" hx-post="/login" hx-target="body" hx-swap="outerHTML" {
+                h2 { "Email & password" }
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                label for="email" { "Email" }
+                input id="email" name="email" type="email" autocomplete="email" required;
+                label for="password" { "Password" }
+                input id="password" name="password" type="password" autocomplete="current-password" required;
+                button type="submit" { "Sign in" }
+            }
+
+            // Passwordless email — magic link + 6-digit code (also self-signup).
+            form method="post" action="/login/otp" hx-post="/login/otp" hx-target="body" hx-swap="outerHTML" {
+                h2 { "Email magic link" }
+                p class="muted" { "We email a one-tap link and a 6-digit code. New here? This also creates your account." }
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                input type="hidden" name="method" value="email";
+                label for="magic-email" { "Email" }
+                input id="magic-email" name="identifier" type="email" autocomplete="email" required;
+                button type="submit" { "Email me a link" }
+            }
+
+            // Passwordless phone — SMS one-time passcode.
+            form method="post" action="/login/otp" hx-post="/login/otp" hx-target="body" hx-swap="outerHTML" {
+                h2 { "Phone code" }
+                p class="muted" { "We text a 6-digit code to your phone. Use international format, e.g. +14155550123." }
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                input type="hidden" name="method" value="phone";
+                label for="otp-phone" { "Phone" }
+                input id="otp-phone" name="identifier" type="tel" autocomplete="tel" inputmode="tel"
+                    placeholder="+14155550123" required;
+                button type="submit" { "Text me a code" }
+            }
+
+            p class="muted" { "Accounts with an authenticator app will be asked for a 6-digit code after this step." }
+            p class="muted" { "Operator accounts use the separate admin application and cookie boundary." }
+        },
+    )
+}
+
+/// OTP-entry page shown after a code is dispatched. Carries the channel +
+/// identifier forward so `/login/verify` knows how to redeem the code.
+fn otp_verify_markup(
+    channel: OtpChannel,
+    identifier: &str,
+    csrf_token: &str,
+    message: Option<&str>,
+) -> Markup {
+    let heading = match channel {
+        OtpChannel::Email => "Check your email",
+        OtpChannel::Phone => "Check your phone",
+    };
+    let blurb = match channel {
+        OtpChannel::Email => "We emailed a magic link and a 6-digit code. Enter the code, or just tap the link.",
+        OtpChannel::Phone => "We texted a 6-digit code to your phone. Enter it below.",
+    };
+    auth_page_shell(
+        "Enter your code · Fiducia Customer",
+        html! {
+            p class="eyebrow" { "Customer application" }
+            h1 { (heading) }
+            p class="muted" { (blurb) }
+            p class="muted" { "Sending to " strong { (identifier) } "." }
+            @if let Some(message) = message {
+                p class="auth-message" role="alert" { (message) }
+            }
+            form method="post" action="/login/verify" hx-post="/login/verify" hx-target="body" hx-swap="outerHTML" {
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                input type="hidden" name="method" value=(channel.field());
+                input type="hidden" name="identifier" value=(identifier);
+                label for="otp-code" { "6-digit code" }
+                input id="otp-code" name="token" type="text" inputmode="numeric" autocomplete="one-time-code"
+                    pattern="[0-9]*" minlength="6" maxlength="8" required;
+                button type="submit" { "Verify & continue" }
+            }
+            form method="post" action="/login/otp" hx-post="/login/otp" hx-target="body" hx-swap="outerHTML" {
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                input type="hidden" name="method" value=(channel.field());
+                input type="hidden" name="identifier" value=(identifier);
+                button type="submit" class="link-button" { "Resend code" }
+            }
+            a href="/login" { "Start over" }
+        },
+    )
+}
+
+/// TOTP step-up page. The primary factor already succeeded; the account has a
+/// verified authenticator, so we require its current 6-digit code before issuing
+/// the app session cookie. `factor_id`/`challenge_id` ride hidden fields; the
+/// aal1 token rides the short-lived pending cookie.
+fn mfa_challenge_markup(
+    factor_id: &str,
+    challenge_id: &str,
+    csrf_token: &str,
+    message: Option<&str>,
+) -> Markup {
+    auth_page_shell(
+        "Two-factor verification · Fiducia Customer",
+        html! {
+            p class="eyebrow" { "Two-factor authentication" }
+            h1 { "Enter your authenticator code" }
+            p class="muted" { "Open your authenticator app (Authy, Google Authenticator, 1Password…) and enter the current 6-digit code for Fiducia." }
+            @if let Some(message) = message {
+                p class="auth-message" role="alert" { (message) }
+            }
+            form method="post" action="/login/mfa" hx-post="/login/mfa" hx-target="body" hx-swap="outerHTML" {
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                input type="hidden" name="factor_id" value=(factor_id);
+                input type="hidden" name="challenge_id" value=(challenge_id);
+                label for="mfa-code" { "Authenticator code" }
+                input id="mfa-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                    pattern="[0-9]*" minlength="6" maxlength="8" required;
+                button type="submit" { "Verify" }
+            }
+            a href="/login" { "Cancel and sign in again" }
+        },
+    )
 }
 
 async fn health() -> Json<serde_json::Value> {
