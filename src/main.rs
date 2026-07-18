@@ -1446,6 +1446,11 @@ fn mfa_enroll_markup(enrollment: &supabase_auth::TotpEnrollment, csrf_token: &st
             }
             p class="muted" { "Can't scan? Enter this key manually:" }
             pre class="totp-secret" { (enrollment.secret) }
+            details class="totp-uri" {
+                summary { "Prefer a setup link?" }
+                p class="muted" { "Paste this otpauth URI into your authenticator app:" }
+                pre class="totp-secret" { (enrollment.uri) }
+            }
             form method="post" action="/app/security/mfa/activate" hx-post="/app/security/mfa/activate" hx-target="body" hx-swap="outerHTML" {
                 input type="hidden" name="csrf_token" value=(csrf_token);
                 input type="hidden" name="factor_id" value=(enrollment.factor_id);
