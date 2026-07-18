@@ -694,23 +694,27 @@ async fn customer_login_submit(
         Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
     };
 
-    let mut headers = HeaderMap::new();
-    let bearer = match HeaderValue::from_str(&format!("Bearer {}", session.access_token)) {
-        Ok(value) => value,
-        Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
+    // Fail closed on MFA before issuing any app cookie: Supabase's password grant
+    // returns an aal1 token even for MFA-enrolled accounts, so the password form
+    // must run the SAME factor check as the OTP path (/login/verify) — otherwise a
+    // verified TOTP factor is trivially bypassed by choosing the password form. A
+    // factor-lookup outage is a 503, never a silent single-factor admit.
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
     };
-    headers.insert(header::AUTHORIZATION, bearer);
-    if let Err(response) = config.authenticator.authenticate(&headers).await {
-        return response;
+    match supabase.list_factors(&session.access_token).await {
+        Ok(factors) => match required_totp_factor(&factors) {
+            Some(factor_id) => {
+                begin_mfa_step_up(&config, &supabase, &session.access_token, &factor_id).await
+            }
+            None => finalize_customer_login(&config, &session.access_token).await,
+        },
+        Err(error) => dependency_error("supabase", "mfa_state_unavailable", error),
     }
-
-    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/app")]).into_response();
-    append_set_cookie(
-        &mut response,
-        &make_customer_session_cookie(&session.access_token),
-    );
-    append_set_cookie(&mut response, &clear_customer_login_csrf_cookie());
-    response
 }
 
 /// Render an unauthenticated login-flow page and bind it to a fresh login-CSRF
@@ -4859,10 +4863,17 @@ mod tests {
     async fn customer_login_is_server_mediated_and_issues_only_customer_cookie() {
         const MOCK_SUPABASE_TOKEN_PATH: &str = "/auth/v1/token";
         const MOCK_AUTH_ME_PATH: &str = "/v1/me";
-        let supabase = Router::new().route(
-            MOCK_SUPABASE_TOKEN_PATH,
-            axum::routing::post(|| async { Json(json!({ "access_token": "customer.jwt" })) }),
-        );
+        let supabase = Router::new()
+            .route(
+                MOCK_SUPABASE_TOKEN_PATH,
+                axum::routing::post(|| async { Json(json!({ "access_token": "customer.jwt" })) }),
+            )
+            // The login now runs a fail-closed MFA factor lookup before issuing a
+            // session; this account has no enrolled factor, so login finalizes.
+            .route(
+                "/auth/v1/user",
+                get(|| async { Json(json!({ "factors": [] })) }),
+            );
         let auth = Router::new().route(
             MOCK_AUTH_ME_PATH,
             get(|| async {
@@ -4954,6 +4965,127 @@ mod tests {
             .all(|cookie| !cookie.contains("fiducia_admin_session")));
         supabase_task.abort();
         auth_task.abort();
+    }
+
+    // Regression: a password login by an account with a verified TOTP factor must
+    // be forced into aal2 step-up (parked on the MFA challenge with the pending
+    // cookie), NEVER handed a session cookie. Without the factor lookup in
+    // `customer_login_submit`, the always-rendered password form silently
+    // bypasses the second factor.
+    #[tokio::test]
+    async fn customer_password_login_with_verified_totp_factor_forces_step_up() {
+        let supabase = Router::new()
+            .route(
+                "/auth/v1/token",
+                axum::routing::post(|| async { Json(json!({ "access_token": "customer.jwt" })) }),
+            )
+            .route(
+                "/auth/v1/user",
+                get(|| async {
+                    Json(json!({
+                        "factors": [
+                            { "id": "factor-1", "factor_type": "totp", "status": "verified" }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/auth/v1/factors/:id/challenge",
+                axum::routing::post(|| async { Json(json!({ "id": "challenge-1" })) }),
+            );
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let mut config = test_config();
+        config.supabase_url = Some(supabase_url);
+        config.supabase_publishable_key = Some("public-publishable-key".to_string());
+        // The step-up path never reaches /v1/me, so a dead authenticator is fine.
+        config.authenticator = Authenticator::AuthService("http://127.0.0.1:1".to_string());
+        let app = build_router(config);
+
+        let login_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let login_cookie = login_page
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let value = value.to_str().ok()?;
+                value
+                    .starts_with(&format!("{CUSTOMER_LOGIN_CSRF_COOKIE}="))
+                    .then(|| value.split(';').next().unwrap().to_string())
+            })
+            .unwrap();
+        let login_html = String::from_utf8(
+            axum::body::to_bytes(login_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let csrf_field = &login_html[login_html.find("name=\"csrf_token\"").unwrap()..];
+        let csrf_value = &csrf_field[csrf_field.find("value=\"").unwrap() + 7..];
+        let csrf_value = &csrf_value[..csrf_value.find('"').unwrap()];
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .header(header::ORIGIN, "https://app.fiducia.cloud")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::COOKIE, login_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={csrf_value}&email=customer%40example.com&password=correct"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Step-up page, not a redirect into the app.
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        // The interim aal1 token rides the pending cookie...
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with(&format!("{CUSTOMER_MFA_PENDING_COOKIE}="))),
+            "expected the MFA pending cookie to be set, got {cookies:?}"
+        );
+        // ...and NO app session cookie is issued before the second factor.
+        assert!(
+            cookies
+                .iter()
+                .all(|cookie| !cookie.starts_with(&format!("{CUSTOMER_SESSION_COOKIE}="))),
+            "a verified-TOTP account must not receive a session cookie from the password form: {cookies:?}"
+        );
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            body.contains("/login/mfa"),
+            "step-up challenge form should target /login/mfa"
+        );
+        supabase_task.abort();
     }
 
     #[tokio::test]
