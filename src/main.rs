@@ -980,6 +980,489 @@ fn mfa_challenge_markup(
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct OtpRequestForm {
+    csrf_token: String,
+    /// "email" or "phone".
+    method: String,
+    identifier: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OtpVerifyForm {
+    csrf_token: String,
+    method: String,
+    identifier: String,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfaStepUpForm {
+    csrf_token: String,
+    factor_id: String,
+    challenge_id: String,
+    code: String,
+}
+
+fn parse_otp_channel(method: &str) -> Option<OtpChannel> {
+    match method.trim() {
+        "email" => Some(OtpChannel::Email),
+        "phone" => Some(OtpChannel::Phone),
+        _ => None,
+    }
+}
+
+/// Complete a login once the caller is fully authenticated (either single-factor
+/// or post-TOTP): re-verify the resulting Supabase token against fiducia-auth
+/// (identity + org membership), then set the app session cookie and clear the
+/// transient login/MFA cookies. Mirrors the password path's finalize step so all
+/// entry points converge on one org-scoping check.
+async fn finalize_customer_login(config: &AppConfig, access_token: &str) -> Response {
+    let mut verify_headers = HeaderMap::new();
+    let bearer = match HeaderValue::from_str(&format!("Bearer {access_token}")) {
+        Ok(value) => value,
+        Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
+    };
+    verify_headers.insert(header::AUTHORIZATION, bearer);
+    if let Err(response) = config.authenticator.authenticate(&verify_headers).await {
+        return response;
+    }
+    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/app")]).into_response();
+    append_set_cookie(&mut response, &make_customer_session_cookie(access_token));
+    append_set_cookie(&mut response, &clear_customer_login_csrf_cookie());
+    append_set_cookie(&mut response, &clear_customer_mfa_pending_cookie());
+    response
+}
+
+/// `POST /login/otp` — dispatch a magic link / one-time code over email or phone.
+/// `should_create_user` is true so this doubles as self-service signup.
+async fn customer_login_otp_submit(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<OtpRequestForm>,
+) -> Response {
+    if let Err(error) = require_login_security(&headers, &config, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let Some(channel) = parse_otp_channel(&form.method) else {
+        let mut page = customer_login_page(&config, Some("Choose email or phone to receive a code."));
+        *page.status_mut() = StatusCode::BAD_REQUEST;
+        return page;
+    };
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
+    };
+    let identifier = form.identifier.trim().to_string();
+    match supabase.send_otp(channel, &identifier, true).await {
+        Ok(()) => login_flow_page(&config, |token| {
+            otp_verify_markup(channel, &identifier, token, None)
+        }),
+        Err(error) => {
+            let retry = login_flow_page(&config, |token| {
+                customer_login_markup(
+                    Some("We couldn't send that code. Check the address and try again."),
+                    token,
+                )
+            });
+            supabase_auth_error_response(error, retry, StatusCode::OK)
+        }
+    }
+}
+
+/// `POST /login/verify` — redeem the OTP, then branch on MFA: a verified
+/// authenticator forces TOTP step-up before any app cookie is issued; otherwise
+/// the login finalizes immediately.
+async fn customer_login_verify_submit(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<OtpVerifyForm>,
+) -> Response {
+    if let Err(error) = require_login_security(&headers, &config, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let Some(channel) = parse_otp_channel(&form.method) else {
+        return customer_login_page(&config, Some("Choose email or phone to receive a code."));
+    };
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
+    };
+    let identifier = form.identifier.trim().to_string();
+    let session = match supabase.verify_otp(channel, &identifier, &form.token).await {
+        Ok(session) => session,
+        Err(error) => {
+            let retry = login_flow_page(&config, |token| {
+                otp_verify_markup(
+                    channel,
+                    &identifier,
+                    token,
+                    Some("That code didn't match or has expired. Request a new one."),
+                )
+            });
+            return supabase_auth_error_response(error, retry, StatusCode::OK);
+        }
+    };
+
+    // Fail closed: never finalize a login without knowing the account's MFA
+    // state. A factor lookup outage is a 503, not a silent single-factor admit.
+    match supabase.list_factors(&session.access_token).await {
+        Ok(factors) => match required_totp_factor(&factors) {
+            Some(factor_id) => {
+                begin_mfa_step_up(&config, &supabase, &session.access_token, &factor_id).await
+            }
+            None => finalize_customer_login(&config, &session.access_token).await,
+        },
+        Err(error) => dependency_error("supabase", "mfa_state_unavailable", error),
+    }
+}
+
+/// Open a TOTP challenge and render the step-up page, stashing the primary-factor
+/// token in the short-lived pending cookie.
+async fn begin_mfa_step_up(
+    config: &AppConfig,
+    supabase: &SupabaseAuth,
+    access_token: &str,
+    factor_id: &str,
+) -> Response {
+    let challenge = match supabase.challenge(access_token, factor_id).await {
+        Ok(challenge) => challenge,
+        Err(error) => return dependency_error("supabase", "mfa_challenge_failed", error),
+    };
+    let factor = challenge.factor_id.clone();
+    let challenge_id = challenge.challenge_id.clone();
+    let mut response = login_flow_page(&config, |token| {
+        mfa_challenge_markup(&factor, &challenge_id, token, None)
+    });
+    append_set_cookie(&mut response, &make_customer_mfa_pending_cookie(access_token));
+    response
+}
+
+/// `POST /login/mfa` — verify the authenticator code against the open challenge,
+/// stepping the session up to aal2 and finalizing the login.
+async fn customer_login_mfa_submit(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<MfaStepUpForm>,
+) -> Response {
+    if let Err(error) = require_login_security(&headers, &config, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let Some(pending_token) = cookie_value(&headers, CUSTOMER_MFA_PENDING_COOKIE) else {
+        return customer_login_page(
+            &config,
+            Some("Your verification session expired. Please sign in again."),
+        );
+    };
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
+    };
+    let challenge = supabase_auth::TotpChallenge {
+        challenge_id: form.challenge_id.clone(),
+        factor_id: form.factor_id.clone(),
+    };
+    match supabase
+        .verify_factor(&pending_token, &challenge, &form.code)
+        .await
+    {
+        Ok(session) => finalize_customer_login(&config, &session.access_token).await,
+        Err(error) => {
+            let factor = form.factor_id.clone();
+            let challenge_id = form.challenge_id.clone();
+            // Keep the pending cookie so the user can retry the current code.
+            let retry = login_flow_page(&config, |token| {
+                mfa_challenge_markup(
+                    &factor,
+                    &challenge_id,
+                    token,
+                    Some("That code didn't match. Enter the current code from your authenticator app."),
+                )
+            });
+            supabase_auth_error_response(error, retry, StatusCode::OK)
+        }
+    }
+}
+
+// ── Authenticator (TOTP) enrollment on the post-login Security surface ─────────
+
+#[derive(Debug, Deserialize)]
+struct MfaEnrollForm {
+    csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfaActivateForm {
+    csrf_token: String,
+    factor_id: String,
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MfaDisableForm {
+    csrf_token: String,
+    factor_id: String,
+}
+
+/// The raw customer Supabase access token backing the current session, read from
+/// the session cookie (or a forwarded bearer). Required to manage the caller's
+/// own factors via Supabase; absent → the caller isn't a browser session.
+fn customer_access_token(headers: &HeaderMap) -> Option<String> {
+    bearer_token(headers)
+}
+
+/// `GET /app/security/mfa` — authenticator management: list enrolled factors and
+/// offer enrollment.
+async fn customer_mfa_page(State(config): State<AppConfig>, headers: HeaderMap) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    let Some(token) = customer_access_token(&headers) else {
+        return deny_json(StatusCode::UNAUTHORIZED, "missing_customer_session");
+    };
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
+    };
+    let factors = match supabase.list_factors(&token).await {
+        Ok(factors) => factors,
+        Err(error) => return dependency_error("supabase", "mfa_state_unavailable", error),
+    };
+    let csrf = customer_csrf_token(&config, &customer);
+    mfa_settings_markup(&factors, &csrf, None).into_response()
+}
+
+/// `POST /app/security/mfa/enroll` — begin TOTP enrollment; renders the QR +
+/// secret + an activation form. Nothing is active until a code is confirmed.
+async fn customer_mfa_enroll(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<MfaEnrollForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let Some(token) = customer_access_token(&headers) else {
+        return deny_json(StatusCode::UNAUTHORIZED, "missing_customer_session");
+    };
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
+    };
+    match supabase.enroll_totp(&token, "Fiducia authenticator").await {
+        Ok(enrollment) => {
+            let csrf = customer_csrf_token(&config, &customer);
+            mfa_enroll_markup(&enrollment, &csrf).into_response()
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            supabase_auth_error_response(
+                error,
+                mfa_result_markup("Couldn't start enrollment", &detail).into_response(),
+                StatusCode::OK,
+            )
+        }
+    }
+}
+
+/// `POST /app/security/mfa/activate` — confirm a freshly enrolled factor by
+/// verifying its first code (challenge + verify).
+async fn customer_mfa_activate(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<MfaActivateForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let Some(token) = customer_access_token(&headers) else {
+        return deny_json(StatusCode::UNAUTHORIZED, "missing_customer_session");
+    };
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
+    };
+    let challenge = match supabase.challenge(&token, &form.factor_id).await {
+        Ok(challenge) => challenge,
+        Err(error) => return dependency_error("supabase", "mfa_challenge_failed", error),
+    };
+    match supabase.verify_factor(&token, &challenge, &form.code).await {
+        Ok(_) => mfa_result_markup(
+            "Authenticator enabled",
+            "Your authenticator app is now required at sign-in. Keep your recovery method up to date.",
+        )
+        .into_response(),
+        Err(error) => {
+            let detail = error.to_string();
+            supabase_auth_error_response(
+                error,
+                mfa_result_markup(
+                    "That code didn't match",
+                    "Enrollment is not active. Return to security and start again with the current code.",
+                )
+                .into_response(),
+                StatusCode::OK,
+            )
+            .tap_detail(&detail)
+        }
+    }
+}
+
+/// `POST /app/security/mfa/disable` — unenroll a factor.
+async fn customer_mfa_disable(
+    State(config): State<AppConfig>,
+    headers: HeaderMap,
+    Form(form): Form<MfaDisableForm>,
+) -> Response {
+    let customer = match config.authenticator.authenticate(&headers).await {
+        Ok(customer) => customer,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let Some(token) = customer_access_token(&headers) else {
+        return deny_json(StatusCode::UNAUTHORIZED, "missing_customer_session");
+    };
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
+    };
+    match supabase.unenroll(&token, &form.factor_id).await {
+        Ok(()) => mfa_result_markup(
+            "Authenticator removed",
+            "That authenticator will no longer be requested at sign-in.",
+        )
+        .into_response(),
+        Err(error) => dependency_error("supabase", "mfa_unenroll_failed", error),
+    }
+}
+
+fn deny_json(status: StatusCode, code: &str) -> Response {
+    (status, Json(json!({ "ok": false, "error": code }))).into_response()
+}
+
+fn mfa_settings_markup(
+    factors: &[supabase_auth::Factor],
+    csrf_token: &str,
+    message: Option<&str>,
+) -> Markup {
+    auth_page_shell(
+        "Authenticator · Fiducia Customer",
+        html! {
+            p class="eyebrow" { "Security" }
+            h1 { "Authenticator app (2FA)" }
+            p class="muted" { "Add a TOTP authenticator (Authy, Google Authenticator, 1Password…) for a second factor at sign-in." }
+            @if let Some(message) = message {
+                p class="auth-message" role="alert" { (message) }
+            }
+            @if factors.is_empty() {
+                p class="muted" { "No authenticator is enrolled yet." }
+            } @else {
+                ul class="factor-list" {
+                    @for factor in factors {
+                        li {
+                            span { (factor.friendly_name.clone().unwrap_or_else(|| "Authenticator".to_string())) }
+                            " — "
+                            span { (factor.status.clone().unwrap_or_else(|| "unknown".to_string())) }
+                            form method="post" action="/app/security/mfa/disable" hx-post="/app/security/mfa/disable" hx-target="body" hx-swap="outerHTML" {
+                                input type="hidden" name="csrf_token" value=(csrf_token);
+                                input type="hidden" name="factor_id" value=(factor.id);
+                                button type="submit" class="link-button" { "Remove" }
+                            }
+                        }
+                    }
+                }
+            }
+            form method="post" action="/app/security/mfa/enroll" hx-post="/app/security/mfa/enroll" hx-target="body" hx-swap="outerHTML" {
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                button type="submit" { "Add authenticator" }
+            }
+            a href="/app/security" { "Back to security" }
+        },
+    )
+}
+
+fn mfa_enroll_markup(enrollment: &supabase_auth::TotpEnrollment, csrf_token: &str) -> Markup {
+    auth_page_shell(
+        "Set up authenticator · Fiducia Customer",
+        html! {
+            p class="eyebrow" { "Security" }
+            h1 { "Scan this with your authenticator" }
+            p class="muted" { "Scan the QR code with Authy, Google Authenticator, or any TOTP app, then enter the 6-digit code it shows to finish." }
+            div class="totp-qr" {
+                (render_qr(&enrollment.qr_code))
+            }
+            p class="muted" { "Can't scan? Enter this key manually:" }
+            pre class="totp-secret" { (enrollment.secret) }
+            form method="post" action="/app/security/mfa/activate" hx-post="/app/security/mfa/activate" hx-target="body" hx-swap="outerHTML" {
+                input type="hidden" name="csrf_token" value=(csrf_token);
+                input type="hidden" name="factor_id" value=(enrollment.factor_id);
+                label for="activate-code" { "Code from your app" }
+                input id="activate-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                    pattern="[0-9]*" minlength="6" maxlength="8" required;
+                button type="submit" { "Turn on 2FA" }
+            }
+            a href="/app/security/mfa" { "Cancel" }
+        },
+    )
+}
+
+/// Render Supabase's QR payload. A `data:`/`http` URL becomes an `img`; anything
+/// else is treated as inline SVG markup from the trusted first-party IdP.
+fn render_qr(qr_code: &str) -> Markup {
+    let trimmed = qr_code.trim();
+    if trimmed.starts_with("data:") || trimmed.starts_with("http") {
+        html! { img src=(trimmed) alt="Authenticator QR code" width="200" height="200"; }
+    } else {
+        html! { (PreEscaped(trimmed.to_string())) }
+    }
+}
+
+fn mfa_result_markup(title: &str, message: &str) -> Markup {
+    auth_page_shell(
+        "Security · Fiducia Customer",
+        html! {
+            p class="eyebrow" { "Security" }
+            h1 { (title) }
+            p class="muted" { (message) }
+            a href="/app/security/mfa" { "Manage authenticator" }
+            " · "
+            a href="/app/security" { "Back to security" }
+        },
+    )
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
 }
