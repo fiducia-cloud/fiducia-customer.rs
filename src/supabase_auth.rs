@@ -121,17 +121,6 @@ pub enum SupabaseAuthError {
     Unavailable(String),
 }
 
-impl SupabaseAuthError {
-    /// Stable machine code for structured JSON error responses and logs.
-    pub const fn code(&self) -> &'static str {
-        match self {
-            SupabaseAuthError::Invalid(_) => "supabase_auth_invalid_input",
-            SupabaseAuthError::Rejected(_) => "supabase_auth_rejected",
-            SupabaseAuthError::Unavailable(_) => "supabase_auth_unavailable",
-        }
-    }
-}
-
 impl std::fmt::Display for SupabaseAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
