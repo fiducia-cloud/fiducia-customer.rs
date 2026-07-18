@@ -694,23 +694,27 @@ async fn customer_login_submit(
         Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
     };
 
-    let mut headers = HeaderMap::new();
-    let bearer = match HeaderValue::from_str(&format!("Bearer {}", session.access_token)) {
-        Ok(value) => value,
-        Err(error) => return dependency_error("supabase", "supabase_login_failed", error),
+    // Fail closed on MFA before issuing any app cookie: Supabase's password grant
+    // returns an aal1 token even for MFA-enrolled accounts, so the password form
+    // must run the SAME factor check as the OTP path (/login/verify) — otherwise a
+    // verified TOTP factor is trivially bypassed by choosing the password form. A
+    // factor-lookup outage is a 503, never a silent single-factor admit.
+    let Some(supabase) = config.supabase_auth() else {
+        return dependency_error(
+            "supabase",
+            "customer_login_not_configured",
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
+        );
     };
-    headers.insert(header::AUTHORIZATION, bearer);
-    if let Err(response) = config.authenticator.authenticate(&headers).await {
-        return response;
+    match supabase.list_factors(&session.access_token).await {
+        Ok(factors) => match required_totp_factor(&factors) {
+            Some(factor_id) => {
+                begin_mfa_step_up(&config, &supabase, &session.access_token, &factor_id).await
+            }
+            None => finalize_customer_login(&config, &session.access_token).await,
+        },
+        Err(error) => dependency_error("supabase", "mfa_state_unavailable", error),
     }
-
-    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/app")]).into_response();
-    append_set_cookie(
-        &mut response,
-        &make_customer_session_cookie(&session.access_token),
-    );
-    append_set_cookie(&mut response, &clear_customer_login_csrf_cookie());
-    response
 }
 
 /// Render an unauthenticated login-flow page and bind it to a fresh login-CSRF

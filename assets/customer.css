@@ -785,3 +785,164 @@ tbody tr:hover {
     gap: 2px;
   }
 }
+
+/* ── Authentication surface (login, passwordless OTP, TOTP 2FA) ─────────────
+   One card centered on the page, shared by /login, /login/verify, /login/mfa
+   and the authenticator-enrollment screens. Kept self-contained so the auth
+   flow renders cleanly without the app shell. */
+.auth-shell {
+  display: flex;
+  min-height: 100vh;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 32px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+}
+
+.auth-card h1 {
+  margin: 4px 0 8px;
+  font-size: 1.5rem;
+}
+
+.auth-card h2 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  color: #334155;
+}
+
+/* Each auth method is its own form; separate them with a hairline rule. */
+.auth-card form + form {
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px solid #eef2f7;
+}
+
+.auth-card label {
+  display: block;
+  margin: 12px 0 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #475569;
+}
+
+.auth-card input[type="email"],
+.auth-card input[type="password"],
+.auth-card input[type="tel"],
+.auth-card input[type="text"] {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.auth-card input:focus {
+  outline: 2px solid #2563eb;
+  outline-offset: 1px;
+  background: #ffffff;
+}
+
+.auth-card button[type="submit"] {
+  width: 100%;
+  margin-top: 16px;
+  padding: 11px 16px;
+  border: 0;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #ffffff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-card button[type="submit"]:hover {
+  background: #1d4ed8;
+}
+
+.auth-message {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  font-size: 0.9rem;
+}
+
+/* Inline text-style action (resend code, remove factor) — not a primary CTA. */
+.link-button {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #2563eb;
+  font-weight: 500;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.factor-list {
+  margin: 8px 0 20px;
+  padding: 0;
+  list-style: none;
+}
+
+.factor-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.factor-list li form {
+  margin-left: auto;
+}
+
+/* TOTP enrollment: QR + monospace fallbacks for the shared secret / otpauth URI. */
+.totp-qr {
+  display: flex;
+  justify-content: center;
+  margin: 20px 0;
+  padding: 16px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+}
+
+.totp-qr svg,
+.totp-qr img {
+  width: 200px;
+  height: 200px;
+}
+
+.totp-secret {
+  overflow-x: auto;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: #f1f5f9;
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.totp-uri {
+  margin-top: 16px;
+}
+
+.totp-uri summary {
+  cursor: pointer;
+  color: #2563eb;
+  font-size: 0.9rem;
+}
