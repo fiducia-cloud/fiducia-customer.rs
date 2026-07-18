@@ -51,6 +51,17 @@ const CUSTOMER_WS_PATH: &str = "/app/ws";
 const CUSTOMER_EVENTS_PATH: &str = "/app/events";
 const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 const CUSTOMER_CSS: &str = include_str!("../assets/customer.css");
+/// Carries the primary-factor (aal1) Supabase token between `/login/verify` and
+/// `/login/mfa` while the user completes TOTP step-up. Short-lived and cleared
+/// the instant the aal2 app-session cookie is issued. Distinct from the app
+/// session cookie so a verified-TOTP user is never admitted on aal1 alone.
+const CUSTOMER_MFA_PENDING_COOKIE: &str = if cfg!(debug_assertions) {
+    "fiducia_customer_mfa_pending"
+} else {
+    "__Host-fiducia_customer_mfa_pending"
+};
+/// Step-up must complete promptly; the pending token self-expires.
+const MFA_PENDING_MAX_AGE_SECS: u64 = 300;
 const CUSTOMER_ORG_HEADER: &str = "x-fiducia-org-id";
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const CUSTOMER_CSRF_HEADER: &str = "x-fiducia-csrf";
