@@ -685,14 +685,23 @@ async fn customer_login_submit(
     response
 }
 
-fn customer_login_page(config: &AppConfig, message: Option<&str>) -> Response {
+/// Render an unauthenticated login-flow page and bind it to a fresh login-CSRF
+/// nonce cookie. `build` receives the HMAC token to embed in its form(s); the
+/// subsequent POST is validated by [`require_login_security`]. Every pre-session
+/// form page (login, OTP entry, MFA step-up) goes through here so they all share
+/// one CSRF contract.
+fn login_flow_page(config: &AppConfig, build: impl FnOnce(&str) -> Markup) -> Response {
     let nonce = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let token = config
         .request_security
         .csrf_token(&format!("login\0{nonce}"));
-    let mut response = customer_login_markup(message, &token).into_response();
+    let mut response = build(&token).into_response();
     append_set_cookie(&mut response, &make_customer_login_csrf_cookie(&nonce));
     response
+}
+
+fn customer_login_page(config: &AppConfig, message: Option<&str>) -> Response {
+    login_flow_page(config, |token| customer_login_markup(message, token))
 }
 
 fn require_login_security(
