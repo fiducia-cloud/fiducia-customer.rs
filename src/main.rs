@@ -243,6 +243,11 @@ fn build_router(config: AppConfig) -> Router {
         .route("/assets/htmx.min.js", get(htmx_js))
         .route("/assets/customer.css", get(customer_css))
         .route("/login", get(customer_login).post(customer_login_submit))
+        // Passwordless + MFA login flows (magic link / email OTP, phone OTP, and
+        // TOTP step-up). All share the login-CSRF cookie contract.
+        .route("/login/otp", post(customer_login_otp_submit))
+        .route("/login/verify", post(customer_login_verify_submit))
+        .route("/login/mfa", post(customer_login_mfa_submit))
         .route("/logout", axum::routing::post(customer_logout))
         .route("/api/customer/context", get(customer_context_json))
         .route(
