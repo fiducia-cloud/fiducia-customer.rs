@@ -511,7 +511,8 @@ async fn request_security_gate(
 ) -> Response {
     let path = request.uri().path();
     let method = request.method();
-    let browser_surface = path == "/login" || path == "/logout" || path.starts_with("/app");
+    let browser_surface =
+        path.starts_with("/login") || path == "/logout" || path.starts_with("/app");
     let customer_api = path.starts_with("/api/customer");
     let exact_origin_required = path == CUSTOMER_WS_PATH
         || (browser_surface && !matches!(*method, Method::GET | Method::HEAD));
