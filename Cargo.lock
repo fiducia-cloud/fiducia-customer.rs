@@ -540,7 +540,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sqlx 0.8.6",
  "tokio",
  "tower 0.5.3",
  "tower-http 0.5.2",
