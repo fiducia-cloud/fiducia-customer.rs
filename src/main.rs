@@ -1162,7 +1162,7 @@ async fn begin_mfa_step_up(
     };
     let factor = challenge.factor_id.clone();
     let challenge_id = challenge.challenge_id.clone();
-    let mut response = login_flow_page(&config, |token| {
+    let mut response = login_flow_page(config, |token| {
         mfa_challenge_markup(&factor, &challenge_id, token, None)
     });
     append_set_cookie(&mut response, &make_customer_mfa_pending_cookie(access_token));
