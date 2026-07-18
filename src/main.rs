@@ -1319,19 +1319,15 @@ async fn customer_mfa_activate(
             "Your authenticator app is now required at sign-in. Keep your recovery method up to date.",
         )
         .into_response(),
-        Err(error) => {
-            let detail = error.to_string();
-            supabase_auth_error_response(
-                error,
-                mfa_result_markup(
-                    "That code didn't match",
-                    "Enrollment is not active. Return to security and start again with the current code.",
-                )
-                .into_response(),
-                StatusCode::OK,
+        Err(error) => supabase_auth_error_response(
+            error,
+            mfa_result_markup(
+                "That code didn't match",
+                "Enrollment is not active. Return to security and start again with the current code.",
             )
-            .tap_detail(&detail)
-        }
+            .into_response(),
+            StatusCode::OK,
+        ),
     }
 }
 
