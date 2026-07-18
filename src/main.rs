@@ -398,6 +398,51 @@ struct AppConfig {
     request_security: RequestSecurity,
 }
 
+impl AppConfig {
+    /// A Supabase Auth client, when both the project URL and publishable key are
+    /// configured. `None` means passwordless/MFA flows are unavailable and their
+    /// handlers must fail closed with `customer_login_not_configured`.
+    fn supabase_auth(&self) -> Option<SupabaseAuth> {
+        match (
+            self.supabase_url.as_deref(),
+            self.supabase_publishable_key.as_deref(),
+        ) {
+            (Some(url), Some(key)) => Some(SupabaseAuth::new(url, key)),
+            _ => None,
+        }
+    }
+}
+
+/// Map a Supabase auth failure onto a rendered login response. `Rejected` is the
+/// user's fault (bad/expired code) and re-renders the given page with the message
+/// at 401; transport/parse failures surface as a 503 dependency error.
+fn supabase_auth_error_response(
+    error: SupabaseAuthError,
+    retry_page: Response,
+    mut retry_status: StatusCode,
+) -> Response {
+    match error {
+        SupabaseAuthError::Invalid(reason) => {
+            tracing::debug!(reason, "rejected malformed passwordless input");
+            let mut page = retry_page;
+            *page.status_mut() = StatusCode::BAD_REQUEST;
+            page
+        }
+        SupabaseAuthError::Rejected(detail) => {
+            tracing::info!(detail, "supabase rejected passwordless/mfa request");
+            let mut page = retry_page;
+            if retry_status == StatusCode::OK {
+                retry_status = StatusCode::UNAUTHORIZED;
+            }
+            *page.status_mut() = retry_status;
+            page
+        }
+        SupabaseAuthError::Unavailable(detail) => {
+            dependency_error("supabase", "supabase_auth_unavailable", detail)
+        }
+    }
+}
+
 fn request_security_error(error: RequestSecurityError) -> Response {
     tracing::warn!(reason = error.code(), "rejected untrusted customer request");
     (
