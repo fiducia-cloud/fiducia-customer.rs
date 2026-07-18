@@ -3,10 +3,10 @@
   "generatedBy": "remote/tools/generate-api-docs.mjs",
   "service": "fiducia-customer.rs",
   "language": "rust",
-  "routeCount": 38,
+  "routeCount": 58,
   "routeTypeCounts": {
     "service": 5,
-    "user-generated": 33
+    "user-generated": 53
   },
   "standardDocsRoutes": [
     "/docs/api",
@@ -25,6 +25,23 @@
       "purpose": "Service descriptor, home redirect, or root RPC endpoint.",
       "handlers": [
         "root"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/api/customer/activity",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_activity_json"
       ],
       "sourceFiles": [
         "remote/deployments/fiducia-customer.rs/src/main.rs"
@@ -274,6 +291,23 @@
       "notes": ""
     },
     {
+      "path": "/app/activity",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_activity"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
       "path": "/app/api-keys",
       "methods": [
         "GET",
@@ -378,6 +412,23 @@
       "notes": ""
     },
     {
+      "path": "/app/fragments/activity",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_activity_fragment"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
       "path": "/app/fragments/api-keys",
       "methods": [
         "GET"
@@ -388,6 +439,23 @@
       "purpose": "Custom code-first route derived from the service router.",
       "handlers": [
         "api_keys_fragment"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/fragments/notifications",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_notifications_fragment"
       ],
       "sourceFiles": [
         "remote/deployments/fiducia-customer.rs/src/main.rs"
@@ -446,6 +514,40 @@
       "notes": ""
     },
     {
+      "path": "/app/notifications",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_notifications"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/notifications/read",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "read_customer_notification_form"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
       "path": "/app/preferences",
       "methods": [
         "GET"
@@ -473,6 +575,74 @@
       "purpose": "Custom code-first route derived from the service router.",
       "handlers": [
         "customer_security"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/security/mfa",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_mfa_page"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/security/mfa/activate",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_mfa_activate"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/security/mfa/disable",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_mfa_disable"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/app/security/mfa/enroll",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_mfa_enroll"
       ],
       "sourceFiles": [
         "remote/deployments/fiducia-customer.rs/src/main.rs"
@@ -584,6 +754,100 @@
       "notes": ""
     },
     {
+      "path": "/auth/v1/factors/:id/challenge",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/auth/v1/factors/factor-1",
+      "methods": [
+        "GET",
+        "DELETE"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "header",
+        "move"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/auth/v1/factors/factor-1/challenge",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/auth/v1/factors/factor-1/verify",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/auth/v1/token",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/auth/v1/user",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
       "path": "/docs/api",
       "methods": [
         "GET"
@@ -654,6 +918,57 @@
       "notes": ""
     },
     {
+      "path": "/login/mfa",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_login_mfa_submit"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/login/otp",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_login_otp_submit"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/login/verify",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "customer_login_verify_submit"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
       "path": "/logout",
       "methods": [
         "POST"
@@ -665,6 +980,21 @@
       "handlers": [
         "customer_logout"
       ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/v1/me",
+      "methods": [
+        "GET"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "service-defined",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [],
       "sourceFiles": [
         "remote/deployments/fiducia-customer.rs/src/main.rs"
       ],

@@ -85,8 +85,7 @@ impl Factor {
     /// Only verified TOTP factors gate login; a half-finished `unverified` enroll
     /// must never lock a user out.
     pub fn is_verified_totp(&self) -> bool {
-        self.factor_type.as_deref() == Some("totp")
-            && self.status.as_deref() == Some("verified")
+        self.factor_type.as_deref() == Some("totp") && self.status.as_deref() == Some("verified")
     }
 }
 
@@ -206,10 +205,7 @@ impl SupabaseAuth {
     }
 
     /// List a user's registered factors (from `GET /auth/v1/user`).
-    pub async fn list_factors(
-        &self,
-        access_token: &str,
-    ) -> Result<Vec<Factor>, SupabaseAuthError> {
+    pub async fn list_factors(&self, access_token: &str) -> Result<Vec<Factor>, SupabaseAuthError> {
         let response = self
             .http
             .get(self.endpoint("user"))
@@ -258,12 +254,13 @@ impl SupabaseAuth {
             .await
             .map_err(|error| SupabaseAuthError::Unavailable(error.to_string()))?;
         let value = self.expect_success(response).await?;
-        let challenge_id = value
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or(SupabaseAuthError::Unavailable(
-                "challenge response missing id".to_string(),
-            ))?;
+        let challenge_id =
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or(SupabaseAuthError::Unavailable(
+                    "challenge response missing id".to_string(),
+                ))?;
         Ok(TotpChallenge {
             challenge_id: challenge_id.to_string(),
             factor_id: factor_id.to_string(),
@@ -519,7 +516,14 @@ mod tests {
     #[test]
     fn email_validation_accepts_real_and_rejects_garbage() {
         assert!(normalize_identifier(OtpChannel::Email, "  user@fiducia.cloud ").is_ok());
-        for bad in ["", "no-at", "a@b", "two@@at.com", "spaces in@x.com", "@x.com"] {
+        for bad in [
+            "",
+            "no-at",
+            "a@b",
+            "two@@at.com",
+            "spaces in@x.com",
+            "@x.com",
+        ] {
             assert!(
                 normalize_identifier(OtpChannel::Email, bad).is_err(),
                 "should reject {bad:?}"
@@ -631,7 +635,10 @@ mod tests {
             extract_error_message(r#"{"msg":"otp expired"}"#),
             "otp expired"
         );
-        assert_eq!(extract_error_message("   "), "supabase returned a non-success status with no body");
+        assert_eq!(
+            extract_error_message("   "),
+            "supabase returned a non-success status with no body"
+        );
     }
 
     #[test]

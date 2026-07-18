@@ -20,7 +20,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use maud::{html, Markup, PreEscaped, DOCTYPE};
@@ -1017,7 +1017,9 @@ fn otp_verify_markup(
         OtpChannel::Phone => "Check your phone",
     };
     let blurb = match channel {
-        OtpChannel::Email => "We emailed a magic link and a 6-digit code. Enter the code, or just tap the link.",
+        OtpChannel::Email => {
+            "We emailed a magic link and a 6-digit code. Enter the code, or just tap the link."
+        }
         OtpChannel::Phone => "We texted a 6-digit code to your phone. Enter it below.",
     };
     auth_page_shell(
@@ -1148,7 +1150,8 @@ async fn customer_login_otp_submit(
         return request_security_error(error);
     }
     let Some(channel) = parse_otp_channel(&form.method) else {
-        let mut page = customer_login_page(&config, Some("Choose email or phone to receive a code."));
+        let mut page =
+            customer_login_page(&config, Some("Choose email or phone to receive a code."));
         *page.status_mut() = StatusCode::BAD_REQUEST;
         return page;
     };
@@ -1243,7 +1246,10 @@ async fn begin_mfa_step_up(
     let mut response = login_flow_page(config, |token| {
         mfa_challenge_markup(&factor, &challenge_id, token, None)
     });
-    append_set_cookie(&mut response, &make_customer_mfa_pending_cookie(access_token));
+    append_set_cookie(
+        &mut response,
+        &make_customer_mfa_pending_cookie(access_token),
+    );
     response
 }
 
@@ -4302,6 +4308,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::routing::delete;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt; // for `oneshot`
@@ -5303,7 +5310,9 @@ mod tests {
                     .header(header::ORIGIN, "https://app.fiducia.cloud")
                     .header("sec-fetch-site", "same-origin")
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from("csrf_token=unused&factor_id=factor-1&code=123456"))
+                    .body(Body::from(
+                        "csrf_token=unused&factor_id=factor-1&code=123456",
+                    ))
                     .unwrap(),
             )
             .await
