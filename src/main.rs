@@ -1026,10 +1026,18 @@ fn customer_login_markup(message: Option<&str>, csrf_token: &str) -> Markup {
                 button type="submit" { "Sign in" }
             }
 
-            // Passwordless email — magic link + 6-digit code (also self-signup).
+            // Passwordless email — 6-digit code (also self-signup).
+            //
+            // Copy says "code", not "magic link", because the link is not wired:
+            // `send_otp` passes no `email_redirect_to` and this router has no
+            // callback route, so the link in Supabase's mail lands on the
+            // project's Site URL — outside this app's __Host-/HttpOnly cookie
+            // boundary. Promising one-tap sign-in would be promising a flow that
+            // dead-ends. Wiring it properly (redirect_to + a callback that
+            // exchanges token_hash and runs the same step-up gate) is follow-up.
             form method="post" action="/login/otp" hx-post="/login/otp" hx-target="body" hx-swap="outerHTML" {
-                h2 { "Email magic link" }
-                p class="muted" { "We email a one-tap link and a 6-digit code. New here? This also creates your account." }
+                h2 { "Email a sign-in code" }
+                p class="muted" { "We email you a 6-digit code. New here? This also creates your account." }
                 input type="hidden" name="csrf_token" value=(csrf_token);
                 input type="hidden" name="method" value="email";
                 label for="magic-email" { "Email" }
