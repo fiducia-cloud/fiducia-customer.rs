@@ -100,6 +100,12 @@ pub async fn list_sessions(
     Ok(sess::Entity::find()
         .filter(sess::Column::UserId.eq(user_id))
         .order_by_desc(sess::Column::LastSeen)
+        // Bound the result like every other read in this file. This renders into
+        // the /app/security device table on every load (and every polled htmx
+        // fragment); a user with many devices/stale sessions otherwise pulls an
+        // unbounded row set into memory and markup. Newest-first, so the cap
+        // keeps the sessions that matter.
+        .limit(MAX_SESSIONS)
         .all(db)
         .await?
         .into_iter()
