@@ -1270,6 +1270,19 @@ async fn customer_login_verify_submit(
         );
     };
     let identifier = form.identifier.trim().to_string();
+    // A 6-digit code is a 10^6 keyspace and the success/failure oracle here is
+    // unambiguous (303 vs 401), so without an attempt cap the code is grindable.
+    // Keyed on the identifier being attacked, not the caller, so rotating source
+    // addresses does not buy fresh attempts against one account.
+    let verify_budget = throttle::check(throttle::Bucket::OtpVerifyPerIdentifier, &identifier);
+    if !verify_budget.allowed {
+        return throttled_response(
+            login_flow_page(&config, |token| {
+                otp_verify_markup(channel, &identifier, token, Some(THROTTLE_MESSAGE))
+            }),
+            verify_budget.retry_after_secs,
+        );
+    }
     let session = match supabase.verify_otp(channel, &identifier, &form.token).await {
         Ok(session) => session,
         Err(error) => {
