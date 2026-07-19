@@ -7,6 +7,7 @@ mod entity;
 mod request_security;
 mod store;
 mod supabase_auth;
+mod throttle;
 
 use auth::{
     bearer_token, cookie_value, Authenticator, CustomerCtx, CUSTOMER_LOGIN_CSRF_COOKIE,
@@ -258,7 +259,7 @@ fn build_router(config: AppConfig) -> Router {
         .route("/assets/htmx.min.js", get(htmx_js))
         .route("/assets/customer.css", get(customer_css))
         .route("/login", get(customer_login).post(customer_login_submit))
-        // Passwordless + MFA login flows (magic link / email OTP, phone OTP, and
+        // Passwordless + MFA login flows (email OTP, phone OTP, and
         // TOTP step-up). All share the login-CSRF cookie contract.
         .route("/login/otp", post(customer_login_otp_submit))
         .route("/login/verify", post(customer_login_verify_submit))
@@ -385,12 +386,6 @@ fn build_router(config: AppConfig) -> Router {
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("upgrade-insecure-requests"),
         ))
-        // Hardening stack (outermost last): catch handler panics, bound request
-        // time, and cap body size.
-        .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new())
         // The login-flow fix prevents a new password grant from becoming a
         // session before TOTP, but this is the token-level backstop: every
         // authenticated customer surface rejects an `aal1` token when Supabase
@@ -408,7 +403,19 @@ fn build_router(config: AppConfig) -> Router {
         .layer(middleware::from_fn_with_state(
             sensitive_header_context,
             security_headers,
-        ));
+        ))
+        // Hardening stack, applied LAST so it is genuinely OUTERMOST.
+        //
+        // Ordering is a correctness property, not style: `.layer()` wraps what
+        // came before, so anything added after these runs outside them. When the
+        // gates above were layered last they escaped both guards — the AAL gate
+        // calls `fiducia-auth` over the network, so a hung upstream ignored
+        // `REQUEST_TIMEOUT_SECS` entirely and a panic inside a gate bypassed
+        // `CatchPanicLayer` and killed the connection. Keep these at the bottom.
+        .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
+        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES));
 
     match customer_app_origin {
         Some(origin) => router.layer(customer_cors(origin)),
@@ -725,6 +732,15 @@ async fn customer_login_submit(
         *response.status_mut() = StatusCode::BAD_REQUEST;
         return response;
     }
+    // Bound credential stuffing against one account before spending an upstream
+    // round trip on it.
+    let password_budget = throttle::check(throttle::Bucket::PasswordPerIdentifier, email);
+    if !password_budget.allowed {
+        return throttled_response(
+            customer_login_page(&config, Some(THROTTLE_MESSAGE)),
+            password_budget.retry_after_secs,
+        );
+    }
     let (Some(supabase_url), Some(publishable_key)) = (
         config.supabase_url.as_deref(),
         config.supabase_publishable_key.as_deref(),
@@ -809,6 +825,35 @@ fn login_flow_page(config: &AppConfig, build: impl FnOnce(&str) -> Markup) -> Re
 fn customer_login_page(config: &AppConfig, message: Option<&str>) -> Response {
     login_flow_page(config, |token| customer_login_markup(message, token))
 }
+
+/// The client identity for per-client throttle buckets. See
+/// [`throttle::client_key`] for why only the LAST `X-Forwarded-For` hop is
+/// trustworthy behind the nginx gateway.
+fn throttle_client_key(headers: &HeaderMap) -> String {
+    throttle::client_key(
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+/// Refuse an over-budget attempt: 429 + `Retry-After`, re-rendering `page` so the
+/// user still gets a usable form.
+///
+/// The message is deliberately generic and identical whether or not the
+/// identifier exists — a throttle response must not become the account-existence
+/// oracle that the rest of this flow is careful to avoid.
+fn throttled_response(page: Response, retry_after_secs: u64) -> Response {
+    let mut response = page;
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+const THROTTLE_MESSAGE: &str =
+    "Too many attempts. Wait a few minutes before trying again.";
 
 fn require_login_security(
     headers: &HeaderMap,
@@ -926,6 +971,12 @@ async fn customer_logout(
     }
     let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response();
     append_set_cookie(&mut response, &clear_customer_session_cookie());
+    // Clear the transient login cookies too. A user who abandons a half-finished
+    // step-up and then signs out would otherwise leave a live pre-2FA Supabase
+    // bearer in the browser for the rest of its 300s window — on a shared
+    // machine that is a residual credential, and "sign out" must mean all of it.
+    append_set_cookie(&mut response, &clear_customer_mfa_pending_cookie());
+    append_set_cookie(&mut response, &clear_customer_login_csrf_cookie());
     response
 }
 
@@ -975,10 +1026,18 @@ fn customer_login_markup(message: Option<&str>, csrf_token: &str) -> Markup {
                 button type="submit" { "Sign in" }
             }
 
-            // Passwordless email — magic link + 6-digit code (also self-signup).
+            // Passwordless email — 6-digit code (also self-signup).
+            //
+            // Copy says "code", not "magic link", because the link is not wired:
+            // `send_otp` passes no `email_redirect_to` and this router has no
+            // callback route, so the link in Supabase's mail lands on the
+            // project's Site URL — outside this app's __Host-/HttpOnly cookie
+            // boundary. Promising one-tap sign-in would be promising a flow that
+            // dead-ends. Wiring it properly (redirect_to + a callback that
+            // exchanges token_hash and runs the same step-up gate) is follow-up.
             form method="post" action="/login/otp" hx-post="/login/otp" hx-target="body" hx-swap="outerHTML" {
-                h2 { "Email magic link" }
-                p class="muted" { "We email a one-tap link and a 6-digit code. New here? This also creates your account." }
+                h2 { "Email a sign-in code" }
+                p class="muted" { "We email you a 6-digit code. New here? This also creates your account." }
                 input type="hidden" name="csrf_token" value=(csrf_token);
                 input type="hidden" name="method" value="email";
                 label for="magic-email" { "Email" }
@@ -1018,7 +1077,7 @@ fn otp_verify_markup(
     };
     let blurb = match channel {
         OtpChannel::Email => {
-            "We emailed a magic link and a 6-digit code. Enter the code, or just tap the link."
+            "We emailed you a 6-digit code. Enter it below."
         }
         OtpChannel::Phone => "We texted a 6-digit code to your phone. Enter it below.",
     };
@@ -1139,7 +1198,7 @@ async fn finalize_customer_login(config: &AppConfig, access_token: &str) -> Resp
     response
 }
 
-/// `POST /login/otp` — dispatch a magic link / one-time code over email or phone.
+/// `POST /login/otp` — dispatch a one-time code over email or phone.
 /// `should_create_user` is true so this doubles as self-service signup.
 async fn customer_login_otp_submit(
     State(config): State<AppConfig>,
@@ -1163,6 +1222,30 @@ async fn customer_login_otp_submit(
         );
     };
     let identifier = form.identifier.trim().to_string();
+    // Two budgets, two different abuses. Per-identifier stops a victim being
+    // spammed with texts/mail they never asked for; per-client caps what one
+    // caller can bill us when it rotates the destination every request (SMS
+    // pumping). Both are checked BEFORE `send_otp` — the cost is the dispatch.
+    let identifier_budget =
+        throttle::check(throttle::Bucket::OtpDispatchPerIdentifier, &identifier);
+    if !identifier_budget.allowed {
+        return throttled_response(
+            login_flow_page(&config, |token| {
+                otp_verify_markup(channel, &identifier, token, Some(THROTTLE_MESSAGE))
+            }),
+            identifier_budget.retry_after_secs,
+        );
+    }
+    let client_budget = throttle::check(
+        throttle::Bucket::OtpDispatchPerClient,
+        &throttle_client_key(&headers),
+    );
+    if !client_budget.allowed {
+        return throttled_response(
+            customer_login_page(&config, Some(THROTTLE_MESSAGE)),
+            client_budget.retry_after_secs,
+        );
+    }
     match supabase.send_otp(channel, &identifier, true).await {
         Ok(()) => login_flow_page(&config, |token| {
             otp_verify_markup(channel, &identifier, token, None)
@@ -1201,6 +1284,19 @@ async fn customer_login_verify_submit(
         );
     };
     let identifier = form.identifier.trim().to_string();
+    // A 6-digit code is a 10^6 keyspace and the success/failure oracle here is
+    // unambiguous (303 vs 401), so without an attempt cap the code is grindable.
+    // Keyed on the identifier being attacked, not the caller, so rotating source
+    // addresses does not buy fresh attempts against one account.
+    let verify_budget = throttle::check(throttle::Bucket::OtpVerifyPerIdentifier, &identifier);
+    if !verify_budget.allowed {
+        return throttled_response(
+            login_flow_page(&config, |token| {
+                otp_verify_markup(channel, &identifier, token, Some(THROTTLE_MESSAGE))
+            }),
+            verify_budget.retry_after_secs,
+        );
+    }
     let session = match supabase.verify_otp(channel, &identifier, &form.token).await {
         Ok(session) => session,
         Err(error) => {
@@ -1276,6 +1372,24 @@ async fn customer_login_mfa_submit(
             "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
         );
     };
+    // The challenge is deliberately kept alive across wrong codes so a user can
+    // retry the current one — which equally lets an attacker holding the primary
+    // factor grind the second. This cap is what makes the second factor an
+    // actual barrier rather than a delegated one.
+    let step_up_budget = throttle::check(
+        throttle::Bucket::MfaVerifyPerClient,
+        &throttle_client_key(&headers),
+    );
+    if !step_up_budget.allowed {
+        let factor = form.factor_id.clone();
+        let challenge_id = form.challenge_id.clone();
+        return throttled_response(
+            login_flow_page(&config, |token| {
+                mfa_challenge_markup(&factor, &challenge_id, token, Some(THROTTLE_MESSAGE))
+            }),
+            step_up_budget.retry_after_secs,
+        );
+    }
     let challenge = supabase_auth::TotpChallenge {
         challenge_id: form.challenge_id.clone(),
         factor_id: form.factor_id.clone(),
