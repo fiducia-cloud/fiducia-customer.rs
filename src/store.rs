@@ -14,6 +14,11 @@ use crate::entity::{
     customer_sessions as sess, users,
 };
 
+/// Upper bound on sessions returned for the /app/security device list. Far above
+/// any real device count, but a hard ceiling so the query can never render an
+/// unbounded row set (see `list_sessions`).
+const MAX_SESSIONS: u64 = 200;
+
 /// Ensure a local `users` row exists for the authenticated Supabase user and
 /// return its id. Supabase remains the source of truth for identity.
 pub async fn ensure_user(
@@ -100,6 +105,12 @@ pub async fn list_sessions(
     Ok(sess::Entity::find()
         .filter(sess::Column::UserId.eq(user_id))
         .order_by_desc(sess::Column::LastSeen)
+        // Bound the result like every other read in this file. This renders into
+        // the /app/security device table on every load (and every polled htmx
+        // fragment); a user with many devices/stale sessions otherwise pulls an
+        // unbounded row set into memory and markup. Newest-first, so the cap
+        // keeps the sessions that matter.
+        .limit(MAX_SESSIONS)
         .all(db)
         .await?
         .into_iter()
