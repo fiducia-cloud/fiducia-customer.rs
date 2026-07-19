@@ -12,7 +12,6 @@ use auth::{
     bearer_token, cookie_value, Authenticator, CustomerCtx, CUSTOMER_LOGIN_CSRF_COOKIE,
     CUSTOMER_SESSION_COOKIE,
 };
-use supabase_auth::{required_totp_factor, OtpChannel, SupabaseAuth, SupabaseAuthError};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::Request;
 use axum::extract::{Form, Path, Query, State};
@@ -34,6 +33,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use supabase_auth::{required_totp_factor, OtpChannel, SupabaseAuth, SupabaseAuthError};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -241,6 +241,7 @@ fn build_router(config: AppConfig) -> Router {
         .fallback(ServeFile::new(config.static_dir.join("404.html")));
     let customer_app_origin = config.customer_app_origin.clone();
     let request_security = config.request_security.clone();
+    let mfa_assurance_config = config.clone();
     let sensitive_header_context = SensitiveHeaderContext {
         customer_app_host: config.customer_app_host.clone(),
         customer_site_mode: config.customer_site_mode,
@@ -390,6 +391,16 @@ fn build_router(config: AppConfig) -> Router {
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new())
+        // The login-flow fix prevents a new password grant from becoming a
+        // session before TOTP, but this is the token-level backstop: every
+        // authenticated customer surface rejects an `aal1` token when Supabase
+        // says that account has a verified factor. New routes inherit this gate.
+        .layer(middleware::from_fn_with_state(
+            mfa_assurance_config,
+            customer_mfa_assurance_gate,
+        ))
+        // Keep host, origin, and CSRF checks outside the authentication/AAL
+        // gate so rejected requests cannot trigger upstream auth calls.
         .layer(middleware::from_fn_with_state(
             request_security,
             request_security_gate,
@@ -437,6 +448,36 @@ impl AppConfig {
             (Some(url), Some(key)) => Some(SupabaseAuth::new(url, key)),
             _ => None,
         }
+    }
+
+    /// Authenticate a customer session and enforce the MFA policy from the
+    /// currently verified token plus Supabase's current factor state. A JWT can
+    /// outlive factor enrollment, so `aal1` alone is insufficient: an enrolled
+    /// factor makes `aal2` mandatory. The factor lookup is intentionally live
+    /// and failures deny access rather than reintroducing a password-only path.
+    async fn authenticate_mfa_aware(&self, headers: &HeaderMap) -> Result<CustomerCtx, Response> {
+        let customer = self.authenticator.authenticate(headers).await?;
+        if customer.is_aal2() {
+            return Ok(customer);
+        }
+
+        let token = customer_access_token(headers)
+            .ok_or_else(|| deny_json(StatusCode::UNAUTHORIZED, "missing_customer_session"))?;
+        let supabase = self.supabase_auth().ok_or_else(|| {
+            dependency_error(
+                "supabase",
+                "mfa_state_unavailable",
+                "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required to verify aal1 sessions",
+            )
+        })?;
+        let factors = supabase
+            .list_factors(&token)
+            .await
+            .map_err(|error| dependency_error("supabase", "mfa_state_unavailable", error))?;
+        if required_totp_factor(&factors).is_some() {
+            return Err(deny_json(StatusCode::UNAUTHORIZED, "mfa_step_up_required"));
+        }
+        Ok(customer)
     }
 }
 
@@ -539,6 +580,39 @@ async fn request_security_gate(
     };
     if let Err(error) = result {
         return request_security_error(error);
+    }
+    next.run(request).await
+}
+
+/// Apply the AAL invariant once at the router boundary, rather than relying on
+/// each handler (or a future route) to remember it. Login and logout remain
+/// reachable: an `aal1` browser must be able to complete MFA or clear a stale
+/// cookie. The root is protected only when this host serves the customer app;
+/// the public marketing host remains public.
+async fn customer_mfa_assurance_gate(
+    State(config): State<AppConfig>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    // Preserve route-method semantics: the catch-up endpoint is GET-only, and
+    // an unsupported method must remain a 405 rather than being transformed
+    // into an authentication response by this outer middleware.
+    let unsupported_sync_method = path.starts_with("/api/customer/sync/")
+        && !matches!(*request.method(), Method::GET | Method::HEAD);
+    let protected = path.starts_with("/app")
+        || path.starts_with("/api/customer")
+        || (path == "/" && should_serve_customer_app(&config, request.headers()));
+    if protected && !unsupported_sync_method {
+        if let Err(response) = config.authenticate_mfa_aware(request.headers()).await {
+            // Browser pages previously turn an absent/invalid session into the
+            // login flow. Preserve that UX for the new aal1 backstop as well;
+            // JSON customer APIs retain an explicit 401 for programmatic callers.
+            if response.status() == StatusCode::UNAUTHORIZED && path.starts_with("/app") {
+                return (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response();
+            }
+            return response;
+        }
     }
     next.run(request).await
 }
@@ -943,7 +1017,9 @@ fn otp_verify_markup(
         OtpChannel::Phone => "Check your phone",
     };
     let blurb = match channel {
-        OtpChannel::Email => "We emailed a magic link and a 6-digit code. Enter the code, or just tap the link.",
+        OtpChannel::Email => {
+            "We emailed a magic link and a 6-digit code. Enter the code, or just tap the link."
+        }
         OtpChannel::Phone => "We texted a 6-digit code to your phone. Enter it below.",
     };
     auth_page_shell(
@@ -1074,7 +1150,8 @@ async fn customer_login_otp_submit(
         return request_security_error(error);
     }
     let Some(channel) = parse_otp_channel(&form.method) else {
-        let mut page = customer_login_page(&config, Some("Choose email or phone to receive a code."));
+        let mut page =
+            customer_login_page(&config, Some("Choose email or phone to receive a code."));
         *page.status_mut() = StatusCode::BAD_REQUEST;
         return page;
     };
@@ -1169,7 +1246,10 @@ async fn begin_mfa_step_up(
     let mut response = login_flow_page(config, |token| {
         mfa_challenge_markup(&factor, &challenge_id, token, None)
     });
-    append_set_cookie(&mut response, &make_customer_mfa_pending_cookie(access_token));
+    append_set_cookie(
+        &mut response,
+        &make_customer_mfa_pending_cookie(access_token),
+    );
     response
 }
 
@@ -1240,6 +1320,9 @@ struct MfaActivateForm {
 struct MfaDisableForm {
     csrf_token: String,
     factor_id: String,
+    /// A current code is required even for an aal2 session: a long-lived
+    /// stepped-up token alone must not be enough to remove an authenticator.
+    code: String,
 }
 
 /// The raw customer Supabase access token backing the current session, read from
@@ -1370,6 +1453,14 @@ async fn customer_mfa_disable(
         Ok(customer) => customer,
         Err(response) => return response,
     };
+    // Supabase itself also enforces this today, but keep the assurance check at
+    // our boundary: factor removal is an account-takeover primitive and must
+    // never depend on a downstream policy remaining configured. The router-wide
+    // gate additionally prevents an aal1 session for an enrolled account from
+    // reaching this handler at all.
+    if !customer.is_aal2() {
+        return deny_json(StatusCode::UNAUTHORIZED, "mfa_step_up_required");
+    }
     if let Err(error) = require_form_security(&headers, &config, &customer, &form.csrf_token) {
         return request_security_error(error);
     }
@@ -1383,7 +1474,42 @@ async fn customer_mfa_disable(
             "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required",
         );
     };
-    match supabase.unenroll(&token, &form.factor_id).await {
+    // Re-challenge the exact factor immediately before deletion. This makes
+    // removal a fresh possession proof, not merely a reuse of an earlier aal2
+    // session. Use the returned stepped-up access token for the destructive
+    // call so Supabase receives the same assurance we just established.
+    let challenge = match supabase.challenge(&token, &form.factor_id).await {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            return supabase_auth_error_response(
+                error,
+                mfa_result_markup(
+                    "Couldn't confirm your authenticator",
+                    "Enter a current code from the authenticator you want to remove.",
+                )
+                .into_response(),
+                StatusCode::UNAUTHORIZED,
+            );
+        }
+    };
+    let stepped_up = match supabase.verify_factor(&token, &challenge, &form.code).await {
+        Ok(session) => session,
+        Err(error) => {
+            return supabase_auth_error_response(
+                error,
+                mfa_result_markup(
+                    "That code didn't match",
+                    "The authenticator was not removed. Enter its current 6-digit code and try again.",
+                )
+                .into_response(),
+                StatusCode::UNAUTHORIZED,
+            );
+        }
+    };
+    match supabase
+        .unenroll(&stepped_up.access_token, &form.factor_id)
+        .await
+    {
         Ok(()) => mfa_result_markup(
             "Authenticator removed",
             "That authenticator will no longer be requested at sign-in.",
@@ -1423,6 +1549,11 @@ fn mfa_settings_markup(
                             form method="post" action="/app/security/mfa/disable" hx-post="/app/security/mfa/disable" hx-target="body" hx-swap="outerHTML" {
                                 input type="hidden" name="csrf_token" value=(csrf_token);
                                 input type="hidden" name="factor_id" value=(factor.id);
+                                label {
+                                    "Current code from this authenticator"
+                                    input name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                                        pattern="[0-9]*" minlength="6" maxlength="8" required;
+                                }
                                 button type="submit" class="link-button" { "Remove" }
                             }
                         }
@@ -4177,6 +4308,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::routing::delete;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt; // for `oneshot`
 
@@ -4345,6 +4478,7 @@ mod tests {
                 user_id: "00000000-0000-4000-8000-000000000002".to_string(),
                 email: Some("test@fiducia.cloud".to_string()),
                 orgs: vec!["00000000-0000-0000-0000-000000000001".to_string()],
+                aal: "aal2".to_string(),
                 credential_binding: "authorization\0verified-supabase-session".to_string(),
                 cookie_authenticated: false,
             })),
@@ -4369,6 +4503,7 @@ mod tests {
             user_id: "00000000-0000-4000-8000-000000000099".to_string(),
             email: Some("multi-org@fiducia.cloud".to_string()),
             orgs: vec![ORG_A.to_string(), ORG_B.to_string()],
+            aal: "aal2".to_string(),
             credential_binding: "authorization\0verified-supabase-session".to_string(),
             cookie_authenticated: false,
         })))
@@ -5088,6 +5223,231 @@ mod tests {
         supabase_task.abort();
     }
 
+    // H13 regression: C1 protects the password handler, but a pre-existing or
+    // future aal1 session must also be stopped at the authenticated router
+    // boundary when Supabase reports a verified factor for that account.
+    #[tokio::test]
+    async fn aal1_session_with_a_verified_factor_is_rejected_on_customer_routes() {
+        let auth = Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": {
+                        "user_id": "00000000-0000-4000-8000-000000000002",
+                        "email": "customer@example.com",
+                        "orgs": [ORG_A],
+                        "roles": [],
+                        "aal": "aal1"
+                    }
+                }))
+            }),
+        );
+        let supabase = Router::new().route(
+            "/auth/v1/user",
+            get(|| async {
+                Json(json!({
+                    "factors": [
+                        { "id": "factor-1", "factor_type": "totp", "status": "verified" }
+                    ]
+                }))
+            }),
+        );
+        let (auth_url, auth_task) = spawn_mock(auth).await;
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let mut config = test_config();
+        config.authenticator = Authenticator::AuthService(auth_url);
+        config.supabase_url = Some(supabase_url);
+        config.supabase_publishable_key = Some("publishable-test-key".to_string());
+
+        let response = build_router(config)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/customer/context")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .header(header::AUTHORIZATION, "Bearer aal1-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("mfa_step_up_required"));
+        auth_task.abort();
+        supabase_task.abort();
+    }
+
+    // H14 regression: a single-factor context must never remove an MFA factor,
+    // even if a future router refactor accidentally bypasses the global gate.
+    #[tokio::test]
+    async fn mfa_disable_requires_aal2_at_the_handler_boundary() {
+        let supabase = Router::new().route(
+            "/auth/v1/user",
+            get(|| async { Json(json!({ "factors": [] })) }),
+        );
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let mut config = test_config();
+        config.supabase_url = Some(supabase_url);
+        config.supabase_publishable_key = Some("publishable-test-key".to_string());
+        config.authenticator = Authenticator::Static(Arc::new(CustomerCtx {
+            user_id: "00000000-0000-4000-8000-000000000002".to_string(),
+            email: Some("customer@example.com".to_string()),
+            orgs: vec![ORG_A.to_string()],
+            aal: "aal1".to_string(),
+            credential_binding: "authorization\0aal1-session".to_string(),
+            cookie_authenticated: false,
+        }));
+
+        let response = build_router(config)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/app/security/mfa/disable")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .header(header::AUTHORIZATION, "Bearer aal1-session")
+                    .header(header::ORIGIN, "https://app.fiducia.cloud")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "csrf_token=unused&factor_id=factor-1&code=123456",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("mfa_step_up_required"));
+        supabase_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mfa_disable_never_unenrolls_without_a_fresh_totp_verification() {
+        let delete_calls = Arc::new(AtomicUsize::new(0));
+        let deleted = delete_calls.clone();
+        // Deliberately omit the challenge/verify routes. A password attacker who
+        // has an old aal2 session but no current TOTP code must not reach DELETE.
+        let supabase = Router::new().route(
+            "/auth/v1/factors/factor-1",
+            delete(move || {
+                let deleted = deleted.clone();
+                async move {
+                    deleted.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let customer = CustomerCtx {
+            user_id: "00000000-0000-4000-8000-000000000002".to_string(),
+            email: Some("customer@example.com".to_string()),
+            orgs: vec![ORG_A.to_string()],
+            aal: "aal2".to_string(),
+            credential_binding: "authorization\0old-aal2-session".to_string(),
+            cookie_authenticated: false,
+        };
+        let mut config = test_config();
+        let csrf = customer_csrf_token(&config, &customer);
+        config.supabase_url = Some(supabase_url);
+        config.supabase_publishable_key = Some("publishable-test-key".to_string());
+        config.authenticator = Authenticator::Static(Arc::new(customer));
+
+        let response = build_router(config)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/app/security/mfa/disable")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .header(header::AUTHORIZATION, "Bearer old-aal2-session")
+                    .header(header::ORIGIN, "https://app.fiducia.cloud")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={csrf}&factor_id=factor-1&code=123456"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        assert_eq!(
+            delete_calls.load(Ordering::Relaxed),
+            0,
+            "unenrollment requires a current TOTP challenge and verification"
+        );
+        supabase_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mfa_disable_uses_the_freshly_verified_session_for_unenrollment() {
+        let delete_authorization = Arc::new(Mutex::new(None));
+        let captured_authorization = delete_authorization.clone();
+        let supabase = Router::new()
+            .route(
+                "/auth/v1/factors/factor-1/challenge",
+                post(|| async { Json(json!({ "id": "challenge-1" })) }),
+            )
+            .route(
+                "/auth/v1/factors/factor-1/verify",
+                post(|| async { Json(json!({ "access_token": "fresh-aal2-session" })) }),
+            )
+            .route(
+                "/auth/v1/factors/factor-1",
+                delete(move |headers: HeaderMap| {
+                    let captured_authorization = captured_authorization.clone();
+                    async move {
+                        *captured_authorization.lock().unwrap() = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let customer = CustomerCtx {
+            user_id: "00000000-0000-4000-8000-000000000002".to_string(),
+            email: Some("customer@example.com".to_string()),
+            orgs: vec![ORG_A.to_string()],
+            aal: "aal2".to_string(),
+            credential_binding: "authorization\0old-aal2-session".to_string(),
+            cookie_authenticated: false,
+        };
+        let mut config = test_config();
+        let csrf = customer_csrf_token(&config, &customer);
+        config.supabase_url = Some(supabase_url);
+        config.supabase_publishable_key = Some("publishable-test-key".to_string());
+        config.authenticator = Authenticator::Static(Arc::new(customer));
+
+        let response = build_router(config)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/app/security/mfa/disable")
+                    .header(header::HOST, "app.fiducia.cloud")
+                    .header(header::AUTHORIZATION, "Bearer old-aal2-session")
+                    .header(header::ORIGIN, "https://app.fiducia.cloud")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "csrf_token={csrf}&factor_id=factor-1&code=123456"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            delete_authorization.lock().unwrap().as_deref(),
+            Some("Bearer fresh-aal2-session")
+        );
+        supabase_task.abort();
+    }
+
     #[tokio::test]
     async fn customer_pages_redirect_missing_sessions_to_customer_login() {
         let mut config = test_config();
@@ -5510,6 +5870,7 @@ mod tests {
             user_id: "00000000-0000-4000-8000-000000000002".to_string(),
             email: Some("cookie@fiducia.cloud".to_string()),
             orgs: vec![ORG_A.to_string()],
+            aal: "aal2".to_string(),
             credential_binding: "cookie\0customer.jwt".to_string(),
             cookie_authenticated: true,
         };
@@ -5757,12 +6118,20 @@ mod interface_contract_tests {
     fn generated_interfaces_are_importable() {
         let request = LockAcquireManyRequest {
             keys: vec!["orders/42".to_string(), "inventory/sku-7".to_string()],
-            holder: Some("worker-a".to_string()),
+            holder: "worker-a".to_string(),
+            request_id: Some("interface-contract-attempt".to_string()),
             ttl_ms: Some(30_000),
-            wait: Some(false),
+            wait: Some(true),
+            wait_timeout_ms: Some(5_000),
         };
 
         assert_eq!(request.keys.len(), 2);
+        assert_eq!(request.holder, "worker-a");
+        assert_eq!(
+            request.request_id.as_deref(),
+            Some("interface-contract-attempt")
+        );
+        assert_eq!(request.wait_timeout_ms, Some(5_000));
         assert!(matches!(
             ProposeErrorReason::NotLeader,
             ProposeErrorReason::NotLeader

@@ -182,12 +182,13 @@ equals `INTERFACES_SHA` before compiling with the committed Cargo lockfile. CI,
 `Cargo.toml`, and the builder image use Rust 1.97; the registry-verified base and
 distroless runtime are both pinned by digest.
 
-The test deployment workflow is intentionally fail-closed: it requires a valid
-`KUBE_CONFIG_TEST`, an existing `fiducia-backend` deployment, and a successful
-rollout. The deployment configuration must provide `CUSTOMER_APP_ORIGIN` and
-`FIDUCIA_CUSTOMER_CSRF_SECRET` from environment/secret management before the
-release binary can become ready; the repository never supplies production
-secret values.
+The Docker workflow publishes `ghcr.io/fiducia-cloud/fiducia-backend` under the
+exact source commit tag, with provenance and an SBOM. It contains the checked-in
+static fallback and performs no source clone or asset build at pod startup.
+Deployment is pull-based GitOps: the cluster configuration must provide
+`CUSTOMER_APP_ORIGIN` and `FIDUCIA_CUSTOMER_CSRF_SECRET` through secret
+management before the release binary can become ready; this repository never
+receives cluster credentials or supplies production secret values.
 
 To test another reviewed contract revision, pass its full commit id and update
 the CI checkout pin in the same reviewed change:

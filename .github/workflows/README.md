@@ -8,9 +8,13 @@ GitHub Actions pipelines for this service.
   `fiducia-cloud/fiducia-interfaces` repo at the exact commit also pinned by the
   Dockerfile so the path-dependency crates
   (`../fiducia-interfaces/generated/...`) resolve reproducibly.
+- **`docker.yml`** — on `main`, publishes the customer/server image under only
+  its immutable commit-SHA tag, with maximum BuildKit provenance and an SBOM.
+  The image contains the reviewed static-site fallback; production pods do not
+  clone source or build assets at startup.
 
-This repository is validation-only: it does not receive kubeconfig credentials
-or deploy itself. Fleet deployment is owned by `fiducia-monorepo`.
+This repository never receives Kubernetes credentials or deploys itself. Argo
+CD consumes digest-pinned desired state promoted through `fiducia-monorepo`.
 
 ## Security baseline
 

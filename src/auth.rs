@@ -51,6 +51,11 @@ pub struct CustomerCtx {
     pub email: Option<String>,
     /// Orgs the user belongs to (admin-controlled claims; see fiducia-auth).
     pub orgs: Vec<String>,
+    /// The verified Supabase Authenticator Assurance Level forwarded by
+    /// fiducia-auth. Missing values are deliberately single-factor so a legacy
+    /// auth response can never accidentally bypass MFA enforcement.
+    #[serde(default = "default_assurance_level")]
+    pub aal: String,
     /// Opaque request-CSRF HMAC input. Never render or log this value.
     #[serde(skip)]
     pub(crate) credential_binding: String,
@@ -66,6 +71,14 @@ impl CustomerCtx {
     pub fn is_browser_session(&self) -> bool {
         self.cookie_authenticated || self.credential_binding.starts_with("development\0")
     }
+
+    pub fn is_aal2(&self) -> bool {
+        self.aal == "aal2"
+    }
+}
+
+fn default_assurance_level() -> String {
+    "aal1".to_string()
 }
 
 /// How a request is authenticated. Production verifies via fiducia-auth; tests
@@ -82,9 +95,22 @@ pub enum Authenticator {
     Static(Arc<CustomerCtx>),
 }
 
+/// Shared client for the `fiducia-auth` hop.
+///
+/// The timeout is load-bearing, not hygiene: this call runs inside
+/// `customer_mfa_assurance_gate`, which is layered OUTSIDE `TimeoutLayer`, so
+/// the server-wide `REQUEST_TIMEOUT_SECS` never applies to it. Without a client
+/// timeout a blackholed `fiducia-auth` pins every authenticated request
+/// indefinitely and exhausts the connection pool. Matches the 10s used by every
+/// other upstream client in this tree (`supabase_auth.rs`, `admin/upstream.rs`).
 fn http() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(reqwest::Client::new)
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(AUTH_UPSTREAM_TIMEOUT_SECS))
+            .build()
+            .expect("customer auth HTTP client must build")
+    })
 }
 
 fn deny(status: StatusCode, code: &str) -> Response {
@@ -104,6 +130,7 @@ impl Authenticator {
                 user_id: "fiducia-e2e-customer".to_string(),
                 email: Some("customer-e2e@fiducia.invalid".to_string()),
                 orgs: vec!["00000000-0000-4000-8000-000000000001".to_string()],
+                aal: "aal2".to_string(),
                 credential_binding: "development\0fiducia-e2e-customer".to_string(),
                 cookie_authenticated: false,
             }));
