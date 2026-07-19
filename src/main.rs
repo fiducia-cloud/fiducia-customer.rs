@@ -7,6 +7,7 @@ mod entity;
 mod request_security;
 mod store;
 mod supabase_auth;
+mod throttle;
 
 use auth::{
     bearer_token, cookie_value, Authenticator, CustomerCtx, CUSTOMER_LOGIN_CSRF_COOKIE,
