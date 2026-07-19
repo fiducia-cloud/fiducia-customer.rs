@@ -11,12 +11,17 @@
 //! configured → 503; missing/invalid token → 401; auth unreachable → 503.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+
+/// Ceiling on the `fiducia-auth` round trip. See `http()` for why this cannot
+/// be left to the server-wide request timeout.
+const AUTH_UPSTREAM_TIMEOUT_SECS: u64 = 10;
 
 const fn customer_session_cookie_name(release_hardened: bool) -> &'static str {
     if release_hardened {
