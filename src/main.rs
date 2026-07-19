@@ -259,7 +259,7 @@ fn build_router(config: AppConfig) -> Router {
         .route("/assets/htmx.min.js", get(htmx_js))
         .route("/assets/customer.css", get(customer_css))
         .route("/login", get(customer_login).post(customer_login_submit))
-        // Passwordless + MFA login flows (magic link / email OTP, phone OTP, and
+        // Passwordless + MFA login flows (email OTP, phone OTP, and
         // TOTP step-up). All share the login-CSRF cookie contract.
         .route("/login/otp", post(customer_login_otp_submit))
         .route("/login/verify", post(customer_login_verify_submit))
