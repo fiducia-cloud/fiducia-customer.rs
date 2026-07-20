@@ -556,6 +556,7 @@ dependencies = [
  "fiducia-interfaces-db",
  "fiducia-payments",
  "fiducia-telemetry",
+ "hex",
  "hmac 0.12.1",
  "maud",
  "reqwest",

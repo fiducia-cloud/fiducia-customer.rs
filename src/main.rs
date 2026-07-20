@@ -5152,6 +5152,49 @@ mod tests {
         (format!("http://{address}"), task)
     }
 
+    /// The billing webhook route is mounted OUTSIDE `/api/customer`, so it is not
+    /// blocked by the session/CSRF/AAL gates — but it must fail closed on its own:
+    /// an unknown provider is a 404 before any state is touched, and a known
+    /// provider still never reaches the ledger without a verifiable signature.
+    #[tokio::test]
+    async fn billing_webhook_fails_closed() {
+        // Unknown provider: rejected at the path, no config/env/DB touched.
+        let resp = build_router(test_config())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/billing/webhooks/venmo")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "unknown provider must 404");
+
+        // Known provider, but no valid signature: whether the signing secret is
+        // configured in this environment or not, the outcome is a rejection
+        // (503 provider_not_configured, or 400 signature_verification_failed) —
+        // never a 2xx that would let an unverified body be recorded.
+        let resp = build_router(test_config())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/billing/webhooks/stripe")
+                    .body(Body::from(r#"{"id":"evt_1","type":"invoice.paid"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_REQUEST
+            ),
+            "a stripe webhook without a valid signature must be rejected, got {}",
+            resp.status(),
+        );
+    }
+
     #[tokio::test]
     async fn customer_login_is_server_mediated_and_issues_only_customer_cookie() {
         const MOCK_SUPABASE_TOKEN_PATH: &str = "/auth/v1/token";
