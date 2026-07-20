@@ -41,6 +41,8 @@ fiducia-payments = { path = "../fiducia-payments.rs" }
 fiducia-interfaces-db = { path = "../fiducia-interfaces/generated/rust-db" }
 
 uuid = { version = "1", features = ["serde", "v4"] }
+# Hex-encode the webhook payload SHA-256 for billing_webhook_events.
+hex = "0.4"
 # `read_at` timestamps for the notifications feed. Already pinned transitively
 # by SeaORM's `with-chrono`; declared directly so `chrono::Utc::now()` is ours.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
