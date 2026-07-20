@@ -3,6 +3,7 @@
 // WS/SSE fragment streams, plus authenticated customer APIs. API-key lifecycle
 // is delegated to fiducia-auth so there is exactly one credential authority.
 mod auth;
+mod billing;
 mod entity;
 mod request_security;
 mod store;
@@ -316,6 +317,15 @@ fn build_router(config: AppConfig) -> Router {
         // mutations go through the explicit create/rotate endpoints above and are
         // owned by fiducia-auth; this BFF exposes no second write authority.
         .route("/api/customer/sync/:table", get(sync_catchup))
+        // Inbound provider webhooks. Deliberately OUTSIDE the `/api/customer`
+        // prefix so the session/CSRF/AAL gates do not apply — these are
+        // unauthenticated by necessity (Stripe/PayPal POST directly) and the
+        // provider SIGNATURE is the trust boundary, verified in `billing` before
+        // anything is recorded. Idempotent on redelivery.
+        .route(
+            "/api/billing/webhooks/:provider",
+            post(billing::webhook),
+        )
         .route(
             "/api/customer/preferences",
             get(customer_preferences_json).put(update_customer_preferences),
@@ -5140,6 +5150,49 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}"), task)
+    }
+
+    /// The billing webhook route is mounted OUTSIDE `/api/customer`, so it is not
+    /// blocked by the session/CSRF/AAL gates — but it must fail closed on its own:
+    /// an unknown provider is a 404 before any state is touched, and a known
+    /// provider still never reaches the ledger without a verifiable signature.
+    #[tokio::test]
+    async fn billing_webhook_fails_closed() {
+        // Unknown provider: rejected at the path, no config/env/DB touched.
+        let resp = build_router(test_config())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/billing/webhooks/venmo")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "unknown provider must 404");
+
+        // Known provider, but no valid signature: whether the signing secret is
+        // configured in this environment or not, the outcome is a rejection
+        // (503 provider_not_configured, or 400 signature_verification_failed) —
+        // never a 2xx that would let an unverified body be recorded.
+        let resp = build_router(test_config())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/billing/webhooks/stripe")
+                    .body(Body::from(r#"{"id":"evt_1","type":"invoice.paid"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_REQUEST
+            ),
+            "a stripe webhook without a valid signature must be rejected, got {}",
+            resp.status(),
+        );
     }
 
     #[tokio::test]
