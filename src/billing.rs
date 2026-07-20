@@ -192,29 +192,29 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Read a required header as an owned string, or a 400 response.
-fn header(headers: &HeaderMap, name: &str) -> Result<String, Response> {
+/// Read a required header as an owned string.
+fn header(headers: &HeaderMap, name: &str) -> Result<String, Reject> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
-        .ok_or_else(|| deny(StatusCode::BAD_REQUEST, "missing_signature_header"))
+        .ok_or(Reject::MissingHeader)
 }
 
-/// Read a required provider secret from the environment, or a 503 response so an
-/// unconfigured provider cannot accept unverifiable events.
-fn env_secret(name: &str) -> Result<String, Response> {
+/// Read a required provider secret from the environment; absent => fail closed so
+/// an unconfigured provider cannot accept unverifiable events.
+fn env_secret(name: &str) -> Result<String, Reject> {
     std::env::var(name)
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| deny(StatusCode::SERVICE_UNAVAILABLE, "provider_not_configured"))
+        .ok_or(Reject::NotConfigured)
 }
 
-/// Map any verification failure to an opaque 400 — a probing attacker learns
-/// only "rejected", while the reason is logged server-side.
-fn reject(error: fiducia_payments::VerifyError) -> Response {
+/// Map any verification failure to the opaque signature reject — a probing
+/// attacker learns only "rejected", while the reason is logged server-side.
+fn reject(error: fiducia_payments::VerifyError) -> Reject {
     tracing::warn!(%error, "billing webhook signature rejected");
-    deny(StatusCode::BAD_REQUEST, "signature_verification_failed")
+    Reject::Signature
 }
 
 fn deny(status: StatusCode, code: &str) -> Response {
