@@ -317,6 +317,13 @@ fn build_router(config: AppConfig) -> Router {
         // mutations go through the explicit create/rotate endpoints above and are
         // owned by fiducia-auth; this BFF exposes no second write authority.
         .route("/api/customer/sync/:table", get(sync_catchup))
+        // Inbound provider webhooks. Unauthenticated by necessity (Stripe/PayPal
+        // POST directly); the provider signature is the trust boundary, verified
+        // in `billing` before anything is recorded. Idempotent on redelivery.
+        .route(
+            "/api/customer/billing/webhooks/:provider",
+            post(billing::webhook),
+        )
         .route(
             "/api/customer/preferences",
             get(customer_preferences_json).put(update_customer_preferences),
