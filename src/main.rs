@@ -3,6 +3,7 @@
 // WS/SSE fragment streams, plus authenticated customer APIs. API-key lifecycle
 // is delegated to fiducia-auth so there is exactly one credential authority.
 mod auth;
+mod billing;
 mod entity;
 mod request_security;
 mod store;
