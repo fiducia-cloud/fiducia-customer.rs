@@ -11,12 +11,17 @@
 //! configured → 503; missing/invalid token → 401; auth unreachable → 503.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+
+/// Ceiling on the `fiducia-auth` round trip. See `http()` for why this cannot
+/// be left to the server-wide request timeout.
+const AUTH_UPSTREAM_TIMEOUT_SECS: u64 = 10;
 
 const fn customer_session_cookie_name(release_hardened: bool) -> &'static str {
     if release_hardened {
@@ -95,9 +100,22 @@ pub enum Authenticator {
     Static(Arc<CustomerCtx>),
 }
 
+/// Shared client for the `fiducia-auth` hop.
+///
+/// The timeout is load-bearing, not hygiene: this call runs inside
+/// `customer_mfa_assurance_gate`, which is layered OUTSIDE `TimeoutLayer`, so
+/// the server-wide `REQUEST_TIMEOUT_SECS` never applies to it. Without a client
+/// timeout a blackholed `fiducia-auth` pins every authenticated request
+/// indefinitely and exhausts the connection pool. Matches the 10s used by every
+/// other upstream client in this tree (`supabase_auth.rs`, `admin/upstream.rs`).
 fn http() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(reqwest::Client::new)
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(AUTH_UPSTREAM_TIMEOUT_SECS))
+            .build()
+            .expect("customer auth HTTP client must build")
+    })
 }
 
 fn deny(status: StatusCode, code: &str) -> Response {
