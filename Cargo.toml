@@ -33,6 +33,9 @@ fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.
 # Shared API payload/error contract (generated from fiducia-interfaces schemas) —
 # the one source of truth for the types every fiducia service speaks.
 fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
+# Stripe/PayPal webhook signature verification (the security-critical crypto,
+# kept in a pure, separately-tested crate).
+fiducia-payments = { path = "../fiducia-payments.rs" }
 
 # Generated customer-plane contract row types returned by the SeaORM store.
 fiducia-interfaces-db = { path = "../fiducia-interfaces/generated/rust-db" }
