@@ -607,6 +607,7 @@ dependencies = [
  "spki",
  "subtle",
  "thiserror 2.0.18",
+ "url",
  "x509-cert",
 ]
 
