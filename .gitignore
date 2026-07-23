@@ -11,6 +11,10 @@
 /static
 /dist
 
+# Browser E2E deps (playwright/puppeteer/@fiducia/test-config)
+node_modules/
+package-lock.json
+
 # Scratch / git worktrees (tmp/worktrees/*)
 tmp/
 

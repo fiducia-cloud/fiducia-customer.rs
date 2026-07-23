@@ -1,0 +1,17 @@
+{
+  "name": "fiducia-customer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser E2E for the fiducia customer portal. Playwright + Puppeteer are consumed as libraries under node --test; the Rust server is booted by the shared harness via cargo against stub Supabase/fiducia-auth (no npm build step).",
+  "scripts": {
+    "test:browser": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "test:browser:playwright": "node --test tests/customer-playwright.test.mjs",
+    "test:browser:puppeteer": "node --test tests/customer-puppeteer.test.mjs"
+  },
+  "devDependencies": {
+    "@fiducia/test-config": "file:../fiducia-test-config",
+    "playwright": "^1.61.1",
+    "puppeteer": "^25.2.1"
+  }
+}
