@@ -324,10 +324,7 @@ fn build_router(config: AppConfig) -> Router {
         // unauthenticated by necessity (Stripe/PayPal POST directly) and the
         // provider SIGNATURE is the trust boundary, verified in `billing` before
         // anything is recorded. Idempotent on redelivery.
-        .route(
-            "/api/billing/webhooks/:provider",
-            post(billing::webhook),
-        )
+        .route("/api/billing/webhooks/:provider", post(billing::webhook))
         .route(
             "/api/customer/preferences",
             get(customer_preferences_json).put(update_customer_preferences),
@@ -898,8 +895,7 @@ fn throttled_response(page: Response, retry_after_secs: u64) -> Response {
     response
 }
 
-const THROTTLE_MESSAGE: &str =
-    "Too many attempts. Wait a few minutes before trying again.";
+const THROTTLE_MESSAGE: &str = "Too many attempts. Wait a few minutes before trying again.";
 
 fn require_login_security(
     headers: &HeaderMap,
@@ -1122,9 +1118,7 @@ fn otp_verify_markup(
         OtpChannel::Phone => "Check your phone",
     };
     let blurb = match channel {
-        OtpChannel::Email => {
-            "We emailed you a 6-digit code. Enter it below."
-        }
+        OtpChannel::Email => "We emailed you a 6-digit code. Enter it below.",
         OtpChannel::Phone => "We texted a 6-digit code to your phone. Enter it below.",
     };
     auth_page_shell(
@@ -5171,7 +5165,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "unknown provider must 404");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "unknown provider must 404"
+        );
 
         // Known provider, but no valid signature: whether the signing secret is
         // configured in this environment or not, the outcome is a rejection

@@ -80,7 +80,10 @@ pub struct Decision {
 
 impl Decision {
     const fn allow() -> Self {
-        Self { allowed: true, retry_after_secs: 0 }
+        Self {
+            allowed: true,
+            retry_after_secs: 0,
+        }
     }
 }
 
@@ -123,7 +126,10 @@ fn check_in(state: &mut Windows, bucket: Bucket, key: &str, now: Instant) -> Dec
         prune_expired(state, now);
         if state.len() >= MAX_TRACKED_KEYS {
             // Refuse the new key instead of evicting a live one.
-            return Decision { allowed: false, retry_after_secs: window.as_secs() };
+            return Decision {
+                allowed: false,
+                retry_after_secs: window.as_secs(),
+            };
         }
     }
 
@@ -138,7 +144,10 @@ fn check_in(state: &mut Windows, bucket: Bucket, key: &str, now: Instant) -> Dec
             .map(|oldest| window.saturating_sub(now.duration_since(*oldest)))
             .unwrap_or(window);
         // Never advertise 0s while denying.
-        return Decision { allowed: false, retry_after_secs: retry.as_secs().max(1) };
+        return Decision {
+            allowed: false,
+            retry_after_secs: retry.as_secs().max(1),
+        };
     }
 
     events.push(now);
@@ -197,7 +206,10 @@ mod tests {
         }
         let denied = check_in(&mut s, Bucket::OtpDispatchPerIdentifier, "u@x.com", now);
         assert!(!denied.allowed, "the 4th dispatch must be refused");
-        assert!(denied.retry_after_secs > 0, "a denial must advertise a retry delay");
+        assert!(
+            denied.retry_after_secs > 0,
+            "a denial must advertise a retry delay"
+        );
     }
 
     #[test]
@@ -270,7 +282,10 @@ mod tests {
         // of it, so only the last element is trustworthy.
         assert_eq!(client_key(Some("1.2.3.4")), "1.2.3.4");
         assert_eq!(client_key(Some("evil-spoof, 203.0.113.9")), "203.0.113.9");
-        assert_eq!(client_key(Some(" 10.0.0.1 , 198.51.100.7 ")), "198.51.100.7");
+        assert_eq!(
+            client_key(Some(" 10.0.0.1 , 198.51.100.7 ")),
+            "198.51.100.7"
+        );
     }
 
     #[test]

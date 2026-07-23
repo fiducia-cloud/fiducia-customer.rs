@@ -54,14 +54,18 @@ pub async fn webhook(
     };
 
     match record(&config, &verified, &body).await {
-        Ok(Ingest::Recorded) => {
-            (StatusCode::OK, Json(json!({ "ok": true, "deduped": false }))).into_response()
-        }
+        Ok(Ingest::Recorded) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "deduped": false })),
+        )
+            .into_response(),
         // Already processed a prior delivery — ACK so the provider stops retrying.
         Ok(Ingest::Deduped) => {
             (StatusCode::OK, Json(json!({ "ok": true, "deduped": true }))).into_response()
         }
-        Err(IngestError::Unavailable) => deny(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable"),
+        Err(IngestError::Unavailable) => {
+            deny(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+        }
         Err(IngestError::Db(error)) => {
             tracing::error!(%error, provider = %provider, "billing webhook persist failed");
             deny(StatusCode::INTERNAL_SERVER_ERROR, "persist_failed")
@@ -89,7 +93,9 @@ impl Reject {
         match self {
             // Opaque to the caller: a prober learns only "rejected"; the specific
             // reason is logged where the reject is raised.
-            Reject::NotConfigured => deny(StatusCode::SERVICE_UNAVAILABLE, "provider_not_configured"),
+            Reject::NotConfigured => {
+                deny(StatusCode::SERVICE_UNAVAILABLE, "provider_not_configured")
+            }
             Reject::MissingHeader => deny(StatusCode::BAD_REQUEST, "missing_signature_header"),
             Reject::CertFetchFailed => deny(StatusCode::BAD_GATEWAY, "cert_fetch_failed"),
             Reject::Signature => deny(StatusCode::BAD_REQUEST, "signature_verification_failed"),
@@ -108,8 +114,14 @@ async fn verify(
         Provider::Stripe => {
             let secret = env_secret("STRIPE_WEBHOOK_SECRET")?;
             let sig = header(headers, "stripe-signature")?;
-            stripe::verify(body, &sig, &secret, now_unix(), stripe::DEFAULT_TOLERANCE_SECS)
-                .map_err(reject)
+            stripe::verify(
+                body,
+                &sig,
+                &secret,
+                now_unix(),
+                stripe::DEFAULT_TOLERANCE_SECS,
+            )
+            .map_err(reject)
         }
         Provider::Paypal => {
             let webhook_id = env_secret("PAYPAL_WEBHOOK_ID")?;
@@ -235,5 +247,11 @@ async fn fetch_cert(cert_url: &str) -> Result<String, reqwest::Error> {
             .build()
             .expect("paypal cert client must build")
     });
-    client.get(cert_url).send().await?.error_for_status()?.text().await
+    client
+        .get(cert_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await
 }
