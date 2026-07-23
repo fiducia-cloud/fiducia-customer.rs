@@ -81,7 +81,9 @@ const CUSTOMER_REGIONS: &[&str] = &["auto", "iad1", "sfo1", "ams1", "fra1", "sin
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    fiducia_telemetry::init(SERVICE);
+    // Hold the guard for the whole of `main`: v0.2.1's `init` returns a
+    // `#[must_use]` TelemetryGuard that shuts the OTLP exporters down on drop.
+    let _telemetry = fiducia_telemetry::init(SERVICE);
 
     // Directory of the built Astro site. Defaults to the bundled `static/`
     // (populated from fiducia-marketing.web's `dist/` at build time), but can be
