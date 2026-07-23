@@ -3,10 +3,10 @@
   "generatedBy": "remote/tools/generate-api-docs.mjs",
   "service": "fiducia-customer.rs",
   "language": "rust",
-  "routeCount": 58,
+  "routeCount": 59,
   "routeTypeCounts": {
     "service": 5,
-    "user-generated": 53
+    "user-generated": 54
   },
   "standardDocsRoutes": [
     "/docs/api",
@@ -25,6 +25,23 @@
       "purpose": "Service descriptor, home redirect, or root RPC endpoint.",
       "handlers": [
         "root"
+      ],
+      "sourceFiles": [
+        "remote/deployments/fiducia-customer.rs/src/main.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "path": "/api/billing/webhooks/:provider",
+      "methods": [
+        "POST"
+      ],
+      "routeType": "user-generated",
+      "implementation": "code-first",
+      "auth": "webhook signature",
+      "purpose": "Custom code-first route derived from the service router.",
+      "handlers": [
+        "billing"
       ],
       "sourceFiles": [
         "remote/deployments/fiducia-customer.rs/src/main.rs"
