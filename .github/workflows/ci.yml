@@ -76,3 +76,24 @@ jobs:
       - name: audit
         working-directory: repo
         run: cargo audit
+
+  container-build:
+    name: production container graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Sibling dependency pins stay synchronized
+        run: python3 scripts/check-sibling-pins.py
+      - name: Build the non-publishing production image
+        run: |
+          docker build \
+            --build-arg INTERFACES_SHA=0e3dca3f70d61ac94a8904969c5dcd1868321aec \
+            --build-arg PAYMENTS_REF=126dc5d1b3fcba289f95139284dc0f3c54b56a8a \
+            --build-arg MARKETING_REF=f3fd0e63b3c0898bed33c66817847056067f7ca8 \
+            --build-arg TEST_CONFIG_REF=026fcf28193c7baeb7f5feb68480a91539c1f0fa \
+            --tag fiducia-backend:pr .
