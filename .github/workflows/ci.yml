@@ -34,17 +34,20 @@ jobs:
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
         with:
           args: repo/.github/workflows/ci.yml repo/.github/workflows/cli-flags.yml repo/.github/workflows/docker.yml
+      - name: Sibling dependency pins stay synchronized
+        working-directory: repo
+        run: python3 scripts/check-sibling-pins.py
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-interfaces
-          ref: bd718cd72d72aa330534f3688f8fb1ce90c19d10
+          ref: 0e3dca3f70d61ac94a8904969c5dcd1868321aec
           path: fiducia-interfaces
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-payments.rs
-          ref: 0c8b735949f90514545fd03dadcf3ba337a1e948
+          ref: 126dc5d1b3fcba289f95139284dc0f3c54b56a8a
           path: fiducia-payments.rs
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
