@@ -66,6 +66,10 @@ test(
     assert.match(csp, /base-uri 'none'/);
     assert.match(csp, /form-action 'self'/);
     assert.match(csp, /object-src 'none'/);
+    assert.match(
+      csp,
+      /sha256-faU7yAF8NxuMTNEwVmBz\+VcYeIoBQ2EMHW3WaVxCvnk=/,
+    );
     assert.doesNotMatch(csp, /unsafe-inline|unsafe-eval/);
 
     assert.match(await pageText(page), /Sign in to Fiducia/);
@@ -115,58 +119,57 @@ test(
     assert.ok(session, "session cookie must be set after OTP login");
     assert.equal(session.httpOnly, true);
     assert.equal(session.sameSite, "Strict");
+    const cookieHeader = cookies
+      .map((cookie) => `${cookie.name}=${cookie.value}`)
+      .join("; ");
 
     // The ambient cookie now authenticates a full navigation to the portal.
     await page.goto(`${server.url}/app`, { waitUntil: "networkidle0" });
     assert.match(await pageText(page), /Dashboard/);
     assert.match(await pageText(page), new RegExp(CUSTOMER.email));
 
-    // CSRF negative paths: a mutating request without a valid token is rejected
-    // both pre-session (login flow nonce) and on the authenticated surface.
-    const rejected = await page.evaluate(async () => {
-      const post = async (path, fields) => {
-        const response = await fetch(path, {
-          method: "POST",
-          body: new URLSearchParams(fields),
-        });
-        return { status: response.status, body: await response.json() };
-      };
-      return {
-        login: await post("/login/otp", {
-          csrf_token: "forged",
-          method: "email",
-          identifier: "dev@acme.com",
-        }),
-        session: await post("/app/notifications/read", {
-          csrf_token: "forged",
-          id: "00000000-0000-4000-8000-000000000009",
-        }),
-      };
-    });
-    assert.equal(rejected.login.status, 403);
-    assert.equal(rejected.login.body.error, "customer_request_rejected");
-    assert.equal(rejected.session.status, 403);
-    assert.equal(rejected.session.body.error, "customer_request_rejected");
-
-    // Puppeteer does not expose Playwright's context-sharing request API, so
-    // replay the authenticated cookie through Node fetch with an attacker
-    // Origin. The server must reject the ambient session before mutation.
-    const cookieHeader = cookies
-      .map((cookie) => `${cookie.name}=${cookie.value}`)
-      .join("; ");
-    const crossOrigin = await fetch(
-      `${server.url}/app/notifications/read`,
+    // Run deliberate rejection probes through Node fetch. The exact cookie and
+    // Origin boundaries are still exercised without treating expected 403s as
+    // product console failures in the rendered page.
+    const rejectedLogin = await postForm(
+      `${server.url}/login/otp`,
+      cookieHeader,
+      server.url,
       {
-        method: "POST",
-        headers: {
-          cookie: cookieHeader,
-          origin: "https://attacker.example",
-          "content-type": "application/x-www-form-urlencoded",
-        },
-        body: new URLSearchParams({
-          csrf_token: "forged",
-          id: "00000000-0000-4000-8000-000000000009",
-        }),
+        csrf_token: "forged",
+        method: "email",
+        identifier: "dev@acme.com",
+      },
+    );
+    assert.equal(rejectedLogin.status, 403);
+    assert.equal(
+      (await rejectedLogin.json()).error,
+      "customer_request_rejected",
+    );
+
+    const rejectedSession = await postForm(
+      `${server.url}/app/notifications/read`,
+      cookieHeader,
+      server.url,
+      {
+        csrf_token: "forged",
+        id: "00000000-0000-4000-8000-000000000009",
+      },
+    );
+    assert.equal(rejectedSession.status, 403);
+    assert.equal(
+      (await rejectedSession.json()).error,
+      "customer_request_rejected",
+    );
+
+    // The same authenticated cookies must be rejected under a foreign Origin.
+    const crossOrigin = await postForm(
+      `${server.url}/app/notifications/read`,
+      cookieHeader,
+      "https://attacker.example",
+      {
+        csrf_token: "forged",
+        id: "00000000-0000-4000-8000-000000000009",
       },
     );
     assert.equal(crossOrigin.status, 403);
@@ -234,6 +237,18 @@ test(
     assertNoBrowserErrors(browserErrors);
   },
 );
+
+async function postForm(url, cookie, origin, fields) {
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      cookie,
+      origin,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams(fields),
+  });
+}
 
 async function pageText(page) {
   return page.$eval("body", (body) => body.textContent ?? "");
