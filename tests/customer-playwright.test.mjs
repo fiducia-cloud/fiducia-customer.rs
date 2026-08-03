@@ -65,6 +65,10 @@ test(
     assert.match(csp, /base-uri 'none'/);
     assert.match(csp, /form-action 'self'/);
     assert.match(csp, /object-src 'none'/);
+    assert.match(
+      csp,
+      /sha256-faU7yAF8NxuMTNEwVmBz\+VcYeIoBQ2EMHW3WaVxCvnk=/,
+    );
     assert.doesNotMatch(csp, /unsafe-inline|unsafe-eval/);
 
     await assertVisibleText(page, "Sign in to Fiducia");
@@ -110,35 +114,42 @@ test(
     await assertVisibleText(page, "Dashboard");
     await assertVisibleText(page, CUSTOMER.email);
 
-    // CSRF negative paths: a mutating request without a valid token is rejected
-    // both pre-session (login flow nonce) and on the authenticated surface.
-    const rejected = await page.evaluate(async () => {
-      const post = async (path, fields) => {
-        const response = await fetch(path, {
-          method: "POST",
-          body: new URLSearchParams(fields),
-        });
-        return { status: response.status, body: await response.json() };
-      };
-      return {
-        login: await post("/login/otp", {
-          csrf_token: "forged",
-          method: "email",
-          identifier: "dev@acme.com",
-        }),
-        session: await post("/app/notifications/read", {
+    // Exercise deliberate rejection paths through the context-sharing request
+    // client. They still use the browser's cookies, but expected 403 responses
+    // do not masquerade as product console failures in the rendered page.
+    const requestOrigin = { origin: server.url };
+    const rejectedLogin = await page.request.post(`${server.url}/login/otp`, {
+      headers: requestOrigin,
+      form: {
+        csrf_token: "forged",
+        method: "email",
+        identifier: "dev@acme.com",
+      },
+    });
+    assert.equal(rejectedLogin.status(), 403);
+    assert.equal(
+      (await rejectedLogin.json()).error,
+      "customer_request_rejected",
+    );
+
+    const rejectedSession = await page.request.post(
+      `${server.url}/app/notifications/read`,
+      {
+        headers: requestOrigin,
+        form: {
           csrf_token: "forged",
           id: "00000000-0000-4000-8000-000000000009",
-        }),
-      };
-    });
-    assert.equal(rejected.login.status, 403);
-    assert.equal(rejected.login.body.error, "customer_request_rejected");
-    assert.equal(rejected.session.status, 403);
-    assert.equal(rejected.session.body.error, "customer_request_rejected");
+        },
+      },
+    );
+    assert.equal(rejectedSession.status(), 403);
+    assert.equal(
+      (await rejectedSession.json()).error,
+      "customer_request_rejected",
+    );
 
     // A context-sharing API request proves that an authenticated ambient cookie
-    // cannot be borrowed by a different Origin, even when the attacker supplies a
+    // cannot be borrowed by a different Origin, even when the caller supplies a
     // syntactically valid form body.
     const crossOrigin = await page.request.post(
       `${server.url}/app/notifications/read`,
