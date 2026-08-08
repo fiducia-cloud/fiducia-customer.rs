@@ -2,6 +2,8 @@
 
 Tracking: [DEN-2789](https://linear.app/denman/issue/DEN-2789/fiducia-cloud-shared-seaorm-boundary-fiducia-orm-in-fiducia-lib-fiducia)
 
+Canonical ORM owner: [`fiducia-cloud/fiducia-orm-core`](https://github.com/fiducia-cloud/fiducia-orm-core), currently under review in [PR #1](https://github.com/fiducia-cloud/fiducia-orm-core/pull/1).
+
 `fiducia-customer.rs` is currently a mixed customer-facing BFF: it renders the customer experience and also exposes narrowly scoped authenticated customer API endpoints. That makes two different data boundaries visible in one deployable. They must remain explicit until the write endpoints move behind a dedicated API service.
 
 ## 1. Customer-owned writable state
@@ -25,46 +27,44 @@ Coordination, lease, lock, consensus, node, brain, and other shared Fiducia doma
 
 - a separate `FIDUCIA_SHARED_READ_DATABASE_URL` is used; never reuse `DATABASE_URL`;
 - the principal has schema `USAGE` and an explicit `SELECT` allowlist only;
-- the connection is created through `fiducia-orm` with `DbRole::ReadOnly`;
-- `default_transaction_read_only=on` is verified with `assert_read_only` before the connection enters application state;
-- handlers call named functions under `fiducia_orm::queries::read`, not an unrestricted ORM session or query builder;
+- the connection is created through the default `read-only` surface of `fiducia-orm-core`;
+- `default_transaction_read_only=on` is verified by the crate before the opaque read context enters application state;
+- handlers call named policy-aware read functions, not a raw SeaORM connection, entity manager, or query builder;
 - every query is tenant-scoped, bounded, and redacted;
 - shared-domain mutations always go through the owning API/service over authenticated HTTP or another explicit versioned contract.
 
 If a read-only shared connection cannot be verified, the affected shared-domain view must fail closed or degrade to an unavailable state. The process must not fall back to the customer writer credential.
 
-## Shared library rollout
+## Canonical ORM rollout
 
-The root `.zpkg.toml` imports `fiducia-cloud/fiducia-lib`. `fiducia-lib` PR #1 adds `fiducia-orm`, including `DbRole::{ReadWrite, ReadOnly}`, `assert_read_only`, `ORG_SCHEMA = "fiducia"`, schema-qualified helpers, and named read/write query modules.
-
-After that PR merges and private Cargo authentication is available in every build environment, the intended Cargo dependency is:
+The root `.zpkg.toml` imports `fiducia-cloud/fiducia-orm-core`. After `fiducia-orm-core` PR #1 is completed and private Cargo authentication is available in every build environment, the intended dependency is:
 
 ```toml
-fiducia-orm = {
-  package = "fiducia-orm",
-  git = "https://github.com/fiducia-cloud/fiducia-lib.git",
-  rev = "03cf218db1dcfc96f08d49dabcf19d447869644f"
+fiducia-orm-core = {
+  git = "https://github.com/fiducia-cloud/fiducia-orm-core.git",
+  rev = "3fc2c5e5ba17cefea5fee00a1b77578929e48d1f",
+  default-features = false,
+  features = ["read-only"]
 }
 ```
 
-The revision above is the reviewed head of `fiducia-lib` PR #1. Replace it with the merge commit before enabling the dependency. The future shared-read seam is:
+The future shared-read seam should expose only an opaque context, for example:
 
 ```rust
-use fiducia_orm::{DbRole, assert_read_only, connect};
+use fiducia_orm_core::{ReadContext, connect_read_only};
 
-let shared_reads = connect(
+let shared_reads: ReadContext = connect_read_only(
     &std::env::var("FIDUCIA_SHARED_READ_DATABASE_URL")?,
-    DbRole::ReadOnly,
-)
-.await?;
-assert_read_only(&shared_reads).await?;
+).await?;
 ```
 
-The Cargo git dependency is documented rather than committed before the private dependency can be fetched and `Cargo.lock` regenerated reproducibly. The zed package dependency records the cross-repository relationship now.
+The revision above is the current head of the canonical scaffold PR, not yet a production-ready consumer pin. Before enabling it, that PR must pin the Fiducia entity slice from `ORESoftware/k8s-libs-and-shared-defs`, keep raw ORM/session types private, implement role-aware connection and read-only verification, add working named queries, compile every write type/function only under `read-write`, and provide compile-fail consumer fixtures plus live PostgreSQL/CockroachDB denial evidence. Replace the scaffold revision with the merge commit after those gates pass.
+
+The earlier `fiducia-lib` ORM branch is an implementation donor only and must not become a second authoritative package. The Cargo git dependency is documented rather than committed before the canonical private dependency can be fetched and `Cargo.lock` regenerated reproducibly. The zed package dependency records the correct cross-repository relationship now.
 
 ## Schema and migration ownership
 
-- Shared definitions are imported from `ORESoftware/k8s-libs-and-shared-defs` through the organization library, namespaced by organization and project.
+- Shared definitions are imported from `ORESoftware/k8s-libs-and-shared-defs` through the canonical ORM crate, namespaced by organization and project.
 - Shared Fiducia schema changes use `declarative-migrations`/`dpm`, are verified against PostgreSQL and CockroachDB as applicable, and run under a separate migrator identity.
 - Destructive changes follow expand → backfill → contract across compatible releases.
 - `fiducia-node.rs`, `fiducia-brain.rs`, and similar coordination services remain on the specialized Fiducia Kubernetes cluster.
@@ -75,7 +75,7 @@ The Cargo git dependency is documented rather than committed before the private 
 This repository must never:
 
 - use its customer `DATABASE_URL` for shared-domain reads as a convenience fallback;
-- import or call `fiducia_orm::queries::write` for coordination-domain data;
+- enable the ORM crate's `read-write` feature or call a shared coordination-domain write function;
 - acquire the shared API runtime or migrator credential;
 - add automatic schema synchronization at startup;
 - let rendering modules issue ad hoc SQL or bypass the authenticated customer/API boundary;
