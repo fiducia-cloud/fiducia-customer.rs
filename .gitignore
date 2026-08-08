@@ -29,6 +29,9 @@ sops-private*.txt
 node_modules/
 package-lock.json
 
+# Zed package dependencies
+/.vendor/.zed/
+
 # Scratch / git worktrees (tmp/worktrees/*)
 tmp/
 
