@@ -12,16 +12,20 @@ fn read(relative: &str) -> String {
 }
 
 #[test]
-fn package_declares_the_shared_fiducia_library() {
+fn package_declares_the_canonical_fiducia_orm_core() {
     let manifest = read(".zpkg.toml");
     for contract in [
         "org = \"fiducia-cloud\"",
         "name = \"fiducia-customer\"",
-        "\"fiducia-cloud/fiducia-lib\" = \"^0.1.0\"",
+        "\"fiducia-cloud/fiducia-orm-core\" = \"^0.1.0\"",
         "dir = \".vendor/.zed\"",
     ] {
         assert!(manifest.contains(contract), "zed package contract lost {contract}");
     }
+    assert!(
+        !manifest.contains("\"fiducia-cloud/fiducia-lib\""),
+        "the general library must not become a second ORM package owner"
+    );
 }
 
 #[test]
@@ -31,9 +35,10 @@ fn customer_writer_and_shared_reader_are_distinct_contracts() {
         "combined BFF/API deployable",
         "FIDUCIA_SHARED_READ_DATABASE_URL",
         "never reuse `DATABASE_URL`",
-        "DbRole::ReadOnly",
-        "assert_read_only",
-        "queries::read",
+        "fiducia-orm-core",
+        "read-only",
+        "opaque read context",
+        "named policy-aware read functions",
         "fiducia-auth",
         "expand → backfill → contract",
         "specialized Fiducia Kubernetes cluster",
@@ -45,8 +50,8 @@ fn customer_writer_and_shared_reader_are_distinct_contracts() {
     }
 
     assert!(
-        !boundary.contains("fiducia_orm::queries::write` for coordination-domain data is allowed"),
-        "shared-domain writes must not be granted to the customer tier"
+        boundary.contains("must not become a second authoritative package"),
+        "the duplicate embedded ORM package must remain explicitly superseded"
     );
 }
 
@@ -78,8 +83,8 @@ fn current_writable_connection_remains_scoped_to_customer_state() {
 
     for forbidden_shared_seam in [
         "FIDUCIA_SHARED_READ_DATABASE_URL",
-        "fiducia_orm::queries::write",
-        "DbRole::ReadWrite",
+        "fiducia_orm_core::connect_read_write",
+        "WriteContext",
     ] {
         assert!(
             !main.contains(forbidden_shared_seam) && !store.contains(forbidden_shared_seam),
