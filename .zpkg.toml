@@ -1,0 +1,15 @@
+[package]
+org = "fiducia-cloud"
+name = "fiducia-customer"
+version = "0.1.0"
+description = "Fiducia customer BFF and web experience. Owns narrowly scoped customer-plane state; shared Fiducia domain access is read-only"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/fiducia-cloud/fiducia-customer.rs"
+
+[dependencies]
+"fiducia-cloud/fiducia-lib" = "^0.1.0"
+
+[install]
+dir = ".vendor/.zed"
