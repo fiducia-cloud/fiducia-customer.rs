@@ -9,7 +9,7 @@ vcs = "git"
 url = "https://github.com/fiducia-cloud/fiducia-customer.rs"
 
 [dependencies]
-"fiducia-cloud/fiducia-lib" = "^0.1.0"
+"fiducia-cloud/fiducia-orm-core" = "^0.1.0"
 
 [install]
 dir = ".vendor/.zed"
