@@ -37,9 +37,12 @@ env-list:
     for f in "${files[@]}"; do
       name=$(basename "$f" .env.enc)
       # Drop sops' own trailing metadata rows (sops_mac, sops_version, …).
-      keys=$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" | tr -d '=' \
-             | grep -v '^sops_' | tr '\n' ' ')
-      printf '%-12s %s\n' "$name" "$keys"
+      # Both greps exit 1 on no match, which under `pipefail` would abort the
+      # whole recipe for the perfectly ordinary case of a freshly created,
+      # still-empty environment. Report it instead of failing.
+      keys=$( { grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" || true; } | tr -d '=' \
+             | { grep -v '^sops_' || true; } | tr '\n' ' ')
+      printf '%-12s %s\n' "$name" "${keys:-(empty — populate with: just env-edit $name)}"
     done
 
 # Decrypt env/enc/*.env.enc into env/dec/*.env (mode 0600). No args = all.
