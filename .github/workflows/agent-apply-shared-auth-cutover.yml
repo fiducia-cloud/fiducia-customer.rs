@@ -1,4 +1,5 @@
 name: apply customer Shared Auth cutover
+# Retrigger after adding the omitted canonical org_members SeaORM entity.
 
 on:
   push:
