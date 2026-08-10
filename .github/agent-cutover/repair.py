@@ -48,6 +48,19 @@ replace_exact(
     "",
     "remove oversized Result helper",
 )
+replace_exact(
+    auth,
+    """pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    match presented_credential(headers) {
+        CredentialSelection::Valid(credential) => Some(credential.token),
+        CredentialSelection::Missing | CredentialSelection::Invalid => None,
+    }
+}
+
+""",
+    "",
+    "remove obsolete bearer helper",
+)
 
 login = Path("src/login.rs")
 replace_exact(
