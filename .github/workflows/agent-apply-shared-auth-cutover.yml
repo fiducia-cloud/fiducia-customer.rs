@@ -59,12 +59,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p artifacts
           cat .github/agent-cutover/patch.part* > /tmp/customer-cutover.b64
           test "$(sha256sum /tmp/customer-cutover.b64 | cut -d' ' -f1)" = "cb3f18d0247c85c52a54299427b421a79fc15c7bf1ed55eb7f0b3826b9f98e95"
           base64 --decode /tmp/customer-cutover.b64 > /tmp/customer-cutover.patch.gz
           test "$(sha256sum /tmp/customer-cutover.patch.gz | cut -d' ' -f1)" = "3f65562d11514edee4da50787ec2d1d4249bfef4e510a77600af4f14d40e5147"
           gzip --decompress --stdout /tmp/customer-cutover.patch.gz > /tmp/customer-cutover.patch
           test "$(sha256sum /tmp/customer-cutover.patch | cut -d' ' -f1)" = "3d266d1cc017ed0723f1f2b0c480671e856fc0bcac4521be3b6a53216ea71311"
+          cp /tmp/customer-cutover.patch artifacts/customer-cutover.patch
           git apply --check /tmp/customer-cutover.patch
           git apply /tmp/customer-cutover.patch
           git diff --check
@@ -88,19 +90,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo check --all-targets --all-features
-          cargo fmt --all
-          cargo fmt --all -- --check
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-targets --all-features
-          cargo audit
-          git diff --check
+          {
+            printf 'rustc=%s\n' "$(rustc --version)"
+            printf 'cargo=%s\n' "$(cargo --version)"
+            cargo check --all-targets --all-features
+            cargo fmt --all
+            cargo fmt --all -- --check
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+            cargo test --locked --all-targets --all-features
+            cargo audit
+            git diff --check
+          } 2>&1 | tee artifacts/rust-verification.log
+
+      - name: Upload cutover diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: customer-shared-auth-cutover-${{ github.sha }}
+          path: repo/artifacts/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Commit verified cutover and remove temporary files
         working-directory: repo
         shell: bash
         run: |
           set -euo pipefail
+          rm -rf artifacts
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm -- .github/workflows/agent-apply-shared-auth-cutover.yml
