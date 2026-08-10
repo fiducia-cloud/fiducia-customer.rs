@@ -2,6 +2,11 @@
 //!
 //! Tenant membership is application-owned authorization state. Shared Auth proves
 //! identity/session assurance; it must not mint or substitute these rows.
+//!
+//! This entity lands one stack layer before the strict Shared Auth consumer cutover,
+//! so the binary does not query it yet. Keep the exception local to this module and
+//! remove it when DEN-1379 wires `authenticate_shared` to the membership lookup.
+#![allow(dead_code)]
 
 use sea_orm::entity::prelude::*;
 
