@@ -1,0 +1,39 @@
+name: temporary source snapshot
+
+on:
+  push:
+    branches:
+      - agent/shared-auth-customer-cutover-20260810
+    paths:
+      - .github/workflows/agent-source-snapshot.yml
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - name: Create source archive
+        run: |
+          set -euo pipefail
+          git archive --format=zip --output=/tmp/fiducia-customer-source.zip HEAD
+      - name: Upload source archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fiducia-customer-source-${{ github.run_id }}
+          path: /tmp/fiducia-customer-source.zip
+          if-no-files-found: error
+          retention-days: 1
+      - name: Remove one-shot workflow
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -- .github/workflows/agent-source-snapshot.yml
+          git commit -m "chore: remove temporary source snapshot workflow"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
