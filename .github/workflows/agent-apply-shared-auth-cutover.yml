@@ -1,5 +1,5 @@
 name: apply customer Shared Auth cutover
-# Retrigger after moving exact-head lint repair into a checked script.
+# Fresh exact-head run after the checked repair script removed the obsolete bearer helper.
 
 on:
   push:
@@ -7,6 +7,7 @@ on:
       - agent/shared-auth-customer-cutover-20260810
     paths:
       - .github/workflows/agent-apply-shared-auth-cutover.yml
+      - .github/agent-cutover/repair.py
 
 permissions:
   contents: write
