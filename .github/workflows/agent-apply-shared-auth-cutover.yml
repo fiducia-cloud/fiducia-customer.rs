@@ -1,5 +1,5 @@
 name: apply customer Shared Auth cutover
-# Retrigger after adding the omitted canonical org_members SeaORM entity.
+# Retrigger after repairing exact-head Clippy findings in the prepared cutover.
 
 on:
   push:
@@ -72,6 +72,65 @@ jobs:
           git apply /tmp/customer-cutover.patch
           git diff --check
 
+      - name: Repair exact-head lint findings in prepared patch
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          auth = Path("src/auth.rs")
+          source = auth.read_text()
+          old_call = """                let credential = selected_customer_credential(headers)?;
+                authority
+                    .authenticate(&credential.token, credential.cookie_authenticated)
+"""
+          new_call = """                let credential = match presented_credential(headers) {
+                    CredentialSelection::Valid(credential) => credential,
+                    CredentialSelection::Missing => {
+                        return Err(deny(StatusCode::UNAUTHORIZED, "missing_customer_session"));
+                    }
+                    CredentialSelection::Invalid => {
+                        return Err(deny(StatusCode::UNAUTHORIZED, "invalid_customer_session"));
+                    }
+                };
+                authority
+                    .authenticate(&credential.token, credential.cookie_authenticated)
+"""
+          old_helper = """fn selected_customer_credential(headers: &HeaderMap) -> Result<PresentedCredential, Response> {
+    match presented_credential(headers) {
+        CredentialSelection::Valid(credential) => Ok(credential),
+        CredentialSelection::Missing => {
+            Err(deny(StatusCode::UNAUTHORIZED, "missing_customer_session"))
+        }
+        CredentialSelection::Invalid => {
+            Err(deny(StatusCode::UNAUTHORIZED, "invalid_customer_session"))
+        }
+    }
+}
+
+"""
+          if source.count(old_call) != 1 or source.count(old_helper) != 1:
+              raise SystemExit("prepared auth patch no longer matches the reviewed lint repair")
+          auth.write_text(source.replace(old_call, new_call).replace(old_helper, ""))
+
+          login = Path("src/login.rs")
+          source = login.read_text()
+          unused_helper = """pub(crate) fn clear_customer_provider_session_cookie() -> String {
+    format!(
+        "{CUSTOMER_PROVIDER_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        cookie_secure_suffix()
+    )
+}
+
+"""
+          if source.count(unused_helper) != 1:
+              raise SystemExit("prepared login patch no longer matches the reviewed lint repair")
+          login.write_text(source.replace(unused_helper, ""))
+          PY
+          git diff --check
+
       - name: Verify dependency and CLI contracts
         working-directory: repo
         shell: bash
@@ -140,7 +199,7 @@ jobs:
             src/supabase_auth.rs \
             src/tests.rs \
             tests/customer-session-lifecycle.test.mjs
-          unexpected="$(git status --porcelain --untracked-files=all | grep -vE '^(M |A |D | M| A| D) (\.cli-flags\.toml|\.github/agent-cutover/patch\.part0[0-4]|\.github/workflows/(ci|docker|agent-apply-shared-auth-cutover)\.yml|Cargo\.(lock|toml)|Dockerfile|README\.md|dependency-pins\.json|src/(auth|login|main|store|supabase_auth|tests)\.rs|src/entity/(mod|org_members)\.rs|tests/customer-session-lifecycle\.test\.mjs)$' || true)"
+          unexpected="$(git status --porcelain --untracked-files=all | grep -vE '^(M |A |D | M| A| D) (\.cli-flags\.toml|\.github/agent-cutover/patch\.part[0-9]+|\.github/workflows/(ci|docker|agent-apply-shared-auth-cutover)\.yml|Cargo\.(lock|toml)|Dockerfile|README\.md|dependency-pins\.json|src/(auth|login|main|store|supabase_auth|tests)\.rs|src/entity/(mod|org_members)\.rs|tests/customer-session-lifecycle\.test\.mjs)$' || true)"
           test -z "$unexpected" || { printf '%s\n' "$unexpected"; exit 1; }
           git diff --cached --check
           git commit -m "feat(auth): cut customer sessions over to Shared Auth"
