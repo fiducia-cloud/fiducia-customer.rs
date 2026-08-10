@@ -58,8 +58,16 @@ replace_exact(
 }
 
 """,
-    "",
-    "remove obsolete bearer helper",
+    """#[cfg(test)]
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    match presented_credential(headers) {
+        CredentialSelection::Valid(credential) => Some(credential.token),
+        CredentialSelection::Missing | CredentialSelection::Invalid => None,
+    }
+}
+
+""",
+    "limit bearer helper to parser tests",
 )
 
 login = Path("src/login.rs")
