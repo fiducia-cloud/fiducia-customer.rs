@@ -57,7 +57,7 @@ COPY . fiducia-customer.rs
 WORKDIR /build/fiducia-customer.rs
 RUN cargo build --locked --release && strip target/release/fiducia-backend
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
 COPY --from=build --chown=65532:65532 /build/fiducia-customer.rs/target/release/fiducia-backend /usr/local/bin/fiducia-backend
 COPY --from=web --chown=65532:65532 /web/fiducia-marketing.web/dist /app/static
 ENV STATIC_DIR=/app/static
