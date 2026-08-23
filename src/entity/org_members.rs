@@ -1,7 +1,8 @@
 //! SeaORM entity for the canonical customer-plane `org_members` table.
 //!
-//! Tenant membership is application-owned authorization state. Shared Auth proves
-//! identity/session assurance; it must not mint or substitute these rows.
+//! This is the canonical customer-to-organization authorization edge. Shared
+//! Auth proves identity and session assurance; it must not mint or substitute
+//! these application-owned rows.
 //!
 //! This entity lands one stack layer before the strict Shared Auth consumer cutover,
 //! so the binary does not query it yet. Keep the exception local to this module and

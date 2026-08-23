@@ -1,0 +1,156 @@
+name: apply customer Shared Auth cutover
+# Fresh exact-head run after the checked repair script removed the obsolete bearer helper.
+
+on:
+  push:
+    branches:
+      - agent/shared-auth-customer-cutover-20260810
+    paths:
+      - .github/workflows/agent-apply-shared-auth-cutover.yml
+      - .github/agent-cutover/repair.py
+
+permissions:
+  contents: write
+
+concurrency:
+  group: customer-shared-auth-cutover-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout customer server exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          submodules: recursive
+          path: repo
+
+      - name: Checkout exact shared interfaces dependency
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: 8aec7206ef98ec05484b4867c35f423b3e17c5d0
+          persist-credentials: false
+          path: fiducia-interfaces
+
+      - name: Checkout exact payments dependency
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: fiducia-cloud/fiducia-payments.rs
+          ref: 126dc5d1b3fcba289f95139284dc0f3c54b56a8a
+          persist-credentials: false
+          path: fiducia-payments.rs
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt, clippy
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60
+        with:
+          tool: cargo-audit@0.22.2
+
+      - name: Apply checksum-verified cutover patch
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cat .github/agent-cutover/patch.part* > /tmp/customer-cutover.b64
+          test "$(sha256sum /tmp/customer-cutover.b64 | cut -d' ' -f1)" = "cb3f18d0247c85c52a54299427b421a79fc15c7bf1ed55eb7f0b3826b9f98e95"
+          base64 --decode /tmp/customer-cutover.b64 > /tmp/customer-cutover.patch.gz
+          test "$(sha256sum /tmp/customer-cutover.patch.gz | cut -d' ' -f1)" = "3f65562d11514edee4da50787ec2d1d4249bfef4e510a77600af4f14d40e5147"
+          gzip --decompress --stdout /tmp/customer-cutover.patch.gz > /tmp/customer-cutover.patch
+          test "$(sha256sum /tmp/customer-cutover.patch | cut -d' ' -f1)" = "3d266d1cc017ed0723f1f2b0c480671e856fc0bcac4521be3b6a53216ea71311"
+          cp /tmp/customer-cutover.patch artifacts/customer-cutover.patch
+          git apply --check /tmp/customer-cutover.patch
+          git apply /tmp/customer-cutover.patch
+          git diff --check
+
+      - name: Repair exact-head lint findings in prepared patch
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/agent-cutover/repair.py
+          git diff --check
+
+      - name: Verify dependency and CLI contracts
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check-sibling-pins.py
+          make -B -C vendor/flags-2-env all
+          vendor/flags-2-env/build/flags2env audit .cli-flags.toml
+          node --check tests/customer-session-lifecycle.test.mjs
+          node --check tests/customer-browser-evidence.mjs
+          node --check tests/customer-browser-harness.mjs
+          node --check tests/customer-playwright.test.mjs
+          node --check tests/customer-puppeteer.test.mjs
+
+      - name: Refresh lockfile and verify Rust
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'rustc=%s\n' "$(rustc --version)"
+            printf 'cargo=%s\n' "$(cargo --version)"
+            cargo check --all-targets --all-features
+            cargo fmt --all
+            cargo fmt --all -- --check
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+            cargo test --locked --all-targets --all-features
+            cargo audit
+            git diff --check
+          } 2>&1 | tee artifacts/rust-verification.log
+
+      - name: Upload cutover diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: customer-shared-auth-cutover-${{ github.sha }}
+          path: repo/artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Commit verified cutover and remove temporary files
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -- .github/workflows/agent-apply-shared-auth-cutover.yml
+          git rm -r -- .github/agent-cutover
+          git add \
+            .cli-flags.toml \
+            .github/workflows/ci.yml \
+            .github/workflows/docker.yml \
+            Cargo.lock \
+            Cargo.toml \
+            Dockerfile \
+            README.md \
+            dependency-pins.json \
+            src/auth.rs \
+            src/entity/mod.rs \
+            src/entity/org_members.rs \
+            src/login.rs \
+            src/main.rs \
+            src/store.rs \
+            src/supabase_auth.rs \
+            src/tests.rs \
+            tests/customer-session-lifecycle.test.mjs
+          unexpected="$(git status --porcelain --untracked-files=all | grep -vE '^(M |A |D | M| A| D) (\.cli-flags\.toml|\.github/agent-cutover/(patch\.part[0-9]+|repair\.py)|\.github/workflows/(ci|docker|agent-apply-shared-auth-cutover)\.yml|Cargo\.(lock|toml)|Dockerfile|README\.md|dependency-pins\.json|src/(auth|login|main|store|supabase_auth|tests)\.rs|src/entity/(mod|org_members)\.rs|tests/customer-session-lifecycle\.test\.mjs)$' || true)"
+          test -z "$unexpected" || { printf '%s\n' "$unexpected"; exit 1; }
+          git diff --cached --check
+          git commit -m "feat(auth): cut customer sessions over to Shared Auth"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
