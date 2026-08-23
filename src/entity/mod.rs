@@ -7,4 +7,5 @@ pub mod billing_webhook_events;
 pub mod customer_notifications;
 pub mod customer_preferences;
 pub mod customer_sessions;
+pub mod org_members;
 pub mod users;
