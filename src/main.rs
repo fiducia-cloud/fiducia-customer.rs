@@ -171,6 +171,11 @@ async fn shutdown_signal() {
 /// Connect to the customer Postgres plane. Production startup fails closed when
 /// `DATABASE_URL` is absent or unreachable.
 ///
+/// This is the current combined BFF/API writer boundary, not P1 for a separately trusted web tier.
+/// Customer DML stays inside authenticated tenant-scoped handlers. A future split defaults to P2;
+/// future shared-domain P1 must use the distinct verified read-only context in
+/// `docs/web-api-data-access.md`. This credential never grants brain/node/coordination access.
+///
 /// The customer plane lives in the dedicated `fiducia` Postgres schema (declared
 /// in k8s-cluster `remote/libs/pg-defs` and converged onto AWS RDS via dpm), so
 /// the shared RDS instance can host many apps without table-name collisions. The
@@ -865,6 +870,9 @@ fn require_idempotency_key(headers: &HeaderMap) -> Result<&HeaderValue, Response
     Ok(value)
 }
 
+/// P2 is selected for API-key and credential-authority operations. Keep this hop stateless,
+/// authenticated, deadline-bounded, and replay-safe through the caller's stable idempotency key.
+/// `fiducia-auth` owns the write/result; failure must not fall back to customer DB, P1, P3, or P4.
 async fn auth_json(
     config: &AppConfig,
     headers: &HeaderMap,
