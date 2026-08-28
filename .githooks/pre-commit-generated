@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Refuse a commit that hand-edits a frozen generated file.
+#
+# Called by .githooks/pre-commit. Not a security control -- anyone can pass
+# --no-verify or REGEN=1. It exists to catch the honest mistake of editing
+# generated output instead of the source it comes from.
+#
+# Regenerating? Run the generator, then commit with:  REGEN=1 git commit ...
+set -euo pipefail
+[ "${REGEN:-}" = "1" ] && exit 0
+root="$(git rev-parse --show-toplevel)"
+staged="$(git diff --cached --name-only --diff-filter=ACM || true)"
+[ -z "$staged" ] && exit 0
+
+offenders=""
+while IFS= read -r f; do
+  case "$f" in
+    */generated/*|generated/*) ;;
+    *) continue ;;
+  esac
+  case "$f" in */README.md) continue ;; esac
+  d="$root/${f%/*}"
+  while [ "$d" != "$root" ] && [ "$(basename "$d")" != "generated" ]; do d="$(dirname "$d")"; done
+  [ -f "$d/README.md" ] || continue
+  grep -qi '<!--[[:space:]]*generated-policy:[[:space:]]*frozen' "$d/README.md" || continue
+  offenders="$offenders  $f
+"
+done <<< "$staged"
+
+if [ -n "$offenders" ]; then
+  cat >&2 <<MSG
+pre-commit: these files are in a frozen generated/ tree and must not be hand-edited:
+$offenders
+Change the source they are generated from and re-run the generator.
+If this commit IS a regeneration, repeat it as:  REGEN=1 git commit ...
+MSG
+  exit 1
+fi
