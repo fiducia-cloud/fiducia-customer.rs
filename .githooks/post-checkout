@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Re-freeze generated files after checkout.
+#
+# Git stores only the executable bit, never the write bit, so every clone,
+# checkout and branch switch hands back mode 644 files that the policy says
+# are read-only. This hook puts the guard back.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -f "$root/scripts/check-generated-contract.py" ] || exit 0
+python3 "$root/scripts/check-generated-contract.py" --root "$root" --freeze >/dev/null 2>&1 || true
