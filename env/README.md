@@ -1,139 +1,83 @@
-# Environment files
+# Encrypted runtime configuration
 
-Secrets for this repo are **committed, encrypted**, with [sops] + [age].
+This service has one reviewed secret contract:
 
+```text
+env/enc/dev.env.enc    # SOPS + age ciphertext; may be committed
+env/enc/prod.env.enc   # SOPS + age ciphertext; may be committed
+env/dec/dev.env        # ignored local plaintext, mode 0600
+env/dec/prod.env       # ignored local plaintext, mode 0600
+.env -> env/dec/<dev|prod>.env
 ```
-env/enc/<name>.env.enc   ciphertext — committed. This is the source of truth.
-env/dec/<name>.env       plaintext  — gitignored, mode 0600, disposable.
-```
 
-`env/dec` is a build artifact. Delete it whenever you like and regenerate with
-`just env-decrypt`; nothing there is authoritative.
+There are exactly two tracked secret stores: `dev` and `prod`. Do not create
+`local`, `staging`, `production`, per-person, or per-provider ciphertext files.
+Deployment platforms may bind different values, but they must implement the
+same documented variable-name contract.
 
-## First run on a new machine
+`env/dec/` is a disposable runtime boundary. It is never authoritative and must
+be created only through `ores-sops ensure-dec`, which rejects symlink and
+non-directory redirection and applies restrictive permissions.
+
+## Canonical workflow
 
 ```sh
-just env-keygen     # creates your age key (never overwrites an existing one)
-just env-whoami     # prints your public recipient — send it to a maintainer
+ores-sops verify        # keyless policy audit; safe for pull-request CI
+ores-sops edit dev      # edit through SOPS; plaintext does not persist
+ores-sops edit prod
+ores-sops use dev       # atomically materialize and activate the managed .env
+ores-sops use prod
+ores-sops diff dev      # variable names only; never values
+ores-sops status
+ores-sops lock          # remove managed plaintext and the managed .env link
 ```
 
-A maintainer adds your recipient to `.sops.yaml`, runs `just env-rekey`, and
-commits. Until then you cannot decrypt anything. After that:
+`just env-verify` is the repository alias for the keyless audit. Pull-request CI
+has no age identity and must not decrypt values. Trusted release/runtime jobs
+may separately prove decryptability through protected workload identity.
 
-```sh
-just env-decrypt    # env/enc/*.env.enc -> env/dec/*.env
-just env-check      # confirms nothing plaintext is tracked and all files decrypt
-```
+## Application configuration contract
 
-## Day to day
+The application owns variable names, types, required/optional status, safe
+defaults, and precedence. Deployment owns values. Runtime configuration must be
+parsed and validated once at process startup into an immutable typed value;
+malformed or missing required values fail before the listener starts. Do not
+read `std::env::var` throughout request handlers or hide deploy-specific values
+in source constants.
 
-| Command | What it does |
-|---|---|
-| `just env-list` | environments and the variable *names* in each (never values) |
-| `just env-decrypt [name…]` | ciphertext → `env/dec/*.env`, mode 0600 |
-| `just env-edit <name>` | open the decrypted file in `$EDITOR`; plaintext never hits disk |
-| `just env-encrypt [name…]` | fold `env/dec/*.env` edits back into the ciphertext |
-| `just env-status` | which variables differ between your `env/dec` and the ciphertext |
-| `just env-run <name> <cmd…>` | run `cmd` with those variables exported, no plaintext on disk |
-| `just env-new <name>` | start a new environment |
-| `just env-rekey` | re-sync recipients after editing `.sops.yaml` |
-| `just env-check` | fail-closed audit — safe to run in CI |
-| `just env-clean` | wipe `env/dec` |
+Non-secret settings may be supplied through flags, ConfigMaps, or platform
+configuration. Credentials, signing/encryption material, database URLs carrying
+credentials, provider tokens, and CSRF/HMAC material belong in the encrypted
+store or platform secret manager. `.cli-flags.toml` deliberately excludes
+secret-bearing names from command-line flags because process arguments are
+observable.
 
-Prefer `just env-edit` over decrypt-edit-encrypt. Both work, but `env-edit`
-re-encrypts only the values you actually changed, so the diff names them:
+## Build and runtime rules
 
-```
--DATABASE_URL=ENC[AES256_GCM,data:OG3trz…]
-+DATABASE_URL=ENC[AES256_GCM,data:9fKq2a…]
-```
+- Never decrypt during `docker build`; layers and build metadata persist.
+- Inject secrets when the process starts, not through build arguments.
+- Never print values in CI, logs, shell tracing, GitHub, Linear, or evidence.
+- Keep the Rust application as PID 1 so SIGTERM reaches it directly.
+- Reject malformed dotenv, duplicate names, unsafe filesystem shapes, and
+  unexpected files below `env/enc/`.
+- Give humans and workloads separate identities; maintain an independently
+  controlled recovery path.
+- Removing a SOPS recipient prevents future access only after updatekeys and
+  rotation of the underlying application credentials by their owners.
 
-`just env-encrypt` uses the same mechanism, so it is equally clean. A bare
-`sops encrypt` is not — it gives every line a fresh IV and rewrites the whole
-file, which makes review useless and guarantees merge conflicts. Don't call
-sops directly; use the recipes.
+SOPS dotenv values are single-line. Represent multiline values with escaped
+newlines. Documentation and test source must not contain a complete private-key
+signature; tests that need one construct it at runtime so scanners stay
+fail-closed.
 
-## Running things
+## Source-control policy
 
-`.envrc` auto-loads **`env/dec/local.env` only** — non-production values for
-your own machine. Staging and production are deliberately opt-in per command:
+Plaintext dotenv is denied repository-wide. `env/dec/` is ignored. `env/enc/*`
+is denied and then exactly `dev.env.enc` and `prod.env.enc` are re-allowed.
+`.sops.yaml` has a separate exact creation rule for each approved ciphertext
+path, and `.gitattributes` normalizes ciphertext to LF.
 
-```sh
-just env-run prod cargo run --release
-just env-run staging ./scripts/migrate.sh
-```
-
-`env-run` streams the values straight into the child process. Nothing is
-written to disk, so an interrupted run can't leave `env/dec/prod.env` behind.
-
-## What is and isn't hidden
-
-Variable **names are plaintext** in `env/enc/*.env.enc`; only values are
-encrypted. That is the point — it makes diffs reviewable and lets `env-list`
-work without a key. Never encode a secret in a variable *name*. Comments are
-encrypted, so anything explanatory belongs in this file instead.
-
-Two format limits, inherited from sops' dotenv parser:
-
-- **No multi-line values.** A PEM must be a single line with `\n` escapes:
-  `JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIE…\n-----END PRIVATE KEY-----\n"`
-- **Blank lines are dropped** on round-trip. Cosmetic only.
-
-## Containers
-
-Decryption happens at `docker run`, **never** at `docker build`. A secret
-decrypted during a build is written into an image layer and stays there — a
-later `RUN rm` does not remove it, and `--build-arg` is worse still because it
-lands in `docker history`.
-
-```sh
-just env-docker-run local ghcr.io/fiducia-cloud/fiducia-auth:dev
-just env-k8s-secret prod | kubectl apply -f -
-```
-
-Nothing is baked into the image: no sops binary, no ciphertext, no entrypoint
-script. That is forced, not chosen. `sops exec-env` shells out to `/bin/sh` in
-**both** modes — `--same-process` included, verified against a valid
-single-word binary path — and most fiducia services run on
-`gcr.io/distroless/cc-debian12`, which deliberately has no shell. So the
-sonus-auris/ores-sops in-container entrypoint cannot run here at all.
-
-Decrypting host-side and injecting with `--env-file` also leaves the
-application as **PID 1**, so `docker stop` delivers SIGTERM straight to it and
-it can drain. Wrapping the app in sops or a shell would make it a child and
-swallow the signal.
-
-The trade-off, stated plainly: `--env-file` values are visible in
-`docker inspect`. The in-image alternative exposes `SOPS_AGE_KEY` there
-instead — a key that decrypts *every* environment — so this is the smaller
-leak, not a free win. For real deployments use `env-k8s-secret` and let the
-platform hold the secret.
-
-### Multi-line values do not fit in --env-file
-
-`docker --env-file` is one line per variable with no escape processing, so a
-value containing a newline cannot be represented: docker keeps the first line
-and silently drops the rest. `just env-docker-run` refuses rather than starting
-a container with a half-truncated key. A PEM therefore goes through
-`just env-run`, `just env-k8s-secret` (base64, no such limit), or gets stored
-single-line.
-
-All three paths share one parser (`.just/dotenv.py`) so the same encrypted file
-yields byte-identical values everywhere. Without it each loader applies its own
-quoting rules and `"-----BEGIN…\n…"` reaches the app with the quotes still
-attached.
-
-## Rules
-
-- Never commit anything from `env/dec/`. `.gitignore` and `just env-check`
-  both block it; don't defeat them with `git add -f`.
-- Never commit a private age key. They belong only in
-  `~/Library/Application Support/sops/age/keys.txt` (macOS) or
-  `~/.config/sops/age/keys.txt` (Linux), mode 0600.
-- Removing a recipient does not un-leak anything. Rotate the credentials too.
-- Files ending in `.env` are gitignored repo-wide. If a repo has a legitimate
-  non-secret `*.env` (for example generated cluster topology), allow it with an
-  explicit `!` rule in `.gitignore` — deny by default, permit narrowly.
-
-[sops]: https://github.com/getsops/sops
-[age]: https://github.com/FiloSottile/age
+A credential or private identity that appears in source, logs, an issue, a pull
+request, chat, or an artifact is exposed. Record only its provider/path/name and
+assign rotation to its owner; do not copy the value to another system and do not
+revoke or rotate shared credentials without explicit authorization.
