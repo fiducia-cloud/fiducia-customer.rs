@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for fiducia-backend.
-FROM node:26-slim@sha256:715e55e4b84e4bb0ff48e49b398a848f08e55daed8eb6a0ea1839ae53bc57583 AS web
+FROM node:26-slim@sha256:4ebb5ace66f15a24c14c492e01a8beeed4fddf970a856109f5126e703e5fe503 AS web
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 ARG MARKETING_REF=f3fd0e63b3c0898bed33c66817847056067f7ca8
@@ -30,7 +30,7 @@ WORKDIR /web/fiducia-marketing.web
 RUN npm ci --ignore-scripts \
     && PUBLIC_BASE=/ npm run build
 
-FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS build
+FROM rust:1.97.1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
@@ -57,10 +57,16 @@ COPY . fiducia-customer.rs
 WORKDIR /build/fiducia-customer.rs
 RUN cargo build --locked --release && strip target/release/fiducia-backend
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build --chown=65532:65532 /build/fiducia-customer.rs/target/release/fiducia-backend /usr/local/bin/fiducia-backend
 COPY --from=web --chown=65532:65532 /web/fiducia-marketing.web/dist /app/static
 ENV STATIC_DIR=/app/static
 EXPOSE 8080
 USER 65532:65532
+# --- sops: this final stage has no shell (distroless/scratch), so runtime
+# decryption cannot run inside the container. Inject secrets HOST-SIDE at
+# `docker run` instead — never at build, never as --build-arg:
+#     just env-docker-run prod <image>        # decrypts env/enc/prod.env.enc
+#                                             # and passes --env-file, no plaintext on disk
+# or render a platform secret from the same ciphertext. See env/README.md.
 ENTRYPOINT ["/usr/local/bin/fiducia-backend"]

@@ -1,3 +1,64 @@
+//! ## Customer web/API data boundary
+//!
+//! This decision governs the traditional Fiducia customer web/API tier. It does
+//! not govern `fiducia-brain.rs` or `fiducia-node.rs`.
+//!
+//! Choose a route per operation; a query being read-only does not by itself make
+//! it safe, cheap, authorized, or consistent.
+//!
+//! 1. **Direct database read — narrow SSR optimization.** Use only for a bounded
+//!    list/detail projection when removing the API hop has a measured benefit.
+//!    The browser-facing capability must receive a distinct `__web_ro` principal
+//!    with database-enforced `SELECT` allowlists, read-only transactions,
+//!    timeouts, tenant/actor context, result limits, and negative
+//!    write/isolation tests. Expose named reads rather than a raw SeaORM
+//!    connection. Never use this route for customer-domain writes or across an
+//!    untrusted/remote network boundary.
+//! 2. **Stateless HTTP to the API cluster — default.** Use a generated client for
+//!    every product mutation and for authorization-sensitive, composite, rapidly
+//!    evolving, or consistency-sensitive reads. Call the load-balanced service
+//!    endpoint with deadlines and trace/actor context. HTTP connection pooling
+//!    may reuse TCP/QUIC underneath, but no application session belongs to a
+//!    particular socket or replica. Retry only idempotent operations or
+//!    mutations protected by an idempotency key.
+//! 3. **Application-stateful TCP to the API cluster — streaming exception.** A
+//!    framed TCP session is appropriate only for measured high-rate streaming
+//!    or backpressure/resume requirements that HTTP streaming or WebSockets do
+//!    not satisfy. Authenticate the connection and each logical stream, bound
+//!    buffers and heartbeats, support versioned framing and resume tokens, and
+//!    reconnect through a TCP-aware load balancer so deploys and failed replicas
+//!    do not strand state. Do not invent a custom TCP protocol for ordinary
+//!    form, CRUD, billing, or SSR traffic.
+//! 4. **NATS/message queue — asynchronous workflow.** Publish a typed, versioned
+//!    command/event for durable jobs, fan-out, or work whose result is not needed
+//!    to render the current response. Include actor/tenant context, correlation
+//!    and idempotency keys, expiry, retry/dead-letter policy, and an audit trail.
+//!    Persist the result and notify the browser by polling, SSE, or WebSocket.
+//!    Broker request/reply is not the default synchronous RPC path.
+//!
+//! Location guide: browser/edge traffic uses HTTPS; an ordinary in-cluster web
+//! handler uses stateless HTTP; a same-trust-zone SSR hot path may earn a
+//! constrained direct read; a genuinely sessionful high-volume stream may earn
+//! TCP; and background processing or integration events use NATS. After a
+//! mutation, render from the API response, an API primary read, or an explicit
+//! consistency token rather than assuming a read replica is current.
+//!
+//! The customer API/domain capability owns customer mutations, transaction
+//! invariants, idempotency, auditing, and event publication. Browser-facing code
+//! may write only isolated web-owned state such as encrypted sessions and
+//! PKCE/CSRF state. Today `fiducia-interfaces/sql/customer.sql` is the reviewed
+//! persistence source consumed by `scripts/dpm-schema.sh`; if schema authority
+//! moves to the canonical `fiducia-orm-core` repository, move it exactly once
+//! rather than copying it. Production DDL runs only from a serialized one-shot
+//! migrator identity. Request-serving replicas never auto-migrate, and
+//! code-first models here never become a second schema authority.
+//!
+//! Because this binary currently hosts browser and customer API routes, treat it
+//! as an explicit `combined-bff-api`: keep browser read/write capabilities
+//! internally separate and record a split/review trigger. Co-location is not
+//! permission to add another writer or give request handlers migrator
+//! credentials.
+
 // fiducia-backend entrypoint: the axum app for fiducia.cloud's website tier.
 // Serves the static Astro marketing site, the Maud/HTMX customer portal and its
 // WS/SSE fragment streams, plus authenticated customer APIs. API-key lifecycle

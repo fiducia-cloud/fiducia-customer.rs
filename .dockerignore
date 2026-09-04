@@ -4,3 +4,9 @@ target
 .env
 .env.*
 *.md
+
+# ores-sops consumer boundary: exclude managed env trees from the build context.
+env/dec
+env/dec/**
+env/enc
+env/enc/**
