@@ -1,0 +1,9 @@
+
+# --- generated trees -------------------------------------------------------
+# Collapse generated output in pull requests and keep it out of language
+# stats. Deliberately NOT `-diff` (we still want a readable local diff) and
+# deliberately NO merge driver: a `merge=ours` here would resolve conflicts by
+# silently picking a side, which is the opposite of how conflicts get resolved
+# in this org. Regenerate and commit the result instead.
+generated/**       linguist-generated=true
+**/generated/**    linguist-generated=true

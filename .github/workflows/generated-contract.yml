@@ -1,0 +1,60 @@
+name: generated-contract
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generated-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    name: Generated policy + runtime contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+
+      - name: Install jsonschema
+        run: python3 -m pip install --quiet jsonschema
+
+      - name: Run generated-contract tool unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      # Policy READMEs must match what git actually does, every generated file
+      # must be freezable, and JSON Schema must still accept the valid fixtures
+      # and reject the invalid ones.
+      - name: Check generated policy and runtime contract
+        run: python3 scripts/check-generated-contract.py --freeze --require-readonly
+
+      # The freeze bit cannot survive a clone, so this is the check that
+      # actually enforces the policy: regenerate, and fail if the committed
+      # output moved. Runs only where the repo declares how to regenerate.
+      - name: Regenerate and diff
+        run: |
+          if [ ! -f .generated-regen.sh ]; then
+            echo "No .generated-regen.sh in this repo; skipping regenerate-and-diff."
+            echo "Add one (a script that re-runs the generators) to enable it."
+            exit 0
+          fi
+          chmod -R u+w $(git ls-files -- '*generated/*' | xargs -r -n1 dirname | sort -u) 2>/dev/null || true
+          bash .generated-regen.sh
+          if ! git diff --quiet --exit-code; then
+            echo "::error::Committed generated output does not match a fresh run of the generator."
+            git diff --stat
+            git diff | head -200
+            exit 1
+          fi
+          echo "Committed generated output matches a fresh generator run."
