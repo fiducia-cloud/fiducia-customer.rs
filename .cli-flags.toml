@@ -1,5 +1,5 @@
-# Non-secret command-line configuration for fiducia-backend. Database credentials
-# and authentication material remain environment-only.
+# Non-secret command-line configuration for fiducia-backend. Database credentials,
+# CSRF/HMAC material, and authentication session secrets remain environment-only.
 [help]
 url = "https://github.com/fiducia-cloud/fiducia-customer.rs"
 columns = ["options", "env", "type", "description"]
@@ -15,7 +15,7 @@ env = "PORT"
 aliases = ["port"]
 short = "p"
 type = "integer"
-help = "HTTP listen port."
+help = "HTTP listen port; defaults to 8080 when omitted and fails on malformed input."
 
 [flags.static-dir]
 env = "STATIC_DIR"
@@ -27,19 +27,19 @@ help = "Static Astro marketing-site directory."
 env = "CUSTOMER_APP_HOST"
 aliases = ["customer-app-host"]
 type = "string"
-help = "Canonical customer application host."
+help = "Canonical customer application host; production target is user.fiducia.cloud."
 
 [flags.customer-app-origin]
 env = "CUSTOMER_APP_ORIGIN"
 aliases = ["customer-app-origin"]
 type = "string"
-help = "Exact standalone customer application origin allowed by CORS."
+help = "Single exact customer application origin allowed by CORS and CSRF checks."
 
 [flags.site-mode]
 env = "FIDUCIA_SITE_MODE"
 aliases = ["site-mode"]
 type = "string"
-help = "Site rendering mode, such as customer."
+help = "Explicit site rendering mode: customer or marketing."
 
 [flags.auth-url]
 env = "FIDUCIA_AUTH_URL"
@@ -58,6 +58,12 @@ env = "SUPABASE_PUBLISHABLE_KEY"
 aliases = ["supabase-publishable-key"]
 type = "string"
 help = "Public Supabase key used by the Rust server for password exchange."
+
+[flags.db-schema]
+env = "FIDUCIA_DB_SCHEMA"
+aliases = ["db-schema"]
+type = "string"
+help = "Postgres schema search path; defaults to fiducia and must be one SQL identifier."
 
 [flags.log]
 env = "RUST_LOG"

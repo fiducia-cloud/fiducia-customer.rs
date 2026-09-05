@@ -1,4 +1,3 @@
-
 # --- generated trees -------------------------------------------------------
 # Collapse generated output in pull requests and keep it out of language
 # stats. Deliberately NOT `-diff` (we still want a readable local diff) and
@@ -7,3 +6,4 @@
 # in this org. Regenerate and commit the result instead.
 generated/**       linguist-generated=true
 **/generated/**    linguist-generated=true
+/env/enc/*.env.enc text eol=lf

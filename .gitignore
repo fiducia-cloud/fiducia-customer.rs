@@ -1,16 +1,23 @@
 /target
 .DS_Store
 *.log
-# --- environment / secrets (sops + age) -------------------------------------
-# Only env/enc/*.env.enc is tracked. Every plaintext form stays out of git;
-# `just env-check` enforces it. See env/README.md.
-# (`*.env` already matches at any depth — `**/*.env` is stated for clarity.)
-.env
-.env.*
+
+# --- environment / secrets (ores-sops + age) -------------------------------
+# Plaintext dotenv is local-only at every depth.
 *.env
-**/*.env
-env/dec/
+*/*.env
+*/**/*.env
+.env.*
+*.env.*
 !.env.example
+
+# Decrypted material is runtime-only.
+/env/dec/
+
+# Deny all encrypted environment names, then permit only the reviewed contract.
+/env/enc/*
+!/env/enc/dev.env.enc
+!/env/enc/prod.env.enc
 
 # age private keys — never commit these.
 *.agekey
@@ -18,10 +25,7 @@ env/dec/
 keys.txt
 sops-private*.txt
 
-
-# Built Astro site. NOT committed — the deployment builds it in-pod (node
-# initContainer) and hands it to this backend via STATIC_DIR. For local dev,
-# point STATIC_DIR at ../fiducia-marketing.web/dist (or run `npm run sync` there).
+# Built Astro site. NOT committed — deployment builds it and supplies STATIC_DIR.
 /static
 /dist
 
@@ -32,10 +36,11 @@ package-lock.json
 # Zed package dependencies
 /.vendor/.zed/
 
-# Scratch / git worktrees (tmp/worktrees/*)
+# Scratch / git worktrees
 tmp/
+temp/
 
-# --- hardened baseline (auto) ---
+# --- hardened baseline ------------------------------------------------------
 Thumbs.db
 *.swp
 *~
@@ -44,12 +49,3 @@ target/
 **/*.rs.bk
 *.pdb
 .cargo-target-*/
-tmp
-temp
-tmp/worktrees
-temp/worktrees
-
-# ores-sops dotenv hardening: plaintext dotenv is local-only at every depth;
-# only env/enc/*.env.enc (sops ciphertext) is tracked. See env/README.md.
-**/**/*.env
-env/dec
