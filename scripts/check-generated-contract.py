@@ -265,8 +265,22 @@ def jsonschema_validate(instance: Any, schema: dict[str, Any]) -> list[str]:
 def structural_validate(instance: Any, schema: dict[str, Any]) -> list[str]:
     """Subset used when the `jsonschema` package is not installed."""
     errors: list[str] = []
-    if schema.get("type") == "object" and not isinstance(instance, dict):
-        return ["instance is not an object"]
+    def matches_type(value: Any, expected: str) -> bool:
+        # bool is an int subclass in Python, but JSON Schema treats it as its
+        # own scalar type; keep the fallback validator aligned with that rule.
+        return {
+            "null": value is None,
+            "boolean": isinstance(value, bool),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+            "string": isinstance(value, str),
+            "array": isinstance(value, list),
+            "object": isinstance(value, dict),
+        }.get(expected, True)
+
+    root_type = schema.get("type")
+    if isinstance(root_type, str) and not matches_type(instance, root_type):
+        return [f"instance is not of type {root_type!r}"]
     if not isinstance(instance, dict) or not isinstance(schema.get("properties"), dict):
         return errors
     required = schema.get("required") or []
@@ -280,6 +294,14 @@ def structural_validate(instance: Any, schema: dict[str, Any]) -> list[str]:
         for key in instance:
             if key not in allowed:
                 errors.append(f"undeclared property {key!r}")
+    for key, property_schema in schema["properties"].items():
+        if key not in instance or not isinstance(property_schema, dict):
+            continue
+        property_type = property_schema.get("type")
+        if isinstance(property_type, str) and not matches_type(instance[key], property_type):
+            errors.append(
+                f"property {key!r} is not of type {property_type!r}"
+            )
     return errors
 
 
