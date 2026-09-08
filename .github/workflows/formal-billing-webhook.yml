@@ -133,6 +133,7 @@ jobs:
           name: billing-webhook-formal-${{ github.run_id }}-${{ github.run_attempt }}
           path: repo/.formal-artifacts/
           if-no-files-found: ignore
+          include-hidden-files: true
           retention-days: 14
 
   bounded-verification:
@@ -176,4 +177,5 @@ jobs:
           name: billing-webhook-bounded-verify-${{ github.run_id }}-${{ github.run_attempt }}
           path: .formal-artifacts/
           if-no-files-found: ignore
+          include-hidden-files: true
           retention-days: 14
