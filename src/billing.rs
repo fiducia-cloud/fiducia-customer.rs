@@ -252,8 +252,8 @@ fn is_exact_redelivery(
 ) -> bool {
     stored.signature_verified
         && stored.provider == incoming.provider.as_str()
-        && stored.provider_event_id == incoming.id
-        && stored.event_type == incoming.event_type
+        && stored.provider_event_id == incoming.id.as_str()
+        && stored.event_type == incoming.event_type.as_str()
         && stored.payload_sha256 == incoming_payload_sha256
 }
 
@@ -397,13 +397,7 @@ mod tests {
         );
         let digest = verified_payload_sha256(&incoming);
         assert!(!is_exact_redelivery(
-            stored(
-                "paypal",
-                "WH-1",
-                "PAYMENT.CAPTURE.COMPLETED",
-                true,
-                &digest,
-            ),
+            stored("paypal", "WH-1", "PAYMENT.CAPTURE.COMPLETED", true, &digest,),
             &incoming,
             &digest,
         ));
