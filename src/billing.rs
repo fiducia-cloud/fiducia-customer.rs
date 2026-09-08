@@ -3,11 +3,13 @@
 //! The route is unauthenticated by necessity (providers POST to it directly), so
 //! the provider SIGNATURE is the only thing that makes a body trustworthy. This
 //! module verifies it via `fiducia-payments` before touching any state, then
-//! records the event in `billing_webhook_events` with the unique
-//! `(provider, provider_event_id)` index acting as the idempotency primitive: a
-//! provider's at-least-once redelivery either inserts a fresh row (first sight)
-//! or conflicts (already handled), and we ACK 200 either way so the provider
-//! stops retrying.
+//! records the event in `billing_webhook_events`.
+//!
+//! The unique `(provider, provider_event_id)` index is only the first half of the
+//! idempotency contract. An exact authenticated redelivery must also match the
+//! stored event type and SHA-256 of the exact verified bytes. Reuse of the same
+//! provider identity with different authenticated content is an identity
+//! conflict, not a successful dedupe, and fails closed.
 //!
 //! Secrets come from the environment (not `AppConfig`, to avoid threading a new
 //! field through every construction site): `STRIPE_WEBHOOK_SECRET` and
@@ -22,7 +24,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ActiveValue::Set, DbErr, EntityTrait};
+use sea_orm::{ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -36,7 +38,8 @@ const CERT_FETCH_TIMEOUT_SECS: u64 = 5;
 
 /// `POST /api/customer/billing/webhooks/:provider` — verify and record a
 /// provider webhook. Always fail closed: an unknown provider, missing secret,
-/// or bad signature never reaches the ledger.
+/// bad signature, or conflicting reuse of a provider event identity never
+/// reaches downstream billing effects.
 pub async fn webhook(
     State(config): State<AppConfig>,
     Path(provider): Path<String>,
@@ -44,7 +47,7 @@ pub async fn webhook(
     body: Bytes,
 ) -> Response {
     let provider: Provider = match provider.parse() {
-        Ok(p) => p,
+        Ok(provider) => provider,
         Err(_) => return deny(StatusCode::NOT_FOUND, "unknown_provider"),
     };
 
@@ -53,15 +56,23 @@ pub async fn webhook(
         Err(reject) => return reject.response(),
     };
 
-    match record(&config, &verified, &body).await {
+    match record(&config, &verified).await {
         Ok(Ingest::Recorded) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "deduped": false })),
         )
             .into_response(),
-        // Already processed a prior delivery — ACK so the provider stops retrying.
+        // The prior row matched the exact verified event identity, type, and
+        // payload digest, so ACKing is a safe no-op.
         Ok(Ingest::Deduped) => {
             (StatusCode::OK, Json(json!({ "ok": true, "deduped": true }))).into_response()
+        }
+        Err(IngestError::IdentityConflict) => {
+            tracing::error!(
+                provider = %provider,
+                "authenticated billing event identity reused with different content"
+            );
+            deny(StatusCode::CONFLICT, "event_identity_conflict")
         }
         Err(IngestError::Unavailable) => {
             deny(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
@@ -113,10 +124,10 @@ async fn verify(
     match provider {
         Provider::Stripe => {
             let secret = env_secret("STRIPE_WEBHOOK_SECRET")?;
-            let sig = header(headers, "stripe-signature")?;
+            let signature = header(headers, "stripe-signature")?;
             stripe::verify(
                 body,
-                &sig,
+                &signature,
                 &secret,
                 now_unix(),
                 stripe::DEFAULT_TOLERANCE_SECS,
@@ -148,25 +159,37 @@ async fn verify(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ingest {
     Recorded,
     Deduped,
 }
 
+#[derive(Debug)]
 enum IngestError {
     Unavailable,
+    IdentityConflict,
     Db(DbErr),
 }
 
-/// Idempotently record a verified event. The unique index does the dedup: a
-/// conflicting insert surfaces as `RecordNotInserted`, which we treat as "seen".
-async fn record(
-    config: &AppConfig,
-    event: &VerifiedEvent,
-    raw_body: &Bytes,
-) -> Result<Ingest, IngestError> {
+#[derive(Clone, Copy)]
+struct StoredEventIdentity<'a> {
+    provider: &'a str,
+    provider_event_id: &'a str,
+    event_type: &'a str,
+    signature_verified: bool,
+    payload_sha256: &'a str,
+}
+
+/// Idempotently record a verified event.
+///
+/// A unique-index conflict is not automatically a benign retry. The existing
+/// row must match the provider, event id, event type, verified flag, and digest
+/// of the exact bytes held by [`VerifiedEvent`]. Any disagreement fails closed
+/// as an identity conflict.
+async fn record(config: &AppConfig, event: &VerifiedEvent) -> Result<Ingest, IngestError> {
     let db = config.pool.as_ref().ok_or(IngestError::Unavailable)?;
-    let payload_sha256 = hex::encode(Sha256::digest(raw_body));
+    let payload_sha256 = verified_payload_sha256(event);
 
     let model = wh::ActiveModel {
         id: Set(uuid::Uuid::new_v4()),
@@ -174,7 +197,7 @@ async fn record(
         provider_event_id: Set(event.id.clone()),
         event_type: Set(event.event_type.clone()),
         signature_verified: Set(true),
-        payload_sha256: Set(payload_sha256),
+        payload_sha256: Set(payload_sha256.clone()),
         ..Default::default()
     };
 
@@ -189,10 +212,49 @@ async fn record(
 
     match result {
         Ok(_) => Ok(Ingest::Recorded),
-        // Nothing inserted => the (provider, event_id) row already existed.
-        Err(DbErr::RecordNotInserted) => Ok(Ingest::Deduped),
+        Err(DbErr::RecordNotInserted) => {
+            let existing = wh::Entity::find()
+                .filter(wh::Column::Provider.eq(event.provider.as_str()))
+                .filter(wh::Column::ProviderEventId.eq(event.id.as_str()))
+                .one(db)
+                .await
+                .map_err(IngestError::Db)?;
+
+            let Some(existing) = existing else {
+                // A disappeared conflict row is not evidence of an exact retry.
+                return Err(IngestError::IdentityConflict);
+            };
+            let stored = StoredEventIdentity {
+                provider: &existing.provider,
+                provider_event_id: &existing.provider_event_id,
+                event_type: &existing.event_type,
+                signature_verified: existing.signature_verified,
+                payload_sha256: &existing.payload_sha256,
+            };
+            if is_exact_redelivery(stored, event, &payload_sha256) {
+                Ok(Ingest::Deduped)
+            } else {
+                Err(IngestError::IdentityConflict)
+            }
+        }
         Err(error) => Err(IngestError::Db(error)),
     }
+}
+
+fn verified_payload_sha256(event: &VerifiedEvent) -> String {
+    hex::encode(Sha256::digest(&event.payload))
+}
+
+fn is_exact_redelivery(
+    stored: StoredEventIdentity<'_>,
+    incoming: &VerifiedEvent,
+    incoming_payload_sha256: &str,
+) -> bool {
+    stored.signature_verified
+        && stored.provider == incoming.provider.as_str()
+        && stored.provider_event_id == incoming.id.as_str()
+        && stored.event_type == incoming.event_type.as_str()
+        && stored.payload_sha256 == incoming_payload_sha256
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -200,7 +262,7 @@ async fn record(
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
 }
 
@@ -208,7 +270,7 @@ fn now_unix() -> i64 {
 fn header(headers: &HeaderMap, name: &str) -> Result<String, Reject> {
     headers
         .get(name)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .ok_or(Reject::MissingHeader)
 }
@@ -218,7 +280,7 @@ fn header(headers: &HeaderMap, name: &str) -> Result<String, Reject> {
 fn env_secret(name: &str) -> Result<String, Reject> {
     std::env::var(name)
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|secret| !secret.is_empty())
         .ok_or(Reject::NotConfigured)
 }
 
@@ -254,4 +316,123 @@ async fn fetch_cert(cert_url: &str) -> Result<String, reqwest::Error> {
         .error_for_status()?
         .text()
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(provider: Provider, id: &str, event_type: &str, payload: &[u8]) -> VerifiedEvent {
+        VerifiedEvent {
+            provider,
+            id: id.to_owned(),
+            event_type: event_type.to_owned(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn stored<'a>(
+        provider: &'a str,
+        id: &'a str,
+        event_type: &'a str,
+        signature_verified: bool,
+        digest: &'a str,
+    ) -> StoredEventIdentity<'a> {
+        StoredEventIdentity {
+            provider,
+            provider_event_id: id,
+            event_type,
+            signature_verified,
+            payload_sha256: digest,
+        }
+    }
+
+    #[test]
+    fn exact_authenticated_redelivery_is_a_safe_no_op() {
+        let incoming = event(
+            Provider::Stripe,
+            "evt_1",
+            "invoice.paid",
+            br#"{"id":"evt_1","type":"invoice.paid"}"#,
+        );
+        let digest = verified_payload_sha256(&incoming);
+        assert!(is_exact_redelivery(
+            stored("stripe", "evt_1", "invoice.paid", true, &digest),
+            &incoming,
+            &digest,
+        ));
+    }
+
+    #[test]
+    fn reused_identity_with_different_verified_payload_fails_closed() {
+        let first = event(
+            Provider::Stripe,
+            "evt_1",
+            "invoice.paid",
+            br#"{"id":"evt_1","type":"invoice.paid","amount":100}"#,
+        );
+        let second = event(
+            Provider::Stripe,
+            "evt_1",
+            "invoice.paid",
+            br#"{"id":"evt_1","type":"invoice.paid","amount":101}"#,
+        );
+        let first_digest = verified_payload_sha256(&first);
+        let second_digest = verified_payload_sha256(&second);
+        assert_ne!(first_digest, second_digest);
+        assert!(!is_exact_redelivery(
+            stored("stripe", "evt_1", "invoice.paid", true, &first_digest),
+            &second,
+            &second_digest,
+        ));
+    }
+
+    #[test]
+    fn reused_identity_with_different_event_type_fails_closed() {
+        let incoming = event(
+            Provider::Paypal,
+            "WH-1",
+            "PAYMENT.CAPTURE.DENIED",
+            br#"{"id":"WH-1","event_type":"PAYMENT.CAPTURE.DENIED"}"#,
+        );
+        let digest = verified_payload_sha256(&incoming);
+        assert!(!is_exact_redelivery(
+            stored("paypal", "WH-1", "PAYMENT.CAPTURE.COMPLETED", true, &digest,),
+            &incoming,
+            &digest,
+        ));
+    }
+
+    #[test]
+    fn unverified_or_different_identity_never_counts_as_deduped() {
+        let incoming = event(
+            Provider::Stripe,
+            "evt_1",
+            "invoice.paid",
+            br#"{"id":"evt_1","type":"invoice.paid"}"#,
+        );
+        let digest = verified_payload_sha256(&incoming);
+
+        for candidate in [
+            stored("stripe", "evt_1", "invoice.paid", false, &digest),
+            stored("paypal", "evt_1", "invoice.paid", true, &digest),
+            stored("stripe", "evt_2", "invoice.paid", true, &digest),
+        ] {
+            assert!(!is_exact_redelivery(candidate, &incoming, &digest));
+        }
+    }
+
+    #[test]
+    fn digest_is_bound_to_the_payload_retained_by_verified_event() {
+        let event = event(
+            Provider::Stripe,
+            "evt_1",
+            "invoice.paid",
+            b"verified-provider-bytes",
+        );
+        assert_eq!(
+            verified_payload_sha256(&event),
+            hex::encode(Sha256::digest(b"verified-provider-bytes"))
+        );
+    }
 }
