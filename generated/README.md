@@ -1,3 +1,5 @@
+<!-- generated-policy: frozen -->
+
 # generated
 
 Generated API documentation — do **not** edit by hand. These files are produced
@@ -10,3 +12,17 @@ Contract" in `AGENTS.md`. The app serves them at `/docs/api`, `/api/docs`, and
 - **`api-docs.html`** — human-readable rendering of the same.
 
 Regenerate them from the source of truth (the router) rather than editing here.
+
+## Read-only + runtime contract
+
+<!-- generated-policy: frozen -->
+
+Files in this `generated/` tree are frozen with `chmod a-w` after generation.
+This README stays writable. Git does not persist the write bit; re-run:
+
+```sh
+python3 scripts/check-generated-contract.py --freeze --require-readonly
+```
+
+JSON Schema is a runtime **cross-check** (fixtures must validate; invalid
+fixtures must fail). Compile-time types alone are not the contract.
