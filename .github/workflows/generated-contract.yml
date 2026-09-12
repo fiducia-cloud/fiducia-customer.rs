@@ -17,8 +17,11 @@ jobs:
   contract:
     name: Generated policy + runtime contract
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
@@ -26,6 +29,9 @@ jobs:
 
       - name: Install jsonschema
         run: python3 -m pip install --quiet jsonschema
+
+      - name: Run generated-contract tool unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
 
       # Policy READMEs must match what git actually does, every generated file
       # must be freezable, and JSON Schema must still accept the valid fixtures
