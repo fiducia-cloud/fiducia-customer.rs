@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for fiducia-backend.
-FROM node:26-slim@sha256:14bf3eac4bf209d906d3c41256597d3ab1f926b2e93a79e9bdfe1efd32454239 AS web
+FROM node:26-slim@sha256:ec7758ee051e457b468b32bde57b0879010b325bb9862718e9615225ce4aaae1 AS web
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 ARG MARKETING_REF=f3fd0e63b3c0898bed33c66817847056067f7ca8
