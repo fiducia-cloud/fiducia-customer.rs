@@ -64,7 +64,7 @@ class GeneratedContractCheckerTests(unittest.TestCase):
             "additionalProperties": False,
         }
 
-        self.assertEqual(checker.structural_validate([], schema), ["instance is not an object"])
+        self.assertEqual(checker.structural_validate([], schema), ["instance is not of type 'object'"])
         self.assertEqual(
             checker.structural_validate({"extra": True}, schema),
             ["missing required property 'name'", "undeclared property 'extra'"],

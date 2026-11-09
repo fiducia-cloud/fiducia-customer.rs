@@ -33,7 +33,7 @@ jobs:
           context: .
           build-args: |
             INTERFACES_SHA=f64cefd987ed16173c526b33a92fb90cbdfcac45
-            PAYMENTS_REF=126dc5d1b3fcba289f95139284dc0f3c54b56a8a
+            PAYMENTS_REF=5aea61201b76ea174c7f666f1525e646e6fb4f9c
             MARKETING_REF=f3fd0e63b3c0898bed33c66817847056067f7ca8
             TEST_CONFIG_REF=026fcf28193c7baeb7f5feb68480a91539c1f0fa
           push: true

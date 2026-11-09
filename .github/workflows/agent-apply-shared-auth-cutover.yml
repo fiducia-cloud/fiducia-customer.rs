@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: fiducia-cloud/fiducia-payments.rs
-          ref: 126dc5d1b3fcba289f95139284dc0f3c54b56a8a
+          ref: 5aea61201b76ea174c7f666f1525e646e6fb4f9c
           persist-credentials: false
           path: fiducia-payments.rs
 

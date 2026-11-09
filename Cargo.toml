@@ -47,6 +47,8 @@ hex = "0.4"
 # by SeaORM's `with-chrono`; declared directly so `chrono::Utc::now()` is ours.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Test-only signed X.509/RSA webhook fixtures against the sibling payments verifier.
 [dev-dependencies]
+rsa = { version = "0.9", features = ["sha2"] }
 # `ServiceExt::oneshot` drives the router in tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }

@@ -35,6 +35,12 @@ contracts = {
         rf"repository:\s*fiducia-cloud/fiducia-interfaces\s+ref:\s*{interfaces}\b",
         rf"repository:\s*fiducia-cloud/fiducia-payments\.rs\s+ref:\s*{payments}\b",
     ],
+    ".github/workflows/formal-billing-webhook.yml": [
+        rf"repository:\s*fiducia-cloud/fiducia-payments\.rs\s+ref:\s*{payments}\b",
+    ],
+    ".github/workflows/agent-apply-shared-auth-cutover.yml": [
+        rf"repository:\s*fiducia-cloud/fiducia-payments\.rs\s+ref:\s*{payments}\b",
+    ],
     ".github/workflows/docker.yml": [
         rf"INTERFACES_SHA={interfaces}\b",
         rf"MARKETING_REF={marketing}\b",

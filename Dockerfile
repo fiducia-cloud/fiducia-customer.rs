@@ -36,7 +36,7 @@ RUN apt-get update \
 WORKDIR /build
 # Immutable cross-repository input. Bump this SHA together with the CI checkout.
 ARG INTERFACES_SHA=f64cefd987ed16173c526b33a92fb90cbdfcac45
-ARG PAYMENTS_REF=126dc5d1b3fcba289f95139284dc0f3c54b56a8a
+ARG PAYMENTS_REF=5aea61201b76ea174c7f666f1525e646e6fb4f9c
 RUN for value in "$INTERFACES_SHA" "$PAYMENTS_REF"; do \
       test "${#value}" -eq 40 \
       && test -z "$(printf '%s' "$value" | tr -d '0-9a-f')"; \
