@@ -45,7 +45,7 @@ jobs:
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-payments.rs
-          ref: 126dc5d1b3fcba289f95139284dc0f3c54b56a8a
+          ref: 5aea61201b76ea174c7f666f1525e646e6fb4f9c
           path: fiducia-payments.rs
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -121,7 +121,7 @@ jobs:
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-payments.rs
-          ref: 126dc5d1b3fcba289f95139284dc0f3c54b56a8a
+          ref: 5aea61201b76ea174c7f666f1525e646e6fb4f9c
           path: fiducia-payments.rs
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -243,7 +243,7 @@ jobs:
         run: |
           docker build \
             --build-arg INTERFACES_SHA=f64cefd987ed16173c526b33a92fb90cbdfcac45 \
-            --build-arg PAYMENTS_REF=126dc5d1b3fcba289f95139284dc0f3c54b56a8a \
+            --build-arg PAYMENTS_REF=5aea61201b76ea174c7f666f1525e646e6fb4f9c \
             --build-arg MARKETING_REF=f3fd0e63b3c0898bed33c66817847056067f7ca8 \
             --build-arg TEST_CONFIG_REF=026fcf28193c7baeb7f5feb68480a91539c1f0fa \
             --tag fiducia-backend:pr .
