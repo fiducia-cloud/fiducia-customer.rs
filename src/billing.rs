@@ -154,9 +154,30 @@ async fn verify(
                 cert_url: &cert_url,
                 auth_algo: &header(headers, "paypal-auth-algo")?,
             };
-            paypal::verify(&transmission, &webhook_id, body, &cert_pem).map_err(reject)
+            verify_paypal_transmission(&transmission, &webhook_id, body, &cert_pem, now_unix())
+                .map_err(reject)
         }
     }
+}
+
+/// Bind PayPal's signed transmission timestamp to the same five-minute replay
+/// budget as Stripe before permitting any verified event into the billing DB.
+/// The clock is injectable to prove inclusive boundaries without wall-clock races.
+fn verify_paypal_transmission(
+    transmission: &paypal::Transmission<'_>,
+    webhook_id: &str,
+    raw_body: &[u8],
+    cert_pem: &str,
+    received_at_unix: i64,
+) -> Result<VerifiedEvent, fiducia_payments::VerifyError> {
+    paypal::verify_at(
+        transmission,
+        webhook_id,
+        raw_body,
+        cert_pem,
+        received_at_unix,
+        paypal::DEFAULT_TOLERANCE_SECS,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +342,139 @@ async fn fetch_cert(cert_url: &str) -> Result<String, reqwest::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use base64::Engine;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use rsa::RsaPrivateKey;
+
+    // Test-only RSA key + matching X.509 cert belong to the same pinned sibling
+    // crate as the production verifier; they are not operational credentials.
+    const PAYPAL_TEST_CERT: &str =
+        include_str!("../../fiducia-payments.rs/tests/fixtures/paypal_test_cert.pem");
+    const PAYPAL_TEST_KEY: &str =
+        include_str!("../../fiducia-payments.rs/tests/fixtures/paypal_test_key.pem");
+    const PAYPAL_WEBHOOK: &str = "WH-CUSTOMER-FRESHNESS";
+    const PAYPAL_BODY: &[u8] =
+        br#"{"id":"WH-customer-1","event_type":"PAYMENT.CAPTURE.COMPLETED"}"#;
+    const PAYPAL_CERT_URL: &str =
+        "https://api.paypal.com/v1/notifications/certs/customer-test.pem";
+
+    fn sign_paypal(body: &[u8], time: &str, webhook_id: &str) -> String {
+        let private_key =
+            RsaPrivateKey::from_pkcs8_pem(PAYPAL_TEST_KEY).expect("non-secret RSA test fixture");
+        let signer = SigningKey::<Sha256>::new(private_key);
+        let signed_message =
+            paypal::signed_message("transmission-customer", time, webhook_id, body);
+        base64::engine::general_purpose::STANDARD
+            .encode(signer.sign(signed_message.as_bytes()).to_bytes())
+    }
+
+    fn paypal_headers<'a>(
+        transmission_time: &'a str,
+        signature_b64: &'a str,
+        cert_url: &'a str,
+    ) -> paypal::Transmission<'a> {
+        paypal::Transmission {
+            transmission_id: "transmission-customer",
+            transmission_time,
+            signature_b64,
+            cert_url,
+            auth_algo: "SHA256withRSA",
+        }
+    }
+
+    #[test]
+    fn customer_paypal_boundary_accepts_signed_fresh_event_at_inclusive_window_edges() {
+        let time = "1970-01-01T00:00:00Z";
+        let signature = sign_paypal(PAYPAL_BODY, time, PAYPAL_WEBHOOK);
+        let transmission = paypal_headers(time, &signature, PAYPAL_CERT_URL);
+        for now in [0, 300, -300] {
+            let event = verify_paypal_transmission(
+                &transmission,
+                PAYPAL_WEBHOOK,
+                PAYPAL_BODY,
+                PAYPAL_TEST_CERT,
+                now,
+            )
+            .expect("authentic customer event within replay window");
+            assert_eq!(event.provider, Provider::Paypal);
+            assert_eq!(event.id, "WH-customer-1");
+            assert_eq!(event.payload, PAYPAL_BODY);
+        }
+    }
+
+    #[test]
+    fn customer_paypal_boundary_blocks_signed_replays_after_window_both_directions() {
+        let time = "1970-01-01T00:00:00Z";
+        let signature = sign_paypal(PAYPAL_BODY, time, PAYPAL_WEBHOOK);
+        let transmission = paypal_headers(time, &signature, PAYPAL_CERT_URL);
+        for now in [301, -301, i64::MAX, i64::MIN] {
+            assert!(matches!(
+                verify_paypal_transmission(
+                    &transmission,
+                    PAYPAL_WEBHOOK,
+                    PAYPAL_BODY,
+                    PAYPAL_TEST_CERT,
+                    now,
+                ),
+                Err(fiducia_payments::VerifyError::TimestampOutOfTolerance { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn customer_paypal_boundary_rejects_signed_time_tampering_and_body_replay_conflicts() {
+        let time = "1970-01-01T00:00:00Z";
+        let signature = sign_paypal(PAYPAL_BODY, time, PAYPAL_WEBHOOK);
+        let transmission = paypal_headers(time, &signature, PAYPAL_CERT_URL);
+        let tampered_body =
+            br#"{"id":"WH-customer-1","event_type":"PAYMENT.CAPTURE.DENIED"}"#;
+        assert!(matches!(
+            verify_paypal_transmission(
+                &transmission,
+                PAYPAL_WEBHOOK,
+                tampered_body,
+                PAYPAL_TEST_CERT,
+                0,
+            ),
+            Err(fiducia_payments::VerifyError::SignatureMismatch)
+        ));
+        let moved_time = paypal_headers("1970-01-01T00:00:01Z", &signature, PAYPAL_CERT_URL);
+        assert!(matches!(
+            verify_paypal_transmission(
+                &moved_time,
+                PAYPAL_WEBHOOK,
+                PAYPAL_BODY,
+                PAYPAL_TEST_CERT,
+                1,
+            ),
+            Err(fiducia_payments::VerifyError::SignatureMismatch)
+        ));
+        let bad_calendar = "2026-02-29T00:00:00Z";
+        let invalid_time_signature = sign_paypal(PAYPAL_BODY, bad_calendar, PAYPAL_WEBHOOK);
+        assert!(matches!(
+            verify_paypal_transmission(
+                &paypal_headers(bad_calendar, &invalid_time_signature, PAYPAL_CERT_URL),
+                PAYPAL_WEBHOOK,
+                PAYPAL_BODY,
+                PAYPAL_TEST_CERT,
+                0,
+            ),
+            Err(fiducia_payments::VerifyError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            verify_paypal_transmission(
+                &paypal_headers(time, &signature, "https://paypal.com.evil.test/cert.pem"),
+                PAYPAL_WEBHOOK,
+                PAYPAL_BODY,
+                PAYPAL_TEST_CERT,
+                0,
+            ),
+            Err(fiducia_payments::VerifyError::InvalidInput(_))
+        ));
+    }
 
     fn event(provider: Provider, id: &str, event_type: &str, payload: &[u8]) -> VerifiedEvent {
         VerifiedEvent {
