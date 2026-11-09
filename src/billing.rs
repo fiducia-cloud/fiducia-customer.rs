@@ -358,8 +358,7 @@ mod tests {
     const PAYPAL_WEBHOOK: &str = "WH-CUSTOMER-FRESHNESS";
     const PAYPAL_BODY: &[u8] =
         br#"{"id":"WH-customer-1","event_type":"PAYMENT.CAPTURE.COMPLETED"}"#;
-    const PAYPAL_CERT_URL: &str =
-        "https://api.paypal.com/v1/notifications/certs/customer-test.pem";
+    const PAYPAL_CERT_URL: &str = "https://api.paypal.com/v1/notifications/certs/customer-test.pem";
 
     fn sign_paypal(body: &[u8], time: &str, webhook_id: &str) -> String {
         let private_key =
@@ -429,8 +428,7 @@ mod tests {
         let time = "1970-01-01T00:00:00Z";
         let signature = sign_paypal(PAYPAL_BODY, time, PAYPAL_WEBHOOK);
         let transmission = paypal_headers(time, &signature, PAYPAL_CERT_URL);
-        let tampered_body =
-            br#"{"id":"WH-customer-1","event_type":"PAYMENT.CAPTURE.DENIED"}"#;
+        let tampered_body = br#"{"id":"WH-customer-1","event_type":"PAYMENT.CAPTURE.DENIED"}"#;
         assert!(matches!(
             verify_paypal_transmission(
                 &transmission,
