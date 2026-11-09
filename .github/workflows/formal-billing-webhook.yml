@@ -110,7 +110,7 @@ jobs:
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-payments.rs
-          ref: 126dc5d1b3fcba289f95139284dc0f3c54b56a8a
+          ref: 5aea61201b76ea174c7f666f1525e646e6fb4f9c
           path: fiducia-payments.rs
 
       - name: Install pinned Rust toolchain
