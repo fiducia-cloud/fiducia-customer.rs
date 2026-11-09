@@ -611,6 +611,7 @@ dependencies = [
  "hmac 0.12.1",
  "maud",
  "reqwest",
+ "rsa",
  "sea-orm",
  "serde",
  "serde_json",
